@@ -31,7 +31,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from .events import Event, EventSequencer
+from .events import Event, EventSequencer, truncate_tool_result_content
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +212,7 @@ class _Session:
         self.emit(
             "tool_result",
             tool_use_id=block.tool_use_id,
-            content=block.content,
+            content=truncate_tool_result_content(block.content),
             is_error=bool(block.is_error),
             duration_ms=duration_ms,
         )

@@ -161,6 +161,35 @@ async def test_tool_call_and_result_produce_events_with_duration(adapter):
 
 
 @pytest.mark.asyncio
+async def test_large_tool_result_content_is_truncated(adapter):
+    """U9 (R14): a very large tool result (e.g. a long test run's output)
+    is truncated with an explicit marker rather than reaching the relay's
+    bounded event cache untruncated."""
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    client.push(
+        AssistantMessage(
+            content=[ToolUseBlock(id="tool-1", name="Bash", input={"command": "pytest"})], model="claude"
+        )
+    )
+    await events.__anext__()  # tool_call
+
+    huge_output = "PASS\n" * 5000  # well over the truncation threshold
+    client.push(
+        AssistantMessage(
+            content=[ToolResultBlock(tool_use_id="tool-1", content=huge_output, is_error=False)], model="claude"
+        )
+    )
+    result_event = await events.__anext__()
+
+    assert len(result_event.data["content"]) < len(huge_output)
+    assert "truncated" in result_event.data["content"]
+
+
+@pytest.mark.asyncio
 async def test_permission_request_blocks_until_respond_to_permission_allow(adapter):
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]

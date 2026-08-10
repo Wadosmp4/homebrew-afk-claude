@@ -1,6 +1,11 @@
 import pytest
 
-from companion.adapters.events import Event, EventSequencer
+from companion.adapters.events import (
+    MAX_TOOL_RESULT_CONTENT_CHARS,
+    Event,
+    EventSequencer,
+    truncate_tool_result_content,
+)
 
 
 def test_sequencer_assigns_monotonic_ids_per_session():
@@ -34,3 +39,43 @@ def test_event_roundtrips_through_dict():
     restored = Event.from_dict(event.to_dict())
 
     assert restored == event
+
+
+# --- U9: tool_result content truncation ----------------------------------
+
+def test_truncate_short_string_content_is_unchanged():
+    assert truncate_tool_result_content("short output") == "short output"
+
+
+def test_truncate_long_string_content_is_marked():
+    long_text = "x" * (MAX_TOOL_RESULT_CONTENT_CHARS + 500)
+
+    result = truncate_tool_result_content(long_text)
+
+    assert len(result) < len(long_text)
+    assert result.startswith("x" * MAX_TOOL_RESULT_CONTENT_CHARS)
+    assert "truncated" in result
+    assert str(len(long_text)) in result  # original size is disclosed
+
+
+def test_truncate_list_of_blocks_only_truncates_long_text_blocks():
+    blocks = [
+        {"type": "text", "text": "short"},
+        {"type": "text", "text": "y" * (MAX_TOOL_RESULT_CONTENT_CHARS + 500)},
+        {"type": "image", "data": "base64..."},
+    ]
+
+    result = truncate_tool_result_content(blocks)
+
+    assert result[0] == {"type": "text", "text": "short"}
+    assert "truncated" in result[1]["text"]
+    assert result[2] == {"type": "image", "data": "base64..."}
+
+
+def test_truncate_non_string_non_list_content_passes_through():
+    structured = {"exit_code": 0}
+    assert truncate_tool_result_content(structured) is structured
+
+
+def test_truncate_none_content_passes_through():
+    assert truncate_tool_result_content(None) is None

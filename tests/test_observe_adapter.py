@@ -135,6 +135,112 @@ async def test_discovers_transcript_and_streams_normalized_events(adapter, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_tool_result_duration_computed_from_entry_timestamps(adapter, tmp_path):
+    """U9 (R14): unlike U3's SDK-owned session (a monotonic clock),
+    duration here comes from the JSONL entries' own `timestamp` fields."""
+    project_dir = tmp_path / "projects" / "my-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-timed.jsonl"
+    transcript.touch()
+    await _wait_until(lambda: "session-timed" in adapter.discover_sessions())
+    events = adapter.subscribe("session-timed")
+    await events.__anext__()  # session_started
+
+    _write_line(
+        transcript,
+        {
+            "type": "assistant",
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "tool-1", "name": "Bash", "input": {"command": "pytest"}}],
+            },
+        },
+    )
+    await events.__anext__()  # tool_call
+
+    _write_line(
+        transcript,
+        {
+            "type": "user",
+            "timestamp": "2026-01-01T00:00:02.500Z",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": "14 passed"}],
+            },
+        },
+    )
+    result_event = await events.__anext__()
+
+    assert result_event.data["duration_ms"] == pytest.approx(2500, abs=1)
+
+
+@pytest.mark.asyncio
+async def test_tool_result_without_a_matching_tool_call_has_no_duration(adapter, tmp_path):
+    project_dir = tmp_path / "projects" / "my-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-untimed.jsonl"
+    transcript.touch()
+    await _wait_until(lambda: "session-untimed" in adapter.discover_sessions())
+    events = adapter.subscribe("session-untimed")
+    await events.__anext__()  # session_started
+
+    _write_line(
+        transcript,
+        {
+            "type": "user",
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "orphan-tool-use-id", "content": "x"}],
+            },
+        },
+    )
+    result_event = await events.__anext__()
+
+    assert result_event.data["duration_ms"] is None
+
+
+@pytest.mark.asyncio
+async def test_large_tool_result_content_is_truncated(adapter, tmp_path):
+    project_dir = tmp_path / "projects" / "my-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-huge.jsonl"
+    transcript.touch()
+    await _wait_until(lambda: "session-huge" in adapter.discover_sessions())
+    events = adapter.subscribe("session-huge")
+    await events.__anext__()  # session_started
+
+    _write_line(
+        transcript,
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "tool-1", "name": "Bash", "input": {"command": "pytest"}}],
+            },
+        },
+    )
+    await events.__anext__()  # tool_call
+
+    huge_output = "PASS\n" * 5000
+    _write_line(
+        transcript,
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": huge_output}],
+            },
+        },
+    )
+    result_event = await events.__anext__()
+
+    assert len(result_event.data["content"]) < len(huge_output)
+    assert "truncated" in result_event.data["content"]
+
+
+@pytest.mark.asyncio
 async def test_concurrent_partial_write_does_not_double_emit_or_drop(adapter, tmp_path):
     project_dir = tmp_path / "projects" / "my-repo"
     project_dir.mkdir()

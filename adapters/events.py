@@ -60,6 +60,37 @@ class Event:
         )
 
 
+# U9 (R14): a very large tool result (e.g. a long test run's output) is
+# truncated with an explicit marker rather than silently dropped or
+# blowing up the relay's bounded event-replay cache (KTD3/KTD4) - both
+# adapters call this before emitting `tool_result`.
+MAX_TOOL_RESULT_CONTENT_CHARS = 8000
+
+
+def truncate_tool_result_content(content: Any) -> Any:
+    """Truncate a tool_result's `content` if it's a long string, or a list
+    of content blocks whose text is long. Non-string/list content (already
+    small/structured data) passes through unchanged - there's nothing
+    generically safe to truncate there."""
+    if isinstance(content, str):
+        return _truncate_text(content)
+    if isinstance(content, list):
+        return [_truncate_block(block) for block in content]
+    return content
+
+
+def _truncate_text(text: str) -> str:
+    if len(text) <= MAX_TOOL_RESULT_CONTENT_CHARS:
+        return text
+    return text[:MAX_TOOL_RESULT_CONTENT_CHARS] + f"\n… [truncated, {len(text)} chars total]"
+
+
+def _truncate_block(block: Any) -> Any:
+    if isinstance(block, dict) and isinstance(block.get("text"), str) and len(block["text"]) > MAX_TOOL_RESULT_CONTENT_CHARS:
+        return {**block, "text": _truncate_text(block["text"])}
+    return block
+
+
 class EventSequencer:
     """Assigns monotonic per-session `event_id`s (U5's Approach: "Companion
     assigns event_id per session (monotonic)"). One instance per session -

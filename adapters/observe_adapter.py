@@ -28,11 +28,12 @@ import os
 import stat
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
-from .events import Event, EventSequencer
+from .events import Event, EventSequencer, truncate_tool_result_content
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +190,7 @@ class ObserveAdapter:
             return
 
         entry_type = entry.get("type")
+        entry_timestamp = entry.get("timestamp")
         content = entry.get("message", {}).get("content")
         if content is None:
             return
@@ -198,6 +200,8 @@ class ObserveAdapter:
                 if block.get("type") == "text":
                     session.emit("assistant_message", text=block["text"])
                 elif block.get("type") == "tool_use":
+                    if entry_timestamp:
+                        session.tool_started_at[block["id"]] = entry_timestamp
                     session.emit("tool_call", tool_use_id=block["id"], tool=block["name"], input=block.get("input"))
         elif entry_type == "user":
             if isinstance(content, str):
@@ -205,14 +209,29 @@ class ObserveAdapter:
             elif isinstance(content, list):
                 for block in content:
                     if block.get("type") == "tool_result":
+                        tool_use_id = block.get("tool_use_id")
+                        duration_ms = self._duration_since(session, tool_use_id, entry_timestamp)
                         session.emit(
                             "tool_result",
-                            tool_use_id=block.get("tool_use_id"),
-                            content=block.get("content"),
+                            tool_use_id=tool_use_id,
+                            content=truncate_tool_result_content(block.get("content")),
                             is_error=bool(block.get("is_error", False)),
+                            duration_ms=duration_ms,
                         )
                     elif block.get("type") == "text":
                         session.emit("user_message", text=block["text"])
+
+    @staticmethod
+    def _duration_since(session: "_ObserveSession", tool_use_id: Optional[str], result_timestamp: Optional[str]) -> Optional[float]:
+        started = session.tool_started_at.pop(tool_use_id, None) if tool_use_id else None
+        if started is None or not result_timestamp:
+            return None
+        try:
+            start = datetime.fromisoformat(started)
+            end = datetime.fromisoformat(result_timestamp)
+        except ValueError:
+            return None
+        return max((end - start).total_seconds() * 1000, 0.0)
 
     # --- hooks Unix socket ---------------------------------------------------
 
@@ -280,11 +299,10 @@ class ObserveAdapter:
 
 
 class _ObserveSession:
-    """Unlike U3's SDK-owned session, tool_call/tool_result events here
-    carry no `duration_ms`: JSONL entries have no monotonic clock, and
-    computing one from the entries' own `timestamp` fields wasn't in this
-    unit's test scenarios (deferred - see U9's tool-activity-detail unit,
-    which is where wall-clock duration for observed sessions belongs)."""
+    """U9: `duration_ms` here comes from JSONL entries' own `timestamp`
+    fields (wall-clock ISO strings every real transcript entry carries),
+    not a monotonic clock like U3's SDK-owned session - `tool_started_at`
+    tracks the entry timestamp captured when each tool_call was emitted."""
 
     def __init__(self, session_id: str):
         self.session_id = session_id
@@ -292,6 +310,7 @@ class _ObserveSession:
         self.events: asyncio.Queue[Event] = asyncio.Queue()
         self.pending: dict[str, asyncio.Future] = {}
         self.tail_task: Optional[asyncio.Task] = None
+        self.tool_started_at: dict[str, str] = {}
         self._ended = False
 
     def emit(self, type_: str, **data: Any) -> Event:
