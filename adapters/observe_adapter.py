@@ -132,6 +132,19 @@ class ObserveAdapter:
             if event.type in ("session_ended", "error"):
                 return
 
+    def get_cwd(self, session_id: str) -> Optional[str]:
+        """U10 (R16): captured from the JSONL transcript entries' own
+        `cwd` field (see _normalize_line) - None until at least one
+        transcript line with a `cwd` has been seen for this session."""
+        session = self._sessions.get(session_id)
+        return session.cwd if session is not None else None
+
+    def emit_custom(self, session_id: str, type_: str, **data: Any) -> None:
+        """U10: see SDKAdapter.emit_custom's docstring - same purpose,
+        same "lets the daemon inject a computed result into this
+        session's own stream" contract, for observe-only sessions."""
+        self._get(session_id).emit(type_, **data)
+
     def _get(self, session_id: str) -> "_ObserveSession":
         try:
             return self._sessions[session_id]
@@ -188,6 +201,14 @@ class ObserveAdapter:
             entry = json.loads(raw_line.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             return
+
+        # U10 (R16): every real transcript entry carries the session's cwd;
+        # capture it regardless of whether this particular line has
+        # message content, so git_status/git_diff work as soon as any
+        # line has arrived, not only after the first content-bearing one.
+        entry_cwd = entry.get("cwd")
+        if entry_cwd:
+            session.cwd = entry_cwd
 
         entry_type = entry.get("type")
         entry_timestamp = entry.get("timestamp")
@@ -311,6 +332,7 @@ class _ObserveSession:
         self.pending: dict[str, asyncio.Future] = {}
         self.tail_task: Optional[asyncio.Task] = None
         self.tool_started_at: dict[str, str] = {}
+        self.cwd: Optional[str] = None  # U10 (R16): captured from a JSONL entry's own `cwd` field
         self._ended = False
 
     def emit(self, type_: str, **data: Any) -> Event:

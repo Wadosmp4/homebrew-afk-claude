@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import subprocess
 import uuid
 
 import pytest
@@ -276,6 +277,89 @@ async def test_send_message_action_routes_to_the_owning_sdk_session(running_daem
         assert event["type"] == "user_message"
         assert event["data"]["text"] == "hello claude"
         assert event["session_id"] == session_id
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_git_status_action_returns_a_real_status_snapshot(running_daemon, phone_token, tmp_path):
+    """U10 (R16): the git_status action's result rides the session's own
+    event stream (emit_custom), computed against the session's real cwd -
+    companion/git_status.py's own tests cover the git plumbing itself."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
+    (repo / "README.md").write_text("hi\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "Initial"], cwd=repo, check=True)
+    (repo / "README.md").write_text("changed\n")
+
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": str(repo)})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action({"kind": "git_status", "session_id": session_id})
+
+        event = await phone.next_event()
+        assert event["type"] == "git_status"
+        assert event["data"]["is_git_repo"] is True
+        assert "README.md" in event["data"]["modified"]
+        assert event["data"]["last_commit"] == "Initial"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_git_diff_action_returns_a_real_diff(running_daemon, phone_token, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
+    (repo / "README.md").write_text("original\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "Initial"], cwd=repo, check=True)
+    (repo / "README.md").write_text("updated\n")
+
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": str(repo)})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action({"kind": "git_diff", "session_id": session_id, "path": "README.md"})
+
+        event = await phone.next_event()
+        assert event["type"] == "git_diff"
+        assert event["data"]["is_binary"] is False
+        assert "+updated" in event["data"]["diff"]
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_git_status_with_no_known_cwd_reports_not_a_repo_rather_than_crashing(
+    running_daemon, phone_token
+):
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        # start_session with no cwd at all - SDKAdapter.get_cwd returns None.
+        await phone.send_action({"kind": "start_session", "cwd": None})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action({"kind": "git_status", "session_id": session_id})
+
+        event = await phone.next_event()
+        assert event["type"] == "git_status"
+        assert event["data"]["is_git_repo"] is False
     finally:
         await phone.close()
 

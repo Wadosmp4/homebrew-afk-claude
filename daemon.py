@@ -48,6 +48,7 @@ from uuid import uuid4
 
 import websockets
 
+from . import git_status
 from .adapters.events import Event
 from .adapters.observe_adapter import ObserveAdapter
 from .adapters.sdk_adapter import SDKAdapter
@@ -205,10 +206,37 @@ class CompanionDaemon:
                     action.get("decision"),
                     message=action.get("message", ""),
                 )
+            elif kind == "git_status":
+                await self._handle_git_status(adapter, session_id)
+            elif kind == "git_diff":
+                await self._handle_git_diff(adapter, session_id, action.get("path"))
             else:
                 logger.warning("unknown action kind: %r", kind)
         except Exception:
             logger.exception("action %r failed for session %r", kind, session_id)
+
+    async def _handle_git_status(self, adapter, session_id: str) -> None:
+        """U10 (R16): computes git status for the session's cwd off the
+        event loop (subprocess calls block) and injects the result into
+        the session's own event stream via `emit_custom` - it then rides
+        the same forwarding path (_forward_events) as every other event."""
+        cwd = adapter.get_cwd(session_id)
+        if cwd is None:
+            adapter.emit_custom(session_id, "git_status", is_git_repo=False)
+            return
+        status = await asyncio.to_thread(git_status.get_status, cwd)
+        adapter.emit_custom(session_id, "git_status", **status.to_dict())
+
+    async def _handle_git_diff(self, adapter, session_id: str, path: Optional[str]) -> None:
+        if not path:
+            logger.warning("git_diff action missing path for session %r", session_id)
+            return
+        cwd = adapter.get_cwd(session_id)
+        if cwd is None:
+            adapter.emit_custom(session_id, "git_diff", is_git_repo=False, path=path)
+            return
+        diff = await asyncio.to_thread(git_status.get_diff, cwd, path)
+        adapter.emit_custom(session_id, "git_diff", path=path, **diff.to_dict())
 
     def _adapter_for(self, session_id: str):
         if session_id in self.sdk_adapter.discover_sessions():

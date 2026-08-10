@@ -60,8 +60,9 @@ class SDKAdapter:
             raise ValueError(f"session already connected: {session_id}")
 
         session = _Session(session_id)
+        session.cwd = cwd or self._default_cwd  # U10 (R16): the git-status scope
         self._sessions[session_id] = session
-        options = ClaudeAgentOptions(cwd=cwd or self._default_cwd, can_use_tool=session.can_use_tool)
+        options = ClaudeAgentOptions(cwd=session.cwd, can_use_tool=session.can_use_tool)
         session.client = self._client_factory(options)
 
         await session.client.connect(session.prompt_stream())
@@ -97,6 +98,20 @@ class SDKAdapter:
         await session.client.disconnect()
         session.end("disconnected")
 
+    def get_cwd(self, session_id: str) -> Optional[str]:
+        """U10 (R16): the working directory git_status/git_diff should
+        run against for this session, or None if unknown (never raises -
+        the daemon reports "no cwd known" rather than crashing an action)."""
+        session = self._sessions.get(session_id)
+        return session.cwd if session is not None else None
+
+    def emit_custom(self, session_id: str, type_: str, **data: Any) -> None:
+        """U10: lets the daemon inject a result it computed itself (e.g. a
+        git_status snapshot) into this session's own event stream, so it
+        gets a proper sequenced event_id and rides the same relay
+        caching/replay/mobile-listener path as everything else."""
+        self._get(session_id).emit(type_, **data)
+
     async def subscribe(self, session_id: str) -> AsyncIterator[Event]:
         """Yield this session's normalized events as they occur, until the
         session ends or errors (then the generator returns)."""
@@ -130,6 +145,7 @@ class _Session:
         self.tool_started_at: dict[str, float] = {}
         self.client: Any = None
         self.reader_task: Optional[asyncio.Task] = None
+        self.cwd: Optional[str] = None
         self._ended = False
 
     def emit(self, type_: str, **data: Any) -> Event:

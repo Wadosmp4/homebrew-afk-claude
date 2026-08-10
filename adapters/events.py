@@ -24,6 +24,13 @@ EVENT_TYPES = frozenset(
         "session_ended",
         "waiting_for_input",
         "error",
+        # U10 (R16): a git_status/git_diff request's result rides the same
+        # per-session event stream as everything else (same relay caching,
+        # replay, and mobile event listener) rather than a separate
+        # request/response subprotocol - see companion/daemon.py's
+        # _handle_action for how a request becomes one of these.
+        "git_status",
+        "git_diff",
     }
 )
 
