@@ -65,7 +65,11 @@ class SDKAdapter:
         session.client = self._client_factory(options)
 
         await session.client.connect(session.prompt_stream())
-        session.emit("session_started")
+        # `mode` lets the mobile client (U7) tell an SDK-owned session
+        # (full remote control) from an observe-only one (no
+        # send_message/interrupt, per R5) without a side-channel - see
+        # observe_adapter.py's matching emit for why this one bit matters.
+        session.emit("session_started", mode="sdk_owned")
         session.reader_task = asyncio.create_task(session.read_loop())
 
     async def send_message(self, session_id: str, text: str) -> None:

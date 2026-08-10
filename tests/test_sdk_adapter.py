@@ -93,6 +93,7 @@ async def test_connect_emits_session_started(adapter):
     event, _gen = await _next_event(adapter, "s1")
     assert event.type == "session_started"
     assert event.session_id == "s1"
+    assert event.data["mode"] == "sdk_owned"  # U7 uses this to enable full remote control
 
 
 @pytest.mark.asyncio

@@ -97,7 +97,17 @@ class ObserveAdapter:
         if os.path.exists(self.socket_path):
             os.remove(self.socket_path)
 
-    # --- unsupported remote-control operations (R5) -----------------------
+    # --- unsupported remote-control operations (R5) ------------------------
+    #
+    # Returning `UnsupportedOperation` rather than raising, or emitting a
+    # normal `error` event, is deliberate: `error` terminates this
+    # session's `subscribe()` stream (see below), which is correct for a
+    # fatal SDK/subprocess crash but wrong for "you tapped Stop on a
+    # session you can't control" - that shouldn't kill the feed. U7's
+    # mobile client instead disables the input bar proactively using
+    # `session_started`'s `mode` field (R5's test scenario), so this
+    # path is never actually reached from the app; it stays defensive for
+    # any other action-sending client.
 
     async def send_message(self, session_id: str, text: str) -> UnsupportedOperation:
         return UnsupportedOperation(operation="send_message")
@@ -147,7 +157,7 @@ class ObserveAdapter:
     def _start_watching_transcript(self, path: Path) -> None:
         session_id = path.stem
         session = self._get_or_create(session_id)
-        session.emit("session_started")
+        session.emit("session_started", mode="observe_only")
         session.tail_task = asyncio.create_task(self._tail_file(path, session))
 
     async def _tail_file(self, path: Path, session: "_ObserveSession") -> None:
@@ -236,7 +246,7 @@ class ObserveAdapter:
 
         if event_name == "SessionStart":
             session = self._get_or_create(session_id)
-            session.emit("session_started")
+            session.emit("session_started", mode="observe_only")
             return {}
 
         # Anything else must reference a session we're already tracking -

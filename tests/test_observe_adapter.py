@@ -87,6 +87,7 @@ async def test_discovers_transcript_and_streams_normalized_events(adapter, tmp_p
     events = adapter.subscribe("session-abc")
     started = await events.__anext__()
     assert started.type == "session_started"
+    assert started.data["mode"] == "observe_only"  # U7 disables send/interrupt using this
 
     _write_line(
         transcript,
