@@ -13,11 +13,12 @@ remote-control loop:
     SDK-owned), which mints a fresh session_id and connects with the
     caller-supplied `cwd`.
   - Every adapter's event stream (`subscribe(session_id)`) is forwarded to
-    the relay as `{"type": "event", "event": {...}}` - for an SDK-owned
-    session, forwarding starts right after `start_session`; for an
-    observe-only session, `_watch_observe_sessions` notices it the same
-    way U4 itself notices it (polling `discover_sessions()`, since U4 has
-    no push-style "new session" callback).
+    the relay as `{"type": "event", "event": {...}}` - forwarding starts
+    right after `start_session` for a new SDK-owned session, and
+    `_watch_active_sessions` (re)starts it for any other session (an
+    observe-only one U4 just discovered, or an SDK-owned one whose
+    forwarder died with a previous connection) by polling both adapters'
+    `discover_sessions()`.
 
 State machine (`CompanionDaemon.state`):
 
@@ -83,7 +84,11 @@ class CompanionDaemon:
         self.heartbeats_sent = 0
         self._stop_event = asyncio.Event()
         self._backoff = config.reconnect_initial_delay
-        self._forwarding: set[str] = set()
+        # session_id -> the task currently forwarding its events, bound to
+        # whichever connection spawned it. See _serve_connection's cleanup
+        # for why these must be torn down on disconnect, not left to
+        # discover their own dead socket.
+        self._forwarding: dict[str, asyncio.Task] = {}
 
     def stop(self) -> None:
         """Request a graceful stop. `run()` returns once the current
@@ -129,7 +134,7 @@ class CompanionDaemon:
         tasks = [
             asyncio.create_task(self._heartbeat_loop(ws)),
             asyncio.create_task(self._receive_loop(ws)),
-            asyncio.create_task(self._watch_observe_sessions(ws)),
+            asyncio.create_task(self._watch_active_sessions(ws)),
             asyncio.create_task(self._stop_event.wait()),
         ]
         try:
@@ -142,6 +147,22 @@ class CompanionDaemon:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            # Every entry in self._forwarding was spawned against *this*
+            # connection's `ws`. Left alone, a still-blocked forwarder
+            # (idle on adapter.subscribe()'s queue, having sent nothing
+            # yet) keeps its session_id marked "being forwarded"
+            # indefinitely - so a reconnect's _watch_active_sessions
+            # would see the session_id already present and never restart
+            # it, silently dropping events sent to it after the reconnect
+            # (regression: see test_sdk_session_forwarding_resumes_after_relay_reconnect).
+            # Cancelling explicitly here, rather than waiting for each
+            # forwarder to discover the dead socket on its own next send,
+            # is what actually makes forwarding resume on the new connection.
+            forwarder_tasks = list(self._forwarding.values())
+            for task in forwarder_tasks:
+                task.cancel()
+            await asyncio.gather(*forwarder_tasks, return_exceptions=True)
+            self._forwarding.clear()
 
     async def _heartbeat_loop(self, ws: "websockets.WebSocketClientProtocol") -> None:
         while True:
@@ -181,7 +202,7 @@ class CompanionDaemon:
             except Exception:
                 logger.exception("start_session failed for action %r", action)
                 return
-            asyncio.create_task(self._forward_events(ws, self.sdk_adapter, session_id))
+            self._spawn_forwarder(ws, self.sdk_adapter, session_id)
             return
 
         session_id = action.get("session_id")
@@ -245,29 +266,49 @@ class CompanionDaemon:
             return self.observe_adapter
         return None
 
-    async def _watch_observe_sessions(self, ws: "websockets.WebSocketClientProtocol") -> None:
-        """U4 has no "new session discovered" callback, only the growing
-        `discover_sessions()` list - poll it and start forwarding anything
-        this connection isn't already forwarding."""
+    async def _watch_active_sessions(self, ws: "websockets.WebSocketClientProtocol") -> None:
+        """Restarts forwarding for any session not currently being
+        forwarded on *this* connection - both directions matter:
+
+        - U4 has no "new session discovered" callback, only the growing
+          `discover_sessions()` list, so an observe-only session is only
+          ever noticed by polling.
+        - An SDK-owned session's forwarding is wired to one specific `ws`
+          at `start_session` time. If the relay connection drops and
+          `_serve_connection` reconnects on a new `ws`, that session is
+          still running (session.events keeps queuing) but nothing is
+          re-forwarding it - _serve_connection's cleanup cancels the old
+          connection's forwarder tasks and clears `self._forwarding` on
+          disconnect specifically so this loop sees every still-active
+          session as needing a fresh forwarder here, on the new `ws`."""
         while True:
             await self._sleep_or_stop(self.config.observe_scan_interval)
             if self._stop_event.is_set():
                 return
-            for session_id in self.observe_adapter.discover_sessions():
-                if session_id not in self._forwarding:
-                    asyncio.create_task(self._forward_events(ws, self.observe_adapter, session_id))
+            for adapter in (self.sdk_adapter, self.observe_adapter):
+                for session_id in adapter.discover_sessions():
+                    self._spawn_forwarder(ws, adapter, session_id)
 
-    async def _forward_events(self, ws: "websockets.WebSocketClientProtocol", adapter, session_id: str) -> None:
+    def _spawn_forwarder(self, ws: "websockets.WebSocketClientProtocol", adapter, session_id: str) -> None:
+        """The only place a forwarder task is created, so `self._forwarding`
+        always reflects reality: every entry is a task bound to `ws`,
+        removed either when its session naturally ends (`_forward_events`'s
+        `finally`) or when `_serve_connection` tears down the connection
+        it was spawned against (see that method's cleanup)."""
         if session_id in self._forwarding:
             return
-        self._forwarding.add(session_id)
+        self._forwarding[session_id] = asyncio.create_task(self._forward_events(ws, adapter, session_id))
+
+    async def _forward_events(self, ws: "websockets.WebSocketClientProtocol", adapter, session_id: str) -> None:
         try:
             async for event in adapter.subscribe(session_id):
                 await self._send_event(ws, event)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception("event forwarding failed for session %r", session_id)
         finally:
-            self._forwarding.discard(session_id)
+            self._forwarding.pop(session_id, None)
 
     async def _send_event(self, ws: "websockets.WebSocketClientProtocol", event: Event) -> None:
         await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event.to_dict()}))

@@ -76,6 +76,39 @@ async def _send_hook_async(socket_path: str, event: str, payload: dict) -> dict:
 
 
 @pytest.mark.asyncio
+async def test_session_started_is_not_duplicated_when_both_hook_and_file_discovery_fire(adapter, tmp_path):
+    """Regression test: a real session is normally noticed by *both* the
+    SessionStart hook and the JSONL file watcher for the same session_id
+    (hooks_installer.py registers SessionStart for every watched repo, and
+    _watch_projects_dir independently discovers the new transcript file
+    shortly after) - previously each path emitted its own session_started
+    unconditionally, so every real session showed two "Session started"
+    events in the mobile feed."""
+    project_dir = tmp_path / "projects" / "my-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-dup.jsonl"
+
+    # Hook fires first (as it would in practice - SessionStart precedes
+    # the first transcript write).
+    await _send_hook_async(adapter.socket_path, "SessionStart", {"session_id": "session-dup"})
+    events = adapter.subscribe("session-dup")
+    started = await events.__anext__()
+    assert started.type == "session_started"
+
+    # File discovery now also notices the same session.
+    transcript.touch()
+    await _wait_until(lambda: "session-dup" in adapter.discover_sessions())
+    _write_line(
+        transcript,
+        {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}},
+    )
+
+    # The next event must be the real content, not a second session_started.
+    next_event = await events.__anext__()
+    assert next_event.type == "assistant_message"
+
+
+@pytest.mark.asyncio
 async def test_discovers_transcript_and_streams_normalized_events(adapter, tmp_path):
     project_dir = tmp_path / "projects" / "my-repo"
     project_dir.mkdir()

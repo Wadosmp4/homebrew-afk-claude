@@ -29,7 +29,7 @@ class CompanionConfig:
     reconnect_max_delay: float = 30.0
     # How often the daemon polls ObserveAdapter.discover_sessions() for a
     # session it hasn't started forwarding yet (U4 has no "new session"
-    # callback, only the growing list - see daemon.py's _watch_observe_sessions).
+    # callback, only the growing list - see daemon.py's _watch_active_sessions).
     observe_scan_interval: float = 1.0
 
 

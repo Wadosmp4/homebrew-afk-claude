@@ -171,7 +171,7 @@ class ObserveAdapter:
     def _start_watching_transcript(self, path: Path) -> None:
         session_id = path.stem
         session = self._get_or_create(session_id)
-        session.emit("session_started", mode="observe_only")
+        session.start()
         session.tail_task = asyncio.create_task(self._tail_file(path, session))
 
     async def _tail_file(self, path: Path, session: "_ObserveSession") -> None:
@@ -286,7 +286,7 @@ class ObserveAdapter:
 
         if event_name == "SessionStart":
             session = self._get_or_create(session_id)
-            session.emit("session_started", mode="observe_only")
+            session.start()
             return {}
 
         # Anything else must reference a session we're already tracking -
@@ -333,12 +333,24 @@ class _ObserveSession:
         self.tail_task: Optional[asyncio.Task] = None
         self.tool_started_at: dict[str, str] = {}
         self.cwd: Optional[str] = None  # U10 (R16): captured from a JSONL entry's own `cwd` field
+        self._started = False
         self._ended = False
 
     def emit(self, type_: str, **data: Any) -> Event:
         event = self.sequencer.emit(type_, **data)
         self.events.put_nowait(event)
         return event
+
+    def start(self) -> None:
+        """Idempotent, mirroring `end()` - a session becomes known via
+        *either* the JSONL file watcher or the SessionStart hook, often
+        both, so both call sites route through here rather than emitting
+        `session_started` directly (a real bug this guard fixes: without
+        it, every session got two "Session started" events)."""
+        if self._started:
+            return
+        self._started = True
+        self.emit("session_started", mode="observe_only")
 
     def end(self, reason: str) -> None:
         if self._ended:

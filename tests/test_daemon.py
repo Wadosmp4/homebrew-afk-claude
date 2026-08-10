@@ -190,6 +190,63 @@ async def test_daemon_reconnects_after_relay_restart_without_losing_identity(tmp
         await _stop_server(server2)
 
 
+@pytest.mark.asyncio
+async def test_sdk_session_forwarding_resumes_after_relay_reconnect(tmp_path):
+    """Regression test: an SDK-owned session started before a relay drop
+    must keep forwarding events after the daemon reconnects - previously
+    only observe-only sessions were rediscovered on reconnect, so an
+    SDK-owned session's forwarder silently died with the old connection
+    and was never restarted (see _watch_active_sessions)."""
+    db_path = str(tmp_path / "relay.db")
+    app = create_app(db_path)
+    _, companion_token = auth.bootstrap_companion_device(app.state.db)
+    _, phone_token = auth.create_device(app.state.db, "phone")
+    port = _free_port()
+
+    sdk_adapter, _fake_clients = _fake_sdk_adapter()
+    server = await _start_server(app, port)
+    daemon = CompanionDaemon(
+        _fast_config(port, companion_token),
+        sdk_adapter=sdk_adapter,
+        observe_adapter=_test_observe_adapter(tmp_path),
+    )
+    task = asyncio.create_task(daemon.run())
+    await _wait_until(lambda: daemon.state == "connected")
+
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+        await phone.close()
+
+        # Relay drops entirely, then comes back on the same port/db.
+        await _stop_server(server)
+        await _wait_until(lambda: daemon.state != "connected")
+        app2 = create_app(db_path)
+        server2 = await _start_server(app2, port)
+        try:
+            await _wait_until(lambda: daemon.state == "connected", timeout=5)
+
+            # The SDK session survived the drop (adapter-side state is
+            # untouched) - sending it a message must still reach a phone
+            # reconnected to the relay's new process.
+            phone2 = await _FakePhone.connect(port, phone_token)
+            try:
+                await phone2.send_action(
+                    {"kind": "send_message", "session_id": session_id, "text": "still there?"}
+                )
+                event = await phone2.next_event(timeout=3.0)
+                assert event["type"] == "user_message"
+                assert event["data"]["text"] == "still there?"
+            finally:
+                await phone2.close()
+        finally:
+            await _stop_server(server2)
+    finally:
+        await _stop_daemon(daemon, task)
+
+
 # --- Action routing + event forwarding (daemon <-> SDK adapter <-> phone) --
 
 
