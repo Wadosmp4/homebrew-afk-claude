@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.remoteclaude.companion</string>
+
+    <!-- Replace both placeholders at install time (see companion/README.md):
+         PYTHON_BIN  - the venv's python3 (e.g. /Users/you/repo/.venv/bin/python3)
+         REPO_ROOT   - absolute path to this repository checkout -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>PYTHON_BIN</string>
+        <string>-m</string>
+        <string>companion.daemon</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>REPO_ROOT</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/remote-claude-companion.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/remote-claude-companion.err.log</string>
+</dict>
+</plist>

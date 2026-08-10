@@ -1,0 +1,9 @@
+[project]
+name = "remote-claude-companion"
+version = "0.1.0"
+description = "Mac companion daemon: connects to the relay and drives/observes Claude Code sessions."
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

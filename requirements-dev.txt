@@ -1,0 +1,7 @@
+# Test-only deps. Companion tests spin up the real relay app (U1) in-process
+# for integration coverage of the connect/auth/heartbeat/reconnect chain -
+# hence the relay dependency here, not in requirements.txt.
+-r requirements.txt
+-r ../relay/requirements.txt
+pytest>=8.0,<9.0
+pytest-asyncio>=0.23,<1.0
