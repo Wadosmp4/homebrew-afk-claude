@@ -27,6 +27,10 @@ class CompanionConfig:
     heartbeat_interval: float = 5.0
     reconnect_initial_delay: float = 1.0
     reconnect_max_delay: float = 30.0
+    # How often the daemon polls ObserveAdapter.discover_sessions() for a
+    # session it hasn't started forwarding yet (U4 has no "new session"
+    # callback, only the growing list - see daemon.py's _watch_observe_sessions).
+    observe_scan_interval: float = 1.0
 
 
 def save_config(path: str, config: CompanionConfig) -> None:
