@@ -44,16 +44,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import uuid4
 
 import websockets
 
-from . import git_status
+from . import git_status, history, projects
 from .adapters.events import Event
-from .adapters.observe_adapter import ObserveAdapter
+from .adapters.observe_adapter import KNOWN_ENTRYPOINTS, ObserveAdapter
 from .adapters.sdk_adapter import SDKAdapter
-from .config import CompanionConfig, load_config
+from .config import DEFAULT_CONFIG_PATH, CompanionConfig, load_config, save_config
+from .session_settings import SessionSettings, load_session_settings, save_session_settings
 
 logger = logging.getLogger(__name__)
 
@@ -75,10 +78,25 @@ class CompanionDaemon:
         *,
         sdk_adapter: Optional[SDKAdapter] = None,
         observe_adapter: Optional[ObserveAdapter] = None,
+        recents_path: Optional[str] = None,
+        config_path: Optional[str] = None,
+        session_settings_path: Optional[str] = None,
     ):
         self.config = config
+        self.config_path = config_path or DEFAULT_CONFIG_PATH
         self.sdk_adapter = sdk_adapter or SDKAdapter()
-        self.observe_adapter = observe_adapter or ObserveAdapter()
+        self.observe_adapter = observe_adapter or ObserveAdapter(
+            required_entrypoints=frozenset(config.observe_entrypoints),
+            auto_approve=config.observe_auto_approve,
+            llm_judge=config.observe_llm_judge,
+        )
+        # Injectable for the same reason as the adapters above: tests must
+        # never write into the developer's real recent-projects file
+        # (projects.DEFAULT_RECENTS_PATH) just by exercising start_session.
+        self.recents_path = recents_path
+        # Same injectability reason, for session_settings.py's own default
+        # path - see _try_resume_sdk_session for why this exists at all.
+        self.session_settings_path = session_settings_path
         self.state = "connecting"
         self.connect_attempts = 0
         self.heartbeats_sent = 0
@@ -193,16 +211,90 @@ class CompanionDaemon:
                 asyncio.create_task(self._handle_action(ws, message.get("action") or {}))
 
     async def _handle_action(self, ws: "websockets.WebSocketClientProtocol", action: dict[str, Any]) -> None:
+        # `_serve_connection` spawns this via asyncio.create_task (fire-and-
+        # forget, per action) - an exception here would otherwise surface
+        # only as asyncio's own "exception was never retrieved" warning
+        # instead of our own logging, and would silently drop that one
+        # action rather than the intended log-and-continue.
+        try:
+            await self._dispatch_action(ws, action)
+        except Exception:
+            logger.exception("action %r failed: %r", action.get("kind"), action)
+
+    async def _dispatch_action(self, ws: "websockets.WebSocketClientProtocol", action: dict[str, Any]) -> None:
         kind = action.get("kind")
 
         if kind == "start_session":
             session_id = str(uuid4())
             try:
-                await self.sdk_adapter.connect(session_id, cwd=action.get("cwd"))
+                await self.sdk_adapter.connect(
+                    session_id,
+                    cwd=action.get("cwd"),
+                    model=action.get("model"),
+                    auto_approve=bool(action.get("auto_approve", False)),
+                    llm_judge=bool(action.get("llm_judge", False)),
+                )
             except Exception:
                 logger.exception("start_session failed for action %r", action)
                 return
             self._spawn_forwarder(ws, self.sdk_adapter, session_id)
+            resolved_cwd = self.sdk_adapter.get_cwd(session_id)
+            if resolved_cwd:
+                await asyncio.to_thread(projects.record_recent, resolved_cwd, self.recents_path)
+                await asyncio.to_thread(
+                    save_session_settings,
+                    session_id,
+                    SessionSettings(
+                        cwd=resolved_cwd,
+                        model=action.get("model"),
+                        auto_approve=bool(action.get("auto_approve", False)),
+                        llm_judge=bool(action.get("llm_judge", False)),
+                    ),
+                    self.session_settings_path,
+                )
+            return
+
+        if kind == "list_projects":
+            await self._handle_list_projects(ws)
+            return
+
+        if kind == "list_active_sessions":
+            await self._handle_list_active_sessions(ws)
+            return
+
+        if kind == "list_project_sessions":
+            await self._handle_list_project_sessions(ws, action.get("cwd"))
+            return
+
+        if kind == "read_session_history":
+            await self._handle_read_session_history(ws, action.get("session_id"))
+            return
+
+        if kind == "open_session":
+            # R: "do not connect automatically to opened session, just show
+            # that it exists" - an observe-only session's content only
+            # starts forwarding once the phone actually opens it (see
+            # ObserveAdapter.open_session). No-op for an SDK-owned session,
+            # which already forwards from the moment start_session created it.
+            self.observe_adapter.open_session(action.get("session_id"))
+            return
+
+        if kind == "get_observe_settings":
+            await self._handle_get_observe_settings(ws)
+            return
+
+        if kind == "set_observe_entrypoints":
+            await self._handle_set_observe_entrypoints(ws, action.get("entrypoints"))
+            return
+
+        if kind == "get_auto_approve_settings":
+            await self._handle_get_auto_approve_settings(ws)
+            return
+
+        if kind == "set_auto_approve_settings":
+            await self._handle_set_auto_approve_settings(
+                ws, action.get("auto_approve"), action.get("llm_judge")
+            )
             return
 
         session_id = action.get("session_id")
@@ -212,6 +304,8 @@ class CompanionDaemon:
 
         adapter = self._adapter_for(session_id)
         if adapter is None:
+            adapter = await self._try_resume_sdk_session(session_id)
+        if adapter is None:
             logger.warning("action for unknown session_id=%r: %r", session_id, action)
             return
 
@@ -220,6 +314,8 @@ class CompanionDaemon:
                 await adapter.send_message(session_id, action.get("text", ""))
             elif kind == "interrupt":
                 await adapter.interrupt(session_id)
+            elif kind == "compact":
+                await adapter.compact(session_id)
             elif kind == "respond_to_permission":
                 await adapter.respond_to_permission(
                     session_id,
@@ -231,10 +327,179 @@ class CompanionDaemon:
                 await self._handle_git_status(adapter, session_id)
             elif kind == "git_diff":
                 await self._handle_git_diff(adapter, session_id, action.get("path"))
+            elif kind == "set_session_auto_approve":
+                adapter.set_session_auto_approve(
+                    session_id, action.get("auto_approve"), action.get("llm_judge")
+                )
+                if adapter is self.sdk_adapter:
+                    # Keep the saved record in sync with this live override,
+                    # so a later restart-triggered resume
+                    # (_try_resume_sdk_session) picks it up instead of
+                    # whatever was saved at start_session time. Observed
+                    # sessions have no equivalent - they're never resumed
+                    # this way, since ObserveAdapter has no client to
+                    # reconnect.
+                    await self._persist_sdk_session_settings(
+                        session_id, action.get("auto_approve"), action.get("llm_judge")
+                    )
             else:
                 logger.warning("unknown action kind: %r", kind)
         except Exception:
             logger.exception("action %r failed for session %r", kind, session_id)
+
+    async def _handle_list_projects(self, ws: "websockets.WebSocketClientProtocol") -> None:
+        """Sessions-screen picker (no session_id, unlike git_status/
+        git_diff): sent as a synthetic event on a fixed sentinel
+        session_id rather than through an adapter's `emit_custom`, since
+        that requires an already-connected session and this isn't scoped
+        to one. `event_id` is always 0 - the relay's replay cache keys on
+        (session_id, event_id) and just overwrites, which is exactly what
+        we want for a point-in-time snapshot with no history to replay."""
+        result = await asyncio.to_thread(projects.list_projects, None, self.recents_path)
+        event = {
+            "session_id": "_projects",
+            "event_id": 0,
+            "type": "project_list",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "data": {"projects": result},
+        }
+        await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
+
+    async def _handle_list_active_sessions(self, ws: "websockets.WebSocketClientProtocol") -> None:
+        """SessionListScreen.tsx has no other way to learn what's already
+        running - it normally only ever finds out about a session by
+        witnessing its session_started event live, which a fresh screen
+        instance (e.g. navigated back to after unmounting - React
+        Navigation only keeps a *covered* screen alive, not one you've
+        actually navigated back past) never gets to see. This snapshot
+        fills that gap on mount, the same way _handle_list_projects fills
+        it for the project picker."""
+        sessions = [
+            {
+                "session_id": sid,
+                "cwd": self.sdk_adapter.get_cwd(sid),
+                "mode": "sdk_owned",
+                "active": bool(self.sdk_adapter.is_active(sid)),
+            }
+            for sid in self.sdk_adapter.discover_sessions()
+        ] + [
+            {
+                "session_id": sid,
+                "cwd": self.observe_adapter.get_cwd(sid),
+                "mode": "observe_only",
+                "active": bool(self.observe_adapter.is_active(sid)),
+            }
+            for sid in self.observe_adapter.discover_sessions()
+        ]
+        event = {
+            "session_id": "_active_sessions",
+            "event_id": 0,
+            "type": "active_sessions",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "data": {"sessions": sessions},
+        }
+        await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
+
+    async def _handle_list_project_sessions(
+        self, ws: "websockets.WebSocketClientProtocol", cwd: Optional[str]
+    ) -> None:
+        """Past-session browsing (R: "see previous history of the
+        project"), read-only - see companion/history.py. Sentinel
+        session_id embeds the requested cwd so a phone browsing two
+        different projects' histories in quick succession gets two
+        distinguishable cached responses rather than one clobbering the
+        other (unlike _handle_list_projects, which has only ever needed
+        one global snapshot)."""
+        if not cwd:
+            logger.warning("list_project_sessions action missing cwd")
+            return
+        result = await asyncio.to_thread(history.list_project_sessions, cwd)
+        event = {
+            "session_id": f"_history_list:{cwd}",
+            "event_id": 0,
+            "type": "session_history_list",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "data": {"cwd": cwd, "sessions": [asdict(s) for s in result]},
+        }
+        await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
+
+    async def _handle_read_session_history(
+        self, ws: "websockets.WebSocketClientProtocol", session_id: Optional[str]
+    ) -> None:
+        if not session_id:
+            logger.warning("read_session_history action missing session_id")
+            return
+        events = await asyncio.to_thread(history.read_session_history, session_id)
+        event = {
+            "session_id": f"_history:{session_id}",
+            "event_id": 0,
+            "type": "session_history",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "data": {"session_id": session_id, "events": events if events is not None else []},
+        }
+        await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
+
+    async def _handle_get_observe_settings(self, ws: "websockets.WebSocketClientProtocol") -> None:
+        """R: "give an ability to choose what clients to use" - reports
+        every entrypoint value this build knows about plus which ones are
+        currently selected, so the phone can render a set of toggles
+        without hardcoding the list on both sides."""
+        event = {
+            "session_id": "_observe_settings",
+            "event_id": 0,
+            "type": "observe_settings",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "data": {
+                "known_entrypoints": list(KNOWN_ENTRYPOINTS),
+                "selected_entrypoints": sorted(self.observe_adapter.get_required_entrypoints()),
+            },
+        }
+        await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
+
+    async def _handle_set_observe_entrypoints(
+        self, ws: "websockets.WebSocketClientProtocol", entrypoints: Optional[list]
+    ) -> None:
+        if entrypoints is None:
+            logger.warning("set_observe_entrypoints action missing entrypoints")
+            return
+        chosen = frozenset(entrypoints)
+        self.observe_adapter.set_required_entrypoints(chosen)
+        self.config.observe_entrypoints = sorted(chosen)
+        await asyncio.to_thread(save_config, self.config_path, self.config)
+        await self._handle_get_observe_settings(ws)  # confirm back with the new state
+
+    async def _handle_get_auto_approve_settings(self, ws: "websockets.WebSocketClientProtocol") -> None:
+        """The auto-approve/AI-judgment policy (companion/auto_approve.py,
+        companion/risk_judge.py) applies to *every* session once enabled
+        here - both ones the phone starts (via start_session's own
+        auto_approve/llm_judge flags, which default to this same value -
+        see mobile/screens/SessionListScreen.tsx) and ones discovered from
+        a terminal-started `claude` session (ObserveAdapter's hook path).
+        This is a single global switch, not per-session, since an observed
+        session was never "started" by the phone at all."""
+        event = {
+            "session_id": "_auto_approve_settings",
+            "event_id": 0,
+            "type": "auto_approve_settings",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "data": {
+                "auto_approve": self.observe_adapter.get_auto_approve(),
+                "llm_judge": self.observe_adapter.get_llm_judge(),
+            },
+        }
+        await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
+
+    async def _handle_set_auto_approve_settings(
+        self, ws: "websockets.WebSocketClientProtocol", auto_approve: Optional[bool], llm_judge: Optional[bool]
+    ) -> None:
+        if auto_approve is not None:
+            self.observe_adapter.set_auto_approve(bool(auto_approve))
+            self.config.observe_auto_approve = bool(auto_approve)
+        if llm_judge is not None:
+            self.observe_adapter.set_llm_judge(bool(llm_judge))
+            self.config.observe_llm_judge = bool(llm_judge)
+        await asyncio.to_thread(save_config, self.config_path, self.config)
+        await self._handle_get_auto_approve_settings(ws)  # confirm back with the new state
 
     async def _handle_git_status(self, adapter, session_id: str) -> None:
         """U10 (R16): computes git status for the session's cwd off the
@@ -259,12 +524,83 @@ class CompanionDaemon:
         diff = await asyncio.to_thread(git_status.get_diff, cwd, path)
         adapter.emit_custom(session_id, "git_diff", path=path, **diff.to_dict())
 
+    async def _persist_sdk_session_settings(
+        self, session_id: str, auto_approve: Optional[bool], llm_judge: Optional[bool]
+    ) -> None:
+        """None for either argument leaves that field as it was already
+        saved, same convention as set_session_auto_approve itself."""
+        cwd = self.sdk_adapter.get_cwd(session_id)
+        if cwd is None:
+            return  # shouldn't happen for a live SDK session, but never crash persistence over it
+        saved = await asyncio.to_thread(load_session_settings, session_id, self.session_settings_path)
+        await asyncio.to_thread(
+            save_session_settings,
+            session_id,
+            SessionSettings(
+                cwd=cwd,
+                model=saved.model if saved is not None else None,
+                auto_approve=auto_approve if auto_approve is not None else (saved.auto_approve if saved is not None else False),
+                llm_judge=llm_judge if llm_judge is not None else (saved.llm_judge if saved is not None else False),
+            ),
+            self.session_settings_path,
+        )
+
     def _adapter_for(self, session_id: str):
         if session_id in self.sdk_adapter.discover_sessions():
             return self.sdk_adapter
         if session_id in self.observe_adapter.discover_sessions():
             return self.observe_adapter
         return None
+
+    async def _try_resume_sdk_session(self, session_id: str) -> Optional[SDKAdapter]:
+        """sdk_adapter's in-memory _sessions is wiped on every companion
+        restart (see SDKAdapter.connect's own docstring) - a session_id the
+        phone still references from before the restart isn't a phone error,
+        it's a real, disk-backed transcript the daemon just doesn't know
+        about anymore. Reconnect via the SDK's own `resume` support (same
+        session_id, no fork - see connect()'s comment) instead of silently
+        dropping whatever action prompted this, so a message sent right
+        after a restart is delivered rather than vanishing.
+
+        model/auto_approve/llm_judge come from session_settings.py's saved
+        record when there is one (written by start_session and
+        set_session_auto_approve) - falling back to the transcript's own
+        cwd plus opt-in-off defaults only for a session that predates this
+        being tracked at all. Returns None (falls through to the normal
+        "unknown session_id" warning) if no matching transcript exists, or
+        the resume attempt itself fails - e.g. a session id that was never
+        real, or one already too old for the CLI to load."""
+        cwd = await asyncio.to_thread(
+            history.find_transcript_cwd, session_id, str(self.observe_adapter.projects_dir)
+        )
+        if cwd is None:
+            return None
+        saved = await asyncio.to_thread(load_session_settings, session_id, self.session_settings_path)
+        try:
+            await self.sdk_adapter.connect(
+                session_id,
+                cwd=cwd,
+                resume=session_id,
+                model=saved.model if saved is not None else None,
+                auto_approve=saved.auto_approve if saved is not None else False,
+                llm_judge=saved.llm_judge if saved is not None else False,
+            )
+        except Exception:
+            logger.exception("failed to resume SDK-owned session %r", session_id)
+            return None
+        resolved_cwd = self.sdk_adapter.get_cwd(session_id) or cwd
+        await asyncio.to_thread(
+            save_session_settings,
+            session_id,
+            SessionSettings(
+                cwd=resolved_cwd,
+                model=saved.model if saved is not None else None,
+                auto_approve=saved.auto_approve if saved is not None else False,
+                llm_judge=saved.llm_judge if saved is not None else False,
+            ),
+            self.session_settings_path,
+        )
+        return self.sdk_adapter
 
     async def _watch_active_sessions(self, ws: "websockets.WebSocketClientProtocol") -> None:
         """Restarts forwarding for any session not currently being
@@ -323,8 +659,9 @@ class CompanionDaemon:
 
 def main(config_path: Optional[str] = None) -> None:
     logging.basicConfig(level=logging.INFO)
-    config = load_config(config_path) if config_path else load_config()
-    daemon = CompanionDaemon(config)
+    resolved_config_path = config_path or DEFAULT_CONFIG_PATH
+    config = load_config(resolved_config_path)
+    daemon = CompanionDaemon(config, config_path=resolved_config_path)
     try:
         asyncio.run(daemon.run())
     except KeyboardInterrupt:

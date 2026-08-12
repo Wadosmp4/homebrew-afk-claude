@@ -31,6 +31,32 @@ EVENT_TYPES = frozenset(
         # _handle_action for how a request becomes one of these.
         "git_status",
         "git_diff",
+        # Sessions-screen picker (daemon.py's _handle_list_projects): not
+        # per-session like the rest of this registry - sent on a fixed
+        # sentinel session_id ("_projects") since it isn't scoped to one.
+        "project_list",
+        # Read-only past-session browsing (daemon.py's
+        # _handle_list_project_sessions/_handle_read_session_history,
+        # companion/history.py) - also sentinel session_ids, not real ones.
+        "session_history_list",
+        "session_history",
+        # Which Claude Code clients the observe-only watcher surfaces
+        # (daemon.py's _handle_get_observe_settings/_handle_set_observe_entrypoints,
+        # ObserveAdapter.required_entrypoints) - also a sentinel session_id
+        # ("_observe_settings").
+        "observe_settings",
+        # Per-session auto_approve/llm_judge override confirmation
+        # (ObserveAdapter/SDKAdapter.set_session_auto_approve) - a real,
+        # scoped session_id, emitted whenever a phone-issued override
+        # changes a running session's own state independent of the
+        # adapter-wide default.
+        "session_auto_approve",
+        # SDK-owned only (SDKAdapter._Session._emit_context_usage): a
+        # ClaudeSDKClient.get_context_usage() snapshot polled once per
+        # completed turn - matches what the CLI's own /context command
+        # shows. ObserveAdapter never emits this - an observed session
+        # isn't driven by our own client, so we have no equivalent to poll.
+        "context_usage",
     }
 )
 

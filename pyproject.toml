@@ -4,6 +4,12 @@ version = "0.1.0"
 description = "Mac companion daemon: connects to the relay and drives/observes Claude Code sessions."
 requires-python = ">=3.10"
 
+# Packaging metadata (dependencies, [project.scripts], [build-system]) lives
+# in the repo-root pyproject.toml, not here - `companion`'s import root is
+# the repo root (relative imports like `from .. import auto_approve` assume
+# it), so setuptools needs to build from there too, not from inside this
+# directory. This file exists purely for pytest's local `[tool.pytest.ini_options]`
+# when running `pytest` from within companion/ during dev.
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

@@ -1,6 +1,17 @@
+import json
 import stat
 
 from companion.config import CompanionConfig, load_config, save_config
+
+
+def test_loading_a_config_file_from_before_observe_entrypoints_existed_still_works(tmp_path):
+    path = str(tmp_path / "config.json")
+    path_obj = tmp_path / "config.json"
+    path_obj.write_text(json.dumps({"relay_url": "ws://x/ws/companion", "device_token": "t"}))
+
+    loaded = load_config(path)
+
+    assert loaded.observe_entrypoints == ["claude-desktop"]
 
 
 def test_save_then_load_roundtrips(tmp_path):

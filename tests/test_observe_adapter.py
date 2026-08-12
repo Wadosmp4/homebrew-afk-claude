@@ -94,6 +94,7 @@ async def test_session_started_is_not_duplicated_when_both_hook_and_file_discove
     events = adapter.subscribe("session-dup")
     started = await events.__anext__()
     assert started.type == "session_started"
+    adapter.open_session("session-dup")
 
     # File discovery now also notices the same session.
     transcript.touch()
@@ -109,6 +110,71 @@ async def test_session_started_is_not_duplicated_when_both_hook_and_file_discove
 
 
 @pytest.mark.asyncio
+async def test_content_events_are_not_forwarded_until_the_session_is_opened(adapter, tmp_path):
+    """R: 'do not connect automatically to opened session, just show that
+    it exists' - a discovered session's conversation content must not
+    reach a phone that never asked to look at it. Only session_started/
+    session_ended (the Sessions list's 'this exists' signal) forward
+    unconditionally."""
+    project_dir = tmp_path / "projects" / "my-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-unopened.jsonl"
+    transcript.touch()
+    await _wait_until(lambda: "session-unopened" in adapter.discover_sessions())
+
+    events = adapter.subscribe("session-unopened")
+    started = await events.__anext__()
+    assert started.type == "session_started"
+
+    _write_line(
+        transcript,
+        {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "should stay unforwarded"}]}},
+    )
+    await asyncio.sleep(FAST_POLL * 20)  # give the tail loop time to pick up and process the line
+    # Never queued at all - checking the queue directly (rather than
+    # racing events.__anext__() against a timeout) avoids cancelling the
+    # subscribe() generator, which would leave it unusable afterward.
+    assert adapter._sessions["session-unopened"].events.qsize() == 0
+
+    # Opening now only surfaces *new* content from this point forward -
+    # the earlier, unforwarded line never arrives.
+    adapter.open_session("session-unopened")
+    _write_line(
+        transcript,
+        {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "after opening"}]}},
+    )
+    next_event = await events.__anext__()
+    assert next_event.type == "assistant_message"
+    assert next_event.data["text"] == "after opening"
+
+
+@pytest.mark.asyncio
+async def test_session_started_is_re_announced_with_cwd_once_known_even_if_unopened(adapter, tmp_path):
+    """The Sessions list needs a project name (R: 'name would be good to
+    have to differentiate') even before the phone opens the session - cwd
+    isn't known at the original session_started (mere file discovery), so
+    it rides a second, always-forwarded session_started instead."""
+    project_dir = tmp_path / "projects" / "my-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-named.jsonl"
+    transcript.touch()
+    await _wait_until(lambda: "session-named" in adapter.discover_sessions())
+
+    events = adapter.subscribe("session-named")
+    started = await events.__anext__()
+    assert started.type == "session_started"
+    assert started.data.get("cwd") is None
+
+    _write_line(
+        transcript,
+        {"type": "user", "cwd": "/Users/x/my-repo", "message": {"role": "user", "content": "hi"}},
+    )
+    announced = await events.__anext__()
+    assert announced.type == "session_started"
+    assert announced.data["cwd"] == "/Users/x/my-repo"
+
+
+@pytest.mark.asyncio
 async def test_discovers_transcript_and_streams_normalized_events(adapter, tmp_path):
     project_dir = tmp_path / "projects" / "my-repo"
     project_dir.mkdir()
@@ -121,6 +187,7 @@ async def test_discovers_transcript_and_streams_normalized_events(adapter, tmp_p
     started = await events.__anext__()
     assert started.type == "session_started"
     assert started.data["mode"] == "observe_only"  # U7 disables send/interrupt using this
+    adapter.open_session("session-abc")  # R: content only forwards once opened
 
     _write_line(
         transcript,
@@ -178,6 +245,7 @@ async def test_tool_result_duration_computed_from_entry_timestamps(adapter, tmp_
     await _wait_until(lambda: "session-timed" in adapter.discover_sessions())
     events = adapter.subscribe("session-timed")
     await events.__anext__()  # session_started
+    adapter.open_session("session-timed")
 
     _write_line(
         transcript,
@@ -217,6 +285,7 @@ async def test_tool_result_without_a_matching_tool_call_has_no_duration(adapter,
     await _wait_until(lambda: "session-untimed" in adapter.discover_sessions())
     events = adapter.subscribe("session-untimed")
     await events.__anext__()  # session_started
+    adapter.open_session("session-untimed")
 
     _write_line(
         transcript,
@@ -243,6 +312,7 @@ async def test_large_tool_result_content_is_truncated(adapter, tmp_path):
     await _wait_until(lambda: "session-huge" in adapter.discover_sessions())
     events = adapter.subscribe("session-huge")
     await events.__anext__()  # session_started
+    adapter.open_session("session-huge")
 
     _write_line(
         transcript,
@@ -282,6 +352,7 @@ async def test_concurrent_partial_write_does_not_double_emit_or_drop(adapter, tm
     await _wait_until(lambda: "session-partial" in adapter.discover_sessions())
     events = adapter.subscribe("session-partial")
     await events.__anext__()  # session_started
+    adapter.open_session("session-partial")
 
     line = json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "partial-safe"}]}})
     # Write in two chunks with no trailing newline on the first, simulating
@@ -325,6 +396,294 @@ async def test_permission_request_hook_round_trips_through_socket(adapter, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_auto_approve_policy_allows_an_allowlisted_command_without_a_phone_round_trip(tmp_path):
+    """A terminal-started session's PermissionRequest hook gets the same
+    treatment as a phone-started one once the observed-session policy is
+    enabled (ObserveAdapter(auto_approve=True)) - the hook response comes
+    back "allow" immediately, with no respond_to_permission call needed,
+    for a command companion/auto_approve.py's allowlist covers."""
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    project_dir = projects_dir / "my-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-auto.jsonl"
+    transcript.touch()
+
+    a = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        socket_path=_short_socket_path(),
+        watch_poll_interval=FAST_POLL,
+        tail_poll_interval=FAST_POLL,
+        auto_approve=True,
+    )
+    await a.start()
+    try:
+        await _wait_until(lambda: "session-auto" in a.discover_sessions())
+        events = a.subscribe("session-auto")
+        await events.__anext__()  # session_started (no cwd yet)
+
+        # Content written before start() is treated as pre-existing history
+        # and skipped (see test_preexisting_transcript_content_is_not_replayed)
+        # - the cwd-bearing line has to land after discovery, like any other
+        # "new" transcript content, and re-announces session_started once
+        # picked up (note_cwd_known).
+        _write_line(transcript, {"type": "assistant", "cwd": str(project_dir), "message": {"role": "assistant", "content": []}})
+        await _wait_until(lambda: a.get_cwd("session-auto") == str(project_dir))
+        await events.__anext__()  # session_started (cwd now known)
+
+        response = await _send_hook_async(
+            a.socket_path,
+            "PermissionRequest",
+            {"session_id": "session-auto", "tool_use_id": "tool-1", "tool_name": "Bash", "tool_input": {"command": "pytest"}},
+        )
+        assert response == {"permissionDecision": "allow", "permissionDecisionReason": ""}
+
+        event = await events.__anext__()
+        assert event.type == "permission_request"
+        assert event.data["auto_approved"] is True
+        assert event.data["judged_by"] == "policy"
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_auto_approve_policy_still_blocks_a_denylisted_command_for_observed_sessions(tmp_path):
+    """The denylist wins for observed sessions too - git push always
+    prompts, regardless of the observed-session auto_approve setting."""
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    project_dir = projects_dir / "my-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-denylist.jsonl"
+    transcript.touch()
+
+    a = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        socket_path=_short_socket_path(),
+        watch_poll_interval=FAST_POLL,
+        tail_poll_interval=FAST_POLL,
+        auto_approve=True,
+    )
+    await a.start()
+    try:
+        await _wait_until(lambda: "session-denylist" in a.discover_sessions())
+        events = a.subscribe("session-denylist")
+        await events.__anext__()  # session_started
+
+        hook_task = asyncio.create_task(
+            _send_hook_async(
+                a.socket_path,
+                "PermissionRequest",
+                {"session_id": "session-denylist", "tool_use_id": "tool-1", "tool_name": "Bash", "tool_input": {"command": "git push"}},
+            )
+        )
+        permission_event = await events.__anext__()
+        assert permission_event.type == "permission_request"
+        assert "auto_approved" not in permission_event.data
+
+        await a.respond_to_permission("session-denylist", "tool-1", "allow")
+        response = await asyncio.wait_for(hook_task, timeout=2)
+        assert response["permissionDecision"] == "allow"
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_auto_approve_off_by_default_still_prompts_for_observed_sessions(adapter, tmp_path):
+    """The default ObserveAdapter() (as built by the `adapter` fixture,
+    with no auto_approve kwarg) behaves exactly as before this feature -
+    every permission request blocks on a phone response."""
+    project_dir = tmp_path / "projects" / "my-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-default.jsonl"
+    transcript.touch()
+    await _wait_until(lambda: "session-default" in adapter.discover_sessions())
+    events = adapter.subscribe("session-default")
+    await events.__anext__()  # session_started
+
+    hook_task = asyncio.create_task(
+        _send_hook_async(
+            adapter.socket_path,
+            "PermissionRequest",
+            {"session_id": "session-default", "tool_use_id": "tool-1", "tool_name": "Bash", "tool_input": {"command": "pytest"}},
+        )
+    )
+    permission_event = await events.__anext__()
+    assert permission_event.type == "permission_request"
+    assert "auto_approved" not in permission_event.data
+
+    await adapter.respond_to_permission("session-default", "tool-1", "allow")
+    await asyncio.wait_for(hook_task, timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_llm_judge_auto_approves_an_observed_session_command_on_a_safe_verdict(tmp_path, monkeypatch):
+    """llm_judge is opt-in and separate from auto_approve, same as the
+    phone-started path - a command the allowlist doesn't cover still gets
+    auto-approved when the (faked) judge answers SAFE."""
+    from claude_agent_sdk import AssistantMessage, TextBlock
+
+    from companion import risk_judge
+
+    async def fake_query(*, prompt, options):
+        yield AssistantMessage(content=[TextBlock(text="SAFE: ordinary command")], model="claude")
+
+    monkeypatch.setattr(risk_judge, "query", fake_query)
+
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    project_dir = projects_dir / "my-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-llm.jsonl"
+    transcript.touch()
+
+    a = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        socket_path=_short_socket_path(),
+        watch_poll_interval=FAST_POLL,
+        tail_poll_interval=FAST_POLL,
+        auto_approve=True,
+        llm_judge=True,
+    )
+    await a.start()
+    try:
+        await _wait_until(lambda: "session-llm" in a.discover_sessions())
+        events = a.subscribe("session-llm")
+        await events.__anext__()  # session_started
+
+        response = await _send_hook_async(
+            a.socket_path,
+            "PermissionRequest",
+            {"session_id": "session-llm", "tool_use_id": "tool-1", "tool_name": "Bash", "tool_input": {"command": "some-custom-script.sh"}},
+        )
+        assert response == {"permissionDecision": "allow", "permissionDecisionReason": ""}
+
+        event = await events.__anext__()
+        assert event.type == "permission_request"
+        assert event.data["auto_approved"] is True
+        assert event.data["judged_by"] == "llm"
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_llm_judge_is_never_consulted_for_a_denylisted_observed_session_command(tmp_path, monkeypatch):
+    from companion import risk_judge
+
+    async def judge_should_not_be_called(*, prompt, options):
+        raise AssertionError("the LLM judge must never be consulted for a denylisted command")
+        yield  # pragma: no cover - makes this a generator function
+
+    monkeypatch.setattr(risk_judge, "query", judge_should_not_be_called)
+
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    project_dir = projects_dir / "my-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-llm-deny.jsonl"
+    transcript.touch()
+
+    a = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        socket_path=_short_socket_path(),
+        watch_poll_interval=FAST_POLL,
+        tail_poll_interval=FAST_POLL,
+        auto_approve=True,
+        llm_judge=True,
+    )
+    await a.start()
+    try:
+        await _wait_until(lambda: "session-llm-deny" in a.discover_sessions())
+        events = a.subscribe("session-llm-deny")
+        await events.__anext__()  # session_started
+
+        hook_task = asyncio.create_task(
+            _send_hook_async(
+                a.socket_path,
+                "PermissionRequest",
+                {"session_id": "session-llm-deny", "tool_use_id": "tool-1", "tool_name": "Bash", "tool_input": {"command": "git push"}},
+            )
+        )
+        permission_event = await events.__anext__()
+        assert permission_event.type == "permission_request"
+        assert "auto_approved" not in permission_event.data
+
+        await a.respond_to_permission("session-llm-deny", "tool-1", "allow")
+        await asyncio.wait_for(hook_task, timeout=2)
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_auto_approve_never_resolves_a_structured_question_even_with_llm_judge_on(tmp_path, monkeypatch):
+    """Regression: AskUserQuestion must always fall through to the
+    blocking human-prompt path, even with both auto_approve and llm_judge
+    enabled - "is this safe" is the wrong question for it (the real
+    answer is the phone's chosen option, which only respond_to_permission
+    can carry back). Before this guard, a SAFE verdict from the judge
+    (or, in principle, a permissive is_auto_approvable) would silently
+    resolve the question with a bare allow before the phone ever chose,
+    breaking the "choosing options" feature entirely for observed
+    sessions with auto-approve on."""
+    from companion import risk_judge
+
+    async def judge_always_says_safe(*, prompt, options):
+        from claude_agent_sdk import AssistantMessage, TextBlock
+
+        yield AssistantMessage(content=[TextBlock(text="SAFE: just a question")], model="claude")
+
+    monkeypatch.setattr(risk_judge, "query", judge_always_says_safe)
+
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    project_dir = projects_dir / "my-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-question.jsonl"
+    transcript.touch()
+
+    a = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        socket_path=_short_socket_path(),
+        watch_poll_interval=FAST_POLL,
+        tail_poll_interval=FAST_POLL,
+        auto_approve=True,
+        llm_judge=True,
+    )
+    await a.start()
+    try:
+        await _wait_until(lambda: "session-question" in a.discover_sessions())
+        events = a.subscribe("session-question")
+        await events.__anext__()  # session_started
+
+        question_input = {
+            "questions": [{"question": "Which files?", "options": [{"label": "Last commit"}, {"label": "Last 5"}]}]
+        }
+        hook_task = asyncio.create_task(
+            _send_hook_async(
+                a.socket_path,
+                "PermissionRequest",
+                {
+                    "session_id": "session-question",
+                    "tool_use_id": "tool-1",
+                    "tool_name": "AskUserQuestion",
+                    "tool_input": question_input,
+                },
+            )
+        )
+
+        permission_event = await events.__anext__()
+        assert permission_event.type == "permission_request"
+        assert "auto_approved" not in permission_event.data
+        assert not hook_task.done()  # still blocked - not silently auto-resolved
+
+        await a.respond_to_permission("session-question", "tool-1", "allow", message="Last commit")
+        response = await asyncio.wait_for(hook_task, timeout=2)
+        assert response == {"permissionDecision": "allow", "permissionDecisionReason": "Last commit"}
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
 async def test_hook_for_unknown_session_is_rejected(adapter):
     response = await _send_hook_async(
         adapter.socket_path, "Stop", {"session_id": "no-such-session"}
@@ -347,3 +706,300 @@ async def test_send_message_and_interrupt_return_unsupported_result(adapter, tmp
     interrupt_result = await adapter.interrupt("session-ro")
     assert interrupt_result.operation == "interrupt"
     assert "not supported" in interrupt_result.reason
+
+    compact_result = await adapter.compact("session-ro")
+    assert compact_result.operation == "compact"
+    assert "not supported" in compact_result.reason
+
+
+# --- Safeguards for watching the real ~/.claude/projects (not just test
+# fixtures) - reproducing the CPU-storm incident at unit-test scale would
+# mean tailing a real multi-MB history, so these instead assert the
+# mechanism directly: existing content is skipped, old files are ignored,
+# and the watched-session count is capped. -------------------------------
+
+
+@pytest.mark.asyncio
+async def test_preexisting_transcript_content_is_not_replayed(tmp_path):
+    """Only new lines written after discovery show up - a transcript that
+    already has megabytes of history by the time we notice it must not be
+    read and emitted as if it just happened."""
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    project_dir = projects_dir / "my-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-old-content.jsonl"
+    _write_line(transcript, {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "old, pre-existing turn"}]}})
+
+    a = ObserveAdapter(projects_dir=str(projects_dir), socket_path=_short_socket_path(), watch_poll_interval=FAST_POLL, tail_poll_interval=FAST_POLL)
+    await a.start()
+    try:
+        await _wait_until(lambda: "session-old-content" in a.discover_sessions())
+        events = a.subscribe("session-old-content")
+        started = await events.__anext__()
+        assert started.type == "session_started"
+        a.open_session("session-old-content")
+
+        _write_line(transcript, {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "new turn"}]}})
+        new_event = await events.__anext__()
+        assert new_event.type == "assistant_message"
+        assert new_event.data["text"] == "new turn"
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_stale_transcript_is_never_watched(tmp_path):
+    """A transcript untouched for longer than stale_after_seconds is old
+    history, not a live session - real usage points this at ~/.claude/projects,
+    which can hold months of dormant sessions across every project ever
+    touched."""
+    import os
+    import time
+
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    project_dir = projects_dir / "my-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-stale.jsonl"
+    transcript.touch()
+    old = time.time() - 1000
+    os.utime(transcript, (old, old))
+
+    a = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        socket_path=_short_socket_path(),
+        watch_poll_interval=FAST_POLL,
+        tail_poll_interval=FAST_POLL,
+        stale_after_seconds=500,
+    )
+    await a.start()
+    try:
+        await asyncio.sleep(FAST_POLL * 10)
+        assert "session-stale" not in a.discover_sessions()
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_watched_session_count_is_capped(tmp_path):
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    project_dir = projects_dir / "my-repo"
+    project_dir.mkdir()
+    (project_dir / "session-a.jsonl").touch()
+    (project_dir / "session-b.jsonl").touch()
+
+    a = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        socket_path=_short_socket_path(),
+        watch_poll_interval=FAST_POLL,
+        tail_poll_interval=FAST_POLL,
+        max_watched_sessions=1,
+    )
+    await a.start()
+    try:
+        await _wait_until(lambda: len(a.discover_sessions()) >= 1)
+        await asyncio.sleep(FAST_POLL * 10)
+        assert len(a.discover_sessions()) == 1
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_session_from_a_client_not_in_required_entrypoints_is_never_watched(tmp_path):
+    """~/.claude/projects is shared machine-wide across every client and
+    project - required_entrypoints (R: 'give an ability to choose what
+    clients to use') lets a session from an unrelated repo opened in a
+    different client (e.g. the VS Code extension) stay out of the phone's
+    Sessions list."""
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    project_dir = projects_dir / "other-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-vscode.jsonl"
+    _write_line(transcript, {"type": "user", "entrypoint": "claude-vscode", "cwd": str(project_dir)})
+
+    a = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        socket_path=_short_socket_path(),
+        watch_poll_interval=FAST_POLL,
+        tail_poll_interval=FAST_POLL,
+        required_entrypoints=frozenset({"claude-desktop"}),
+    )
+    await a.start()
+    try:
+        await asyncio.sleep(FAST_POLL * 10)
+        assert "session-vscode" not in a.discover_sessions()
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_session_matching_one_of_several_required_entrypoints_is_watched(tmp_path):
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    project_dir = projects_dir / "my-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-desktop.jsonl"
+    _write_line(transcript, {"type": "user", "entrypoint": "claude-desktop", "cwd": str(project_dir)})
+
+    a = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        socket_path=_short_socket_path(),
+        watch_poll_interval=FAST_POLL,
+        tail_poll_interval=FAST_POLL,
+        required_entrypoints=frozenset({"claude-desktop", "claude-vscode"}),
+    )
+    await a.start()
+    try:
+        await _wait_until(lambda: "session-desktop" in a.discover_sessions())
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_no_required_entrypoints_means_no_filtering(tmp_path):
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    project_dir = projects_dir / "my-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-anything.jsonl"
+    _write_line(transcript, {"type": "user", "entrypoint": "sdk-ts", "cwd": str(project_dir)})
+
+    a = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        socket_path=_short_socket_path(),
+        watch_poll_interval=FAST_POLL,
+        tail_poll_interval=FAST_POLL,
+    )
+    await a.start()
+    try:
+        await _wait_until(lambda: "session-anything" in a.discover_sessions())
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_set_required_entrypoints_changes_filtering_for_transcripts_discovered_after(tmp_path):
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    project_dir = projects_dir / "my-repo"
+    project_dir.mkdir()
+
+    a = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        socket_path=_short_socket_path(),
+        watch_poll_interval=FAST_POLL,
+        tail_poll_interval=FAST_POLL,
+        required_entrypoints=frozenset({"claude-desktop"}),
+    )
+    await a.start()
+    try:
+        assert a.get_required_entrypoints() == frozenset({"claude-desktop"})
+        a.set_required_entrypoints(frozenset({"claude-vscode"}))
+        assert a.get_required_entrypoints() == frozenset({"claude-vscode"})
+
+        transcript = project_dir / "session-vscode.jsonl"
+        _write_line(transcript, {"type": "user", "entrypoint": "claude-vscode", "cwd": str(project_dir)})
+        await _wait_until(lambda: "session-vscode" in a.discover_sessions())
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_is_active_reflects_a_discovered_sessions_live_state(adapter, tmp_path):
+    project_dir = tmp_path / "projects" / "my-repo"
+    project_dir.mkdir()
+    (project_dir / "session-a.jsonl").touch()
+    await _wait_until(lambda: "session-a" in adapter.discover_sessions())
+
+    assert adapter.is_active("session-a") is True
+
+    await _send_hook_async(adapter.socket_path, "SessionEnd", {"session_id": "session-a"})
+
+    assert adapter.is_active("session-a") is False
+
+
+def test_is_active_for_unknown_session_returns_none(adapter):
+    assert adapter.is_active("no-such-session") is None
+
+
+@pytest.mark.asyncio
+async def test_set_session_auto_approve_overrides_a_specific_sessions_snapshotted_state(adapter, tmp_path):
+    """The per-session override lets the phone flip a single already-
+    discovered session's behavior without touching the adapter-wide
+    default or any other session - see ObserveAdapter.set_session_auto_approve."""
+    project_dir = tmp_path / "projects" / "my-repo"
+    project_dir.mkdir()
+    (project_dir / "session-a.jsonl").touch()
+    await _wait_until(lambda: "session-a" in adapter.discover_sessions())
+
+    session = adapter._sessions["session-a"]
+    assert session.auto_approve is False  # snapshotted from the adapter default (False)
+    assert session.llm_judge is False
+
+    assert adapter.set_session_auto_approve("session-a", auto_approve=True) is True
+    assert session.auto_approve is True
+    assert session.llm_judge is False  # untouched - only auto_approve was passed
+
+
+@pytest.mark.asyncio
+async def test_set_session_auto_approve_none_leaves_that_field_untouched(adapter, tmp_path):
+    project_dir = tmp_path / "projects" / "my-repo"
+    project_dir.mkdir()
+    (project_dir / "session-b.jsonl").touch()
+    await _wait_until(lambda: "session-b" in adapter.discover_sessions())
+
+    session = adapter._sessions["session-b"]
+    adapter.set_session_auto_approve("session-b", auto_approve=True, llm_judge=True)
+    assert session.auto_approve is True
+    assert session.llm_judge is True
+
+    # Passing None for auto_approve leaves it at its current value while
+    # still changing llm_judge - same convention as daemon.py's
+    # set_auto_approve_settings.
+    adapter.set_session_auto_approve("session-b", auto_approve=None, llm_judge=False)
+    assert session.auto_approve is True
+    assert session.llm_judge is False
+
+
+@pytest.mark.asyncio
+async def test_set_session_auto_approve_only_affects_the_targeted_session(adapter, tmp_path):
+    project_dir = tmp_path / "projects" / "my-repo"
+    project_dir.mkdir()
+    (project_dir / "session-c.jsonl").touch()
+    (project_dir / "session-d.jsonl").touch()
+    await _wait_until(lambda: "session-c" in adapter.discover_sessions() and "session-d" in adapter.discover_sessions())
+
+    adapter.set_session_auto_approve("session-c", auto_approve=True)
+    assert adapter._sessions["session-c"].auto_approve is True
+    assert adapter._sessions["session-d"].auto_approve is False
+
+
+@pytest.mark.asyncio
+async def test_set_session_auto_approve_for_unknown_session_returns_false_without_raising(adapter):
+    assert adapter.set_session_auto_approve("no-such-session", auto_approve=True) is False
+
+
+@pytest.mark.asyncio
+async def test_set_session_auto_approve_emits_a_confirmation_event_once_opened(adapter, tmp_path):
+    """The confirmation event only reaches the phone once the session is
+    opened (same forwarding rule as any other non-lifecycle event, see
+    _ObserveSession.emit) - matches the real mobile flow, where the
+    per-session toggle only appears inside an already-opened session."""
+    project_dir = tmp_path / "projects" / "my-repo"
+    project_dir.mkdir()
+    (project_dir / "session-e.jsonl").touch()
+    await _wait_until(lambda: "session-e" in adapter.discover_sessions())
+
+    events = adapter.subscribe("session-e")
+    started = await events.__anext__()
+    assert started.type == "session_started"
+    adapter.open_session("session-e")
+
+    adapter.set_session_auto_approve("session-e", auto_approve=True, llm_judge=True)
+    confirm = await events.__anext__()
+    assert confirm.type == "session_auto_approve"
+    assert confirm.data["auto_approve"] is True
+    assert confirm.data["llm_judge"] is True
