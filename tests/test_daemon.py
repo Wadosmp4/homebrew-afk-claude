@@ -82,8 +82,17 @@ async def relay(tmp_path, pg_url):
 @pytest_asyncio.fixture
 async def companion_token(relay):
     app, _port, _db_path = relay
-    _, token = auth.bootstrap_companion_device(app.state.db)
-    return token
+    device_id, token = auth.bootstrap_companion_device(app.state.db)
+    # U2 (R8/KD6): every phone-sent action must now carry a device_id
+    # naming its target companion. Every test in this file predates
+    # multi-Mac support and only ever connects one companion, so rather
+    # than threading device_id through every one of _FakePhone's ~40 call
+    # sites, _FakePhone.send_action auto-fills it from this one companion
+    # whenever a test's action dict doesn't already set one - scoped by
+    # this fixture's own teardown, so it never leaks between tests.
+    _FakePhone.default_device_id = device_id
+    yield token
+    _FakePhone.default_device_id = None
 
 
 @pytest_asyncio.fixture
@@ -219,7 +228,7 @@ async def test_sdk_session_forwarding_resumes_after_relay_reconnect(tmp_path, pg
     and was never restarted (see _watch_active_sessions)."""
     db_path = pg_url
     app = create_app(db_path)
-    _, companion_token = auth.bootstrap_companion_device(app.state.db)
+    companion_device_id, companion_token = auth.bootstrap_companion_device(app.state.db)
     _, phone_token = auth.create_device(app.state.db, "phone")
     port = _free_port()
 
@@ -238,7 +247,9 @@ async def test_sdk_session_forwarding_resumes_after_relay_reconnect(tmp_path, pg
 
     phone = await _FakePhone.connect(port, phone_token)
     try:
-        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        await phone.send_action(
+            {"kind": "start_session", "cwd": "/tmp/some-repo", "device_id": companion_device_id}
+        )
         started = await phone.next_event()
         session_id = started["session_id"]
         await phone.close()
@@ -257,7 +268,12 @@ async def test_sdk_session_forwarding_resumes_after_relay_reconnect(tmp_path, pg
             phone2 = await _FakePhone.connect(port, phone_token)
             try:
                 await phone2.send_action(
-                    {"kind": "send_message", "session_id": session_id, "text": "still there?"}
+                    {
+                        "kind": "send_message",
+                        "session_id": session_id,
+                        "text": "still there?",
+                        "device_id": companion_device_id,
+                    }
                 )
                 event = await phone2.next_event(timeout=3.0)
                 assert event["type"] == "user_message"
@@ -280,6 +296,10 @@ class _FakePhone:
     companion events arrive the same way U7's dashboard will receive them.
     """
 
+    # Set/cleared by the companion_token fixture for the duration of each
+    # test - see that fixture's own comment for why this exists.
+    default_device_id: "str | None" = None
+
     def __init__(self, ws, token: str):
         self._ws = ws
         self._token = token
@@ -293,6 +313,8 @@ class _FakePhone:
         return cls(ws, token)
 
     async def send_action(self, action: dict) -> None:
+        if "device_id" not in action and _FakePhone.default_device_id is not None:
+            action = {**action, "device_id": _FakePhone.default_device_id}
         await self._ws.send(json.dumps({"token": self._token, "type": "action", "action": action}))
 
     async def next_event(self, timeout: float = 2.0) -> dict:
