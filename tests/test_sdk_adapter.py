@@ -16,6 +16,8 @@ import asyncio
 import pytest
 from claude_agent_sdk import (
     AssistantMessage,
+    RateLimitEvent,
+    RateLimitInfo,
     ResultMessage,
     TextBlock,
     ToolResultBlock,
@@ -272,6 +274,38 @@ async def test_context_usage_poll_failure_does_not_crash_the_read_loop(adapter):
     await adapter.send_message("s1", "still alive?")
     user_event = await events.__anext__()
     assert user_event.type == "user_message"
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_event_is_emitted_when_the_cli_reports_one(adapter):
+    """The CLI pushes a RateLimitEvent whenever a rate-limit window's status
+    changes (not on a fixed poll, unlike context_usage) - the adapter just
+    has to forward it, normalized into the shared event model."""
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    started = await events.__anext__()
+    assert started.type == "session_started"
+
+    client.push(
+        RateLimitEvent(
+            rate_limit_info=RateLimitInfo(
+                status="allowed_warning",
+                rate_limit_type="five_hour",
+                utilization=0.82,
+                resets_at=1700000000,
+            ),
+            uuid="rl-1",
+            session_id="s1",
+        )
+    )
+
+    rate_limit_event = await events.__anext__()
+    assert rate_limit_event.type == "rate_limit"
+    assert rate_limit_event.data["rate_limit_type"] == "five_hour"
+    assert rate_limit_event.data["status"] == "allowed_warning"
+    assert rate_limit_event.data["utilization"] == 0.82
+    assert rate_limit_event.data["resets_at"] == 1700000000
 
 
 @pytest.mark.asyncio

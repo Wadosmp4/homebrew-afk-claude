@@ -26,6 +26,7 @@ from claude_agent_sdk import (
     ClaudeSDKClient,
     PermissionResultAllow,
     PermissionResultDeny,
+    RateLimitEvent,
     ResultMessage,
     TextBlock,
     ToolResultBlock,
@@ -418,6 +419,33 @@ class _Session:
                 self.emit("error", message=message.result or f"turn ended with error: {message.subtype}")
             else:
                 self.emit("waiting_for_input", subtype=message.subtype)
+        elif isinstance(message, RateLimitEvent):
+            self._handle_rate_limit(message)
+
+    def _handle_rate_limit(self, message: RateLimitEvent) -> None:
+        # Pushed by the CLI only on a status transition (e.g.
+        # allowed -> allowed_warning), one window (five_hour/seven_day/...)
+        # per event - there's no on-demand "get current usage" call, so the
+        # phone only ever learns what's changed since this session started,
+        # not necessarily every window's live state. `utilization` is
+        # nullable in the CLI's own payload (claude_agent_sdk's parser reads
+        # it as `info.get("utilization")` with no default) - a null here
+        # means the CLI itself didn't report a percentage for this
+        # transition, not a bug on this side. Logged at info level (fires
+        # rarely - only on an actual status transition) so a real payload
+        # can be inspected without needing debug logging enabled.
+        info = message.rate_limit_info
+        logger.info("rate_limit_event for %s: %r", self.session_id, info.raw)
+        self.emit(
+            "rate_limit",
+            rate_limit_type=info.rate_limit_type,
+            status=info.status,
+            utilization=info.utilization,
+            resets_at=info.resets_at,
+            overage_status=info.overage_status,
+            overage_resets_at=info.overage_resets_at,
+            raw=info.raw,
+        )
 
     def _handle_tool_result(self, block: ToolResultBlock) -> None:
         started_at = self.tool_started_at.pop(block.tool_use_id, None)

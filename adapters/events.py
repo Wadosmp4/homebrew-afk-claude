@@ -5,7 +5,8 @@ hook-specific fields.
 
 Event types (R6): assistant_message, tool_call, tool_result,
 permission_request, user_message, and the lifecycle events
-session_started, session_ended, waiting_for_input, error.
+session_started, session_ended, waiting_for_input, error. See EVENT_TYPES
+below for the full set including later additions.
 """
 from __future__ import annotations
 
@@ -57,6 +58,12 @@ EVENT_TYPES = frozenset(
         # shows. ObserveAdapter never emits this - an observed session
         # isn't driven by our own client, so we have no equivalent to poll.
         "context_usage",
+        # SDK-owned only (SDKAdapter._Session._handle_rate_limit): pushed
+        # by the CLI whenever a rate-limit window's status changes, not on
+        # a fixed poll like context_usage - see claude_agent_sdk's
+        # RateLimitEvent. ObserveAdapter never emits this, same reasoning
+        # as context_usage above.
+        "rate_limit",
     }
 )
 
