@@ -71,6 +71,8 @@ class SDKAdapter:
         auto_approve: bool = False,
         llm_judge: bool = False,
         resume: Optional[str] = None,
+        cli_path: Optional[str] = None,
+        cli_env: dict[str, str] = {},
     ) -> None:
         if session_id in self._sessions:
             raise ValueError(f"session already connected: {session_id}")
@@ -106,8 +108,21 @@ class SDKAdapter:
         # to False, so the resumed conversation keeps the same session_id
         # rather than being copied to a new one - required here since our
         # own bookkeeping below keys on the session_id the caller passed in.
+        # `cli_env` must stay dict-shaped here, never collapsed to None -
+        # ClaudeAgentOptions.env is dict-typed (default_factory=dict), not
+        # Optional, on the SDK side, and the real subprocess transport
+        # unconditionally dict-unpacks it (**self._options.env) when
+        # building the child process's environment. Unlike `model=None`
+        # (a legitimate "leave the SDK default alone" sentinel for an
+        # Optional[str] field), env=None would raise a TypeError on every
+        # single session start, not just when a CLI profile is configured.
         options = ClaudeAgentOptions(
-            cwd=session.cwd, model=model, can_use_tool=session.can_use_tool, resume=resume
+            cwd=session.cwd,
+            model=model,
+            can_use_tool=session.can_use_tool,
+            resume=resume,
+            cli_path=cli_path,
+            env=cli_env,
         )
         session.client = self._client_factory(options)
 

@@ -997,6 +997,111 @@ async def test_set_auto_approve_settings_action_can_toggle_auto_approve_without_
         await phone.close()
 
 
+# --- U4: per-Mac CLI binary/profile setting -------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_cli_settings_action_reports_the_current_defaults(running_daemon, phone_token):
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "get_cli_settings"})
+
+        event = await phone.next_event()
+        assert event["type"] == "cli_settings"
+        assert event["data"]["cli_path"] is None
+        assert event["data"]["cli_env"] == {}
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_set_cli_settings_action_persists_to_config_and_reflects_back(running_daemon, phone_token):
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action(
+            {
+                "kind": "set_cli_settings",
+                "cli_path": "/usr/local/bin/claude-custom",
+                "cli_env": {"ANTHROPIC_API_KEY": "sk-test"},
+            }
+        )
+
+        event = await phone.next_event()
+        assert event["type"] == "cli_settings"
+        assert event["data"]["cli_path"] == "/usr/local/bin/claude-custom"
+        assert event["data"]["cli_env"] == {"ANTHROPIC_API_KEY": "sk-test"}
+        assert daemon.config.cli_path == "/usr/local/bin/claude-custom"
+        assert daemon.config.cli_env == {"ANTHROPIC_API_KEY": "sk-test"}
+
+        persisted = load_config(daemon.config_path)
+        assert persisted.cli_path == "/usr/local/bin/claude-custom"
+        assert persisted.cli_env == {"ANTHROPIC_API_KEY": "sk-test"}
+
+        # A subsequent get_cli_settings reflects the persisted values too,
+        # not just the immediate confirmation reply above.
+        await phone.send_action({"kind": "get_cli_settings"})
+        confirm = await phone.next_event()
+        assert confirm["data"]["cli_path"] == "/usr/local/bin/claude-custom"
+        assert confirm["data"]["cli_env"] == {"ANTHROPIC_API_KEY": "sk-test"}
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_start_session_action_threads_the_configured_cli_settings_into_the_sdk_adapter(
+    running_daemon, phone_token
+):
+    """Unlike model/auto_approve/llm_judge, cli_path/cli_env have no
+    phone-side per-request equivalent (KTD5) - start_session must read
+    them straight from self.config, not from the action payload."""
+    daemon, port, fake_clients = running_daemon
+    daemon.config.cli_path = "/usr/local/bin/claude-custom"
+    daemon.config.cli_env = {"ANTHROPIC_API_KEY": "sk-test"}
+
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        await phone.next_event()  # session_started
+
+        assert fake_clients[0].options.cli_path == "/usr/local/bin/claude-custom"
+        assert fake_clients[0].options.env == {"ANTHROPIC_API_KEY": "sk-test"}
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_resumed_sdk_session_also_threads_the_configured_cli_settings(running_daemon, phone_token):
+    """_try_resume_sdk_session is the other of the two connect() call
+    sites (KTD5) - it must also read cli_path/cli_env from self.config
+    directly, since there's no saved SessionSettings equivalent for a
+    Mac-level setting."""
+    daemon, port, fake_clients = running_daemon
+    daemon.config.cli_path = "/usr/local/bin/claude-custom"
+    daemon.config.cli_env = {"ANTHROPIC_API_KEY": "sk-test"}
+
+    projects_dir = daemon.observe_adapter.projects_dir
+    project_dir = projects_dir / "my-repo"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "old-session-1.jsonl").write_text(
+        json.dumps({"type": "user", "cwd": "/tmp/some-repo", "message": {"role": "user", "content": "hi"}}) + "\n"
+    )
+
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action(
+            {"kind": "send_message", "session_id": "old-session-1", "text": "still there?"}
+        )
+        started = await phone.next_event()
+        assert started["type"] == "session_started"
+
+        assert fake_clients[0].options.cli_path == "/usr/local/bin/claude-custom"
+        assert fake_clients[0].options.env == {"ANTHROPIC_API_KEY": "sk-test"}
+    finally:
+        await phone.close()
+
+
 @pytest.mark.asyncio
 async def test_read_session_history_action_returns_the_normalized_conversation(
     running_daemon, phone_token, tmp_path, monkeypatch

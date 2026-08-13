@@ -138,6 +138,49 @@ async def test_connect_with_no_resume_leaves_claude_agent_options_default(adapte
 
 
 @pytest.mark.asyncio
+async def test_connect_passes_the_configured_cli_path_to_claude_agent_options(adapter):
+    """U4/KTD5: a Mac-level CLI binary/profile setting, threaded straight
+    into ClaudeAgentOptions.cli_path."""
+    await adapter.connect("s1", cli_path="/usr/local/bin/claude-custom")
+
+    client = adapter._test_clients["latest"]
+    assert client.options.cli_path == "/usr/local/bin/claude-custom"
+
+
+@pytest.mark.asyncio
+async def test_connect_with_no_cli_path_leaves_claude_agent_options_default(adapter):
+    await adapter.connect("s1")
+
+    client = adapter._test_clients["latest"]
+    assert client.options.cli_path is None
+
+
+@pytest.mark.asyncio
+async def test_connect_passes_the_configured_cli_env_to_claude_agent_options(adapter):
+    await adapter.connect("s1", cli_env={"ANTHROPIC_API_KEY": "sk-test"})
+
+    client = adapter._test_clients["latest"]
+    assert client.options.env == {"ANTHROPIC_API_KEY": "sk-test"}
+
+
+@pytest.mark.asyncio
+async def test_connect_with_no_cli_env_passes_an_empty_dict_never_none(adapter):
+    """CRITICAL regression coverage: ClaudeAgentOptions.env is dict-typed
+    (default_factory=dict), not Optional, on the SDK side - the real
+    subprocess transport unconditionally dict-unpacks it (**self._options.env)
+    when building the child process's environment. Passing env=None would
+    raise a TypeError on every single session start, not just when a CLI
+    profile is configured. This must stay a dict even when cli_env is
+    unset - never collapse an empty cli_env to None anywhere in the chain."""
+    await adapter.connect("s1")
+
+    client = adapter._test_clients["latest"]
+    assert client.options.env is not None
+    assert client.options.env == {}
+    assert isinstance(client.options.env, dict)
+
+
+@pytest.mark.asyncio
 async def test_connect_resolves_a_symlinked_cwd(adapter, tmp_path):
     """Regression test: the real `claude` CLI subprocess resolves symlinks
     before recording its transcript's own cwd (confirmed empirically -

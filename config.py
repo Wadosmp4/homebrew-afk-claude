@@ -18,6 +18,7 @@ import json
 import os
 import stat
 from dataclasses import asdict, dataclass, field
+from typing import Optional
 
 DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/remote-claude-companion/config.json")
 
@@ -57,6 +58,17 @@ class CompanionConfig:
     # via set_auto_approve_settings (daemon.py), which persists back here.
     observe_auto_approve: bool = False
     observe_llm_judge: bool = False
+    # R7/KD5/KTD5: which Claude Code CLI binary/profile this Mac's companion
+    # invokes for new SDK-owned sessions (companion/adapters/sdk_adapter.py's
+    # connect(), threaded into ClaudeAgentOptions' own cli_path/env). A
+    # separate mechanism from the per-session `model` field above - not a
+    # repurposing of it. Defaults keep a pre-existing on-disk config.json
+    # (written before this field existed) loading under
+    # CompanionConfig(**json.load(f))'s strict field match; cli_env must
+    # stay dict-shaped (never None) since ClaudeAgentOptions.env is
+    # dict-typed, not Optional, on the SDK side.
+    cli_path: Optional[str] = None
+    cli_env: dict[str, str] = field(default_factory=dict)
 
 
 def save_config(path: str, config: CompanionConfig) -> None:

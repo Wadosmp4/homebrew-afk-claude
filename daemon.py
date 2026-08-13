@@ -233,6 +233,13 @@ class CompanionDaemon:
                     model=action.get("model"),
                     auto_approve=bool(action.get("auto_approve", False)),
                     llm_judge=bool(action.get("llm_judge", False)),
+                    # Unlike model/auto_approve/llm_judge above, cli_path/
+                    # cli_env (KTD5) are a Mac-level setting with no
+                    # phone-side per-request equivalent - always sourced
+                    # from this companion's own config, never the action
+                    # payload.
+                    cli_path=self.config.cli_path,
+                    cli_env=self.config.cli_env,
                 )
             except Exception:
                 logger.exception("start_session failed for action %r", action)
@@ -295,6 +302,14 @@ class CompanionDaemon:
             await self._handle_set_auto_approve_settings(
                 ws, action.get("auto_approve"), action.get("llm_judge")
             )
+            return
+
+        if kind == "get_cli_settings":
+            await self._handle_get_cli_settings(ws)
+            return
+
+        if kind == "set_cli_settings":
+            await self._handle_set_cli_settings(ws, action.get("cli_path"), action.get("cli_env"))
             return
 
         session_id = action.get("session_id")
@@ -501,6 +516,36 @@ class CompanionDaemon:
         await asyncio.to_thread(save_config, self.config_path, self.config)
         await self._handle_get_auto_approve_settings(ws)  # confirm back with the new state
 
+    async def _handle_get_cli_settings(self, ws: "websockets.WebSocketClientProtocol") -> None:
+        """R7/KD5/KTD5: which Claude Code CLI binary/profile this Mac's
+        companion invokes for new SDK-owned sessions - a Mac-level setting
+        (not per-session, not per-request), so this is the whole state
+        rather than anything scoped to a session_id."""
+        event = {
+            "session_id": "_cli_settings",
+            "event_id": 0,
+            "type": "cli_settings",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "data": {
+                "cli_path": self.config.cli_path,
+                "cli_env": self.config.cli_env,
+            },
+        }
+        await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
+
+    async def _handle_set_cli_settings(
+        self, ws: "websockets.WebSocketClientProtocol", cli_path: Optional[str], cli_env: Optional[dict]
+    ) -> None:
+        """`None` for either argument leaves that field as it was already
+        saved, same convention as _handle_set_auto_approve_settings - the
+        phone sends only the field(s) it's actually changing."""
+        if cli_path is not None:
+            self.config.cli_path = cli_path
+        if cli_env is not None:
+            self.config.cli_env = dict(cli_env)
+        await asyncio.to_thread(save_config, self.config_path, self.config)
+        await self._handle_get_cli_settings(ws)  # confirm back with the new state
+
     async def _handle_git_status(self, adapter, session_id: str) -> None:
         """U10 (R16): computes git status for the session's cwd off the
         event loop (subprocess calls block) and injects the result into
@@ -584,6 +629,12 @@ class CompanionDaemon:
                 model=saved.model if saved is not None else None,
                 auto_approve=saved.auto_approve if saved is not None else False,
                 llm_judge=saved.llm_judge if saved is not None else False,
+                # Same as the start_session call site above: cli_path/
+                # cli_env are a Mac-level setting, always read from
+                # self.config directly - there's no saved SessionSettings
+                # equivalent for it.
+                cli_path=self.config.cli_path,
+                cli_env=self.config.cli_env,
             )
         except Exception:
             logger.exception("failed to resume SDK-owned session %r", session_id)
