@@ -1,9 +1,11 @@
 """Companion configuration: relay URL and device identity.
 
-Contract for U1 (relay): `device_token` is a companion-kind bearer token
-minted once via `relay.auth.bootstrap_companion_device` (an operator
-action, not an HTTP call - see relay/auth.py's module docstring) and
-handed to the companion out-of-band at install time.
+Contract for U1 (relay): `device_token` is a companion-kind bearer token.
+The normal path to getting one is `afk-claude-companion setup` (cli.py) -
+claiming a one-time bootstrap code a relay operator generated locally
+via `relay/bootstrap_companion.py` (an operator action against the
+database, not an HTTP call - see relay/auth.py's module docstring for
+why minting stays off the network).
 
 The config file holds a secret (`device_token`), so it's written with
 owner-only permissions (mode 0600), the same posture the plan calls for
@@ -18,6 +20,14 @@ import stat
 from dataclasses import asdict, dataclass, field
 
 DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/remote-claude-companion/config.json")
+
+# `setup`/`pair` (cli.py) fall back to this when --relay-url isn't passed,
+# mirroring how the mobile app bakes in EXPO_PUBLIC_RELAY_URL at build time
+# (mobile/screens/PairingScreen.tsx) - this is a personal, single-relay
+# app, so there's no real reason to type the same hostname every time.
+# None (unset) is a legitimate value: the CLI just asks for --relay-url
+# explicitly in that case instead of silently failing.
+DEFAULT_RELAY_URL = os.environ.get("AFK_RELAY_URL")
 
 
 @dataclass

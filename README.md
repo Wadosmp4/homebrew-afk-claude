@@ -24,9 +24,32 @@ pip install .                  # from the repo root - installs the afk-claude-co
 
 ## Pairing a new machine
 
-### `pair` (recommended)
+### `setup` (recommended - any Mac, in any state)
 
-One command on the new Mac - no database access, no token to copy by hand:
+One command, whether this is your very first Mac or your fifth - no
+relay URL, database, or token ever typed by hand (`--relay-url` falls
+back to the `AFK_RELAY_URL` environment variable if you've set one):
+
+```bash
+afk-claude-companion setup
+```
+
+- Already has a config? Just prints your phone's pairing code.
+- No config, and you have a one-time bootstrap code your relay operator
+  generated locally (`python3 -m relay.bootstrap_companion` - see
+  `relay/README.md`'s "First-time setup")? Answer "y" when asked, enter
+  it, and `setup` claims this companion's first device token, writes
+  `~/.config/remote-claude-companion/config.json` itself, then
+  immediately prints your phone's pairing code too.
+- No config, and no bootstrap code - just an already-paired phone?
+  Answer "n" and `setup` requests a short code, prints it, and waits for
+  that phone to approve it from "Connect a new Mac," same as `pair`
+  below.
+
+### `pair` (the direct form, additional Macs)
+
+If you already know a phone is paired and want to skip `setup`'s
+question:
 
 ```bash
 afk-claude-companion pair --relay-url https://your-relay-host
@@ -35,24 +58,12 @@ afk-claude-companion pair --relay-url https://your-relay-host
 This prints a short code and waits. Open the mobile app, go to "Connect a
 new Mac," and enter the code - your phone (already trusted) vouches for
 this companion, `pair` picks up its new token automatically, and writes
-`~/.config/remote-claude-companion/config.json` itself. See
-`relay/pairing.py`'s module comment for the full request/approve/claim
-design.
+the config itself. See `relay/pairing.py`'s module comment for the full
+request/approve/claim design.
 
 ### `configure` (manual fallback)
 
-If you already have a device token some other way - e.g. minted directly
-against the relay's storage, which stays a relay-side operator action (see
-`relay/auth.py`'s module docstring for why that's deliberately not an HTTP
-endpoint):
-
-```bash
-python3 -m relay.bootstrap_companion \
-  --db postgresql://user:pass@host/dbname \
-  --relay-url wss://your-relay-host/ws/companion
-```
-
-This prints the exact command to run on the new Mac:
+If you already have a device token some other way (scripting, etc):
 
 ```bash
 afk-claude-companion configure --relay-url wss://your-relay-host/ws/companion --device-token <token>
@@ -61,11 +72,13 @@ afk-claude-companion configure --relay-url wss://your-relay-host/ws/companion --
 which writes the same config file (override the path with
 `--config-path`, or `load_config`'s own argument if calling it directly).
 
-### Getting your phone its first pairing code
+### Getting another phone a pairing code
 
-Once a companion is configured (either path above), it has its own device
+Once a companion is configured (any path above), it has its own device
 token - so it can request a phone pairing code itself, rather than you
-hand-writing an authenticated `curl` call against `/pairing/register`:
+hand-writing an authenticated `curl` call against `/pairing/register`.
+`setup` already does this automatically; to get another one later
+without re-running `setup`:
 
 ```bash
 afk-claude-companion pairing-code

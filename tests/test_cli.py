@@ -310,3 +310,153 @@ def test_pairing_code_stops_cleanly_on_an_http_error(monkeypatch, tmp_path, caps
     main(["pairing-code", "--config-path", str(config_path)])
 
     assert "Could not request a pairing code" in capsys.readouterr().out
+
+
+# --- setup -------------------------------------------------------------
+#
+# The one command for any Mac, in any state - already configured, an
+# additional Mac joining an already-paired phone, or the very first Mac
+# ever.
+
+
+def _fake_input(*responses):
+    """Each successive input() call returns the next response in order -
+    `setup`'s unconfigured branch asks a y/n question, then (only on
+    "yes") a second question for the actual bootstrap code."""
+    it = iter(responses)
+    return lambda prompt: next(it)
+
+
+def test_setup_on_an_already_configured_mac_just_prints_a_phone_pairing_code(monkeypatch, tmp_path, capsys):
+    captured = {}
+
+    def fake_request(relay_url, device_token):
+        captured["relay_url"] = relay_url
+        captured["device_token"] = device_token
+        return {"code": "482913", "expires_at": "later"}
+
+    monkeypatch.setattr(cli, "_request_phone_pairing_code", fake_request)
+
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    main(["setup", "--config-path", str(config_path)])
+
+    assert captured["relay_url"] == "https://relay.example.com"
+    assert captured["device_token"] == "tok-abc123"
+    assert "482913" in capsys.readouterr().out
+
+
+def test_setup_with_a_bootstrap_code_claims_it_then_prints_a_phone_code(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, "_claim_bootstrap_code", lambda relay_url, code: {"device_id": "d1", "token": "tok-new"})
+    monkeypatch.setattr(cli, "_request_phone_pairing_code", lambda relay_url, device_token: {"code": "111111", "expires_at": "later"})
+    monkeypatch.setattr("builtins.input", _fake_input("y", "555444"))
+
+    config_path = tmp_path / "config.json"
+    main(["setup", "--relay-url", "https://relay.example.com", "--config-path", str(config_path)])
+
+    loaded = load_config(str(config_path))
+    assert loaded.relay_url == "wss://relay.example.com/ws/companion"
+    assert loaded.device_token == "tok-new"
+    out = capsys.readouterr().out
+    assert "111111" in out
+
+
+def test_setup_sends_the_bootstrap_code_the_user_typed(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_claim(relay_url, code):
+        captured["code"] = code
+        return {"device_id": "d1", "token": "tok-new"}
+
+    monkeypatch.setattr(cli, "_claim_bootstrap_code", fake_claim)
+    monkeypatch.setattr(cli, "_request_phone_pairing_code", lambda relay_url, device_token: {"code": "111111", "expires_at": "later"})
+    monkeypatch.setattr("builtins.input", _fake_input("y", "  999888  "))
+
+    main(["setup", "--relay-url", "https://relay.example.com", "--config-path", str(tmp_path / "config.json")])
+
+    assert captured["code"] == "999888"
+
+
+def test_setup_without_a_bootstrap_code_runs_the_phone_approval_flow_instead(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_request(relay_url, label):
+        captured["label"] = label
+        return {"code": "111111", "expires_at": "later"}
+
+    monkeypatch.setattr(cli, "_request_companion_pairing", fake_request)
+    monkeypatch.setattr(
+        cli, "_poll_claim", lambda relay_url, code: {"status": "approved", "device_id": "d1", "token": "tok-xyz"}
+    )
+    monkeypatch.setattr("builtins.input", _fake_input("n"))
+
+    config_path = tmp_path / "config.json"
+    main(["setup", "--relay-url", "https://relay.example.com", "--label", "MacBook Pro", "--config-path", str(config_path)])
+
+    assert captured["label"] == "MacBook Pro"
+    loaded = load_config(str(config_path))
+    assert loaded.relay_url == "wss://relay.example.com/ws/companion"
+    assert loaded.device_token == "tok-xyz"
+
+
+def test_setup_without_a_bootstrap_code_never_claims_one(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "_request_companion_pairing", lambda relay_url, label: {"code": "111111", "expires_at": "later"})
+    monkeypatch.setattr(cli, "_poll_claim", lambda relay_url, code: {"status": "approved", "device_id": "d1", "token": "tok-xyz"})
+
+    def fail_if_called(relay_url, code):
+        raise AssertionError("setup should not ask for/claim a bootstrap code when the user said no")
+
+    monkeypatch.setattr(cli, "_claim_bootstrap_code", fail_if_called)
+    monkeypatch.setattr("builtins.input", _fake_input("N"))
+
+    main(["setup", "--relay-url", "https://relay.example.com", "--config-path", str(tmp_path / "config.json")])
+
+
+def test_setup_without_a_bootstrap_code_times_out_without_writing_a_config(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, "_request_companion_pairing", lambda relay_url, label: {"code": "111111", "expires_at": "later"})
+    monkeypatch.setattr(cli, "_poll_claim", lambda relay_url, code: {"status": "pending"})
+    monkeypatch.setattr(cli, "DEFAULT_PAIR_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(cli, "DEFAULT_PAIR_POLL_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr("builtins.input", _fake_input("n"))
+
+    config_path = tmp_path / "config.json"
+    main(["setup", "--relay-url", "https://relay.example.com", "--config-path", str(config_path)])
+
+    assert not config_path.exists()
+    assert "Timed out" in capsys.readouterr().out
+
+
+def test_setup_falls_back_to_the_afk_relay_url_env_var(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, "DEFAULT_RELAY_URL", "https://relay.example.com")
+    monkeypatch.setattr(cli, "_claim_bootstrap_code", lambda relay_url, code: {"device_id": "d1", "token": "tok-new"})
+    monkeypatch.setattr(cli, "_request_phone_pairing_code", lambda relay_url, device_token: {"code": "111111", "expires_at": "later"})
+    monkeypatch.setattr("builtins.input", _fake_input("y", "555444"))
+
+    config_path = tmp_path / "config.json"
+    main(["setup", "--config-path", str(config_path)])
+
+    loaded = load_config(str(config_path))
+    assert loaded.relay_url == "wss://relay.example.com/ws/companion"
+
+
+def test_setup_with_no_relay_url_anywhere_prints_guidance_instead_of_crashing(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, "DEFAULT_RELAY_URL", None)
+
+    main(["setup", "--config-path", str(tmp_path / "does-not-exist.json")])
+
+    out = capsys.readouterr().out
+    assert "AFK_RELAY_URL" in out or "--relay-url" in out
+
+
+def test_setup_stops_cleanly_on_an_invalid_bootstrap_code(monkeypatch, tmp_path, capsys):
+    def raise_error(relay_url, code):
+        raise urllib.error.HTTPError(relay_url, 400, "invalid_code", None, None)
+
+    monkeypatch.setattr(cli, "_claim_bootstrap_code", raise_error)
+    monkeypatch.setattr("builtins.input", _fake_input("y", "000000"))
+
+    config_path = tmp_path / "config.json"
+    main(["setup", "--relay-url", "https://relay.example.com", "--config-path", str(config_path)])
+
+    assert not config_path.exists()
+    assert "Could not claim that code" in capsys.readouterr().out
