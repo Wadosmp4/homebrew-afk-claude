@@ -522,7 +522,7 @@ class ObserveAdapter:
             # ever gets to choose - the exact regression this guard exists
             # to prevent.
             if not approval_policy.is_structured_question(tool_input) and session.auto_approve:
-                denylisted = approval_policy.is_denylisted(tool_name, tool_input)
+                denylisted = approval_policy.is_denylisted(tool_name, tool_input, session.cwd)
                 if not denylisted and approval_policy.is_auto_approvable(tool_name, tool_input, cwd=session.cwd):
                     session.emit(
                         "permission_request",
@@ -534,7 +534,10 @@ class ObserveAdapter:
                     )
                     return {"permissionDecision": "allow", "permissionDecisionReason": ""}
                 if not denylisted and session.llm_judge:
-                    if await risk_judge.judge_is_safe(tool_name, tool_input, session.cwd):
+                    judge_reason: dict[str, Optional[str]] = {}
+                    if await risk_judge.judge_is_safe(
+                        tool_name, tool_input, session.cwd, cache=session.judgment_cache, reason_out=judge_reason
+                    ):
                         session.emit(
                             "permission_request",
                             request_id=request_id,
@@ -542,6 +545,7 @@ class ObserveAdapter:
                             input=tool_input,
                             auto_approved=True,
                             judged_by="llm",
+                            judge_reason=judge_reason.get("reason"),
                         )
                         return {"permissionDecision": "allow", "permissionDecisionReason": ""}
 
@@ -605,6 +609,12 @@ class _ObserveSession:
         # ObserveAdapter.set_session_auto_approve.
         self.auto_approve = auto_approve
         self.llm_judge = llm_judge
+        # Mirrors SDKAdapter._Session.judgment_cache (sdk_adapter.py) - an
+        # identical (tool_name, tool_input) pair judged once for this
+        # observed session is never re-judged, same reasoning as there.
+        # Previously missing here, so every repeat of an identical tool
+        # call paid the full CLI-subprocess judge latency again.
+        self.judgment_cache: dict[tuple[str, str], bool] = {}
 
     def emit(self, type_: str, **data: Any) -> Event:
         event = self.sequencer.emit(type_, **data)

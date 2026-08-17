@@ -44,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -59,6 +60,39 @@ from .config import DEFAULT_CONFIG_PATH, CompanionConfig, load_config, save_conf
 from .session_settings import SessionSettings, load_session_settings, save_session_settings
 
 logger = logging.getLogger(__name__)
+
+# Dynamic-linker/interpreter injection vectors - a phone-supplied cli_env
+# containing any of these could hijack the spawned CLI subprocess (e.g.
+# loading an attacker-controlled shared library into it) regardless of
+# what cli_path itself points to. Rejected outright rather than stripped,
+# so a rejected change is visible (the confirm-back below still reports
+# the last-accepted cli_env) instead of silently landing minus one key.
+_DANGEROUS_CLI_ENV_KEYS = frozenset({
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+})
+
+
+def _is_valid_remote_cli_path(cli_path: str) -> bool:
+    """A phone-supplied cli_path is a code-execution-adjacent primitive
+    (it's what gets spawned for every subsequent session on this Mac) -
+    this doesn't try to whitelist a specific binary name (users legitimately
+    point this at a custom claude build or wrapper script - KTD5), but does
+    require it to be an absolute path to a file that already exists on this
+    machine and is executable. That closes the sharpest edge of "any phone
+    token can point the companion at an arbitrary path" - it can only ever
+    select among executables already present on disk, not stage a brand
+    new one via this action alone."""
+    if not os.path.isabs(cli_path):
+        return False
+    try:
+        return os.path.isfile(cli_path) and os.access(cli_path, os.X_OK)
+    except OSError:
+        return False
 
 
 class CompanionDaemon:
@@ -107,6 +141,16 @@ class CompanionDaemon:
         # for why these must be torn down on disconnect, not left to
         # discover their own dead socket.
         self._forwarding: dict[str, asyncio.Task] = {}
+        # _receive_loop dispatches every inbound action as its own
+        # asyncio.create_task, unordered - so two actions that each read-
+        # modify-write the same on-disk JSON file (session_settings.py's
+        # save_session_settings, projects.py's record_recent) can interleave
+        # and silently drop one write. Each lock serializes one file's
+        # read-modify-write sequence across concurrently-dispatched actions
+        # on this daemon instance; separate locks since the two files are
+        # unrelated and there's no reason to block one on the other.
+        self._session_settings_lock = asyncio.Lock()
+        self._recents_lock = asyncio.Lock()
 
     def stop(self) -> None:
         """Request a graceful stop. `run()` returns once the current
@@ -234,12 +278,13 @@ class CompanionDaemon:
                     auto_approve=bool(action.get("auto_approve", False)),
                     llm_judge=bool(action.get("llm_judge", False)),
                     # Unlike model/auto_approve/llm_judge above, cli_path/
-                    # cli_env (KTD5) are a Mac-level setting with no
-                    # phone-side per-request equivalent - always sourced
-                    # from this companion's own config, never the action
-                    # payload.
+                    # cli_env (KTD5) and risk_judge_use_api are Mac-level
+                    # settings with no phone-side per-request equivalent -
+                    # always sourced from this companion's own config,
+                    # never the action payload.
                     cli_path=self.config.cli_path,
                     cli_env=self.config.cli_env,
+                    risk_judge_use_api=self.config.risk_judge_use_api,
                 )
             except Exception:
                 logger.exception("start_session failed for action %r", action)
@@ -247,18 +292,20 @@ class CompanionDaemon:
             self._spawn_forwarder(ws, self.sdk_adapter, session_id)
             resolved_cwd = self.sdk_adapter.get_cwd(session_id)
             if resolved_cwd:
-                await asyncio.to_thread(projects.record_recent, resolved_cwd, self.recents_path)
-                await asyncio.to_thread(
-                    save_session_settings,
-                    session_id,
-                    SessionSettings(
-                        cwd=resolved_cwd,
-                        model=action.get("model"),
-                        auto_approve=bool(action.get("auto_approve", False)),
-                        llm_judge=bool(action.get("llm_judge", False)),
-                    ),
-                    self.session_settings_path,
-                )
+                async with self._recents_lock:
+                    await asyncio.to_thread(projects.record_recent, resolved_cwd, self.recents_path)
+                async with self._session_settings_lock:
+                    await asyncio.to_thread(
+                        save_session_settings,
+                        session_id,
+                        SessionSettings(
+                            cwd=resolved_cwd,
+                            model=action.get("model"),
+                            auto_approve=bool(action.get("auto_approve", False)),
+                            llm_judge=bool(action.get("llm_judge", False)),
+                        ),
+                        self.session_settings_path,
+                    )
             return
 
         if kind == "list_projects":
@@ -538,13 +585,33 @@ class CompanionDaemon:
     ) -> None:
         """`None` for either argument leaves that field as it was already
         saved, same convention as _handle_set_auto_approve_settings - the
-        phone sends only the field(s) it's actually changing."""
+        phone sends only the field(s) it's actually changing.
+
+        Unlike the other settings this daemon accepts over the wire,
+        cli_path/cli_env feed straight into the subprocess spawned for
+        every subsequent session (sdk_adapter.py's ClaudeAgentOptions) -
+        entirely outside the can_use_tool permission gating everything
+        else goes through. A rejected value is dropped silently from this
+        call (logged, not applied) rather than raising - the confirm-back
+        below still reports the last-accepted state either way, so the
+        phone can tell a rejection happened by comparing what it sent
+        against what comes back."""
         if cli_path is not None:
-            self.config.cli_path = cli_path
+            if _is_valid_remote_cli_path(cli_path):
+                self.config.cli_path = cli_path
+            else:
+                logger.warning(
+                    "rejected set_cli_settings cli_path %r: not an absolute path to an existing executable file",
+                    cli_path,
+                )
         if cli_env is not None:
-            self.config.cli_env = dict(cli_env)
+            dangerous = _DANGEROUS_CLI_ENV_KEYS.intersection(cli_env)
+            if not dangerous:
+                self.config.cli_env = dict(cli_env)
+            else:
+                logger.warning("rejected set_cli_settings cli_env: disallowed key(s) %r", sorted(dangerous))
         await asyncio.to_thread(save_config, self.config_path, self.config)
-        await self._handle_get_cli_settings(ws)  # confirm back with the new state
+        await self._handle_get_cli_settings(ws)  # confirm back with the (possibly-unchanged) state
 
     async def _handle_git_status(self, adapter, session_id: str) -> None:
         """U10 (R16): computes git status for the session's cwd off the
@@ -577,18 +644,25 @@ class CompanionDaemon:
         cwd = self.sdk_adapter.get_cwd(session_id)
         if cwd is None:
             return  # shouldn't happen for a live SDK session, but never crash persistence over it
-        saved = await asyncio.to_thread(load_session_settings, session_id, self.session_settings_path)
-        await asyncio.to_thread(
-            save_session_settings,
-            session_id,
-            SessionSettings(
-                cwd=cwd,
-                model=saved.model if saved is not None else None,
-                auto_approve=auto_approve if auto_approve is not None else (saved.auto_approve if saved is not None else False),
-                llm_judge=llm_judge if llm_judge is not None else (saved.llm_judge if saved is not None else False),
-            ),
-            self.session_settings_path,
-        )
+        # The load and save below must be one atomic read-modify-write, not
+        # just the save - two concurrently-dispatched toggles for this
+        # session (e.g. auto_approve then llm_judge tapped in quick
+        # succession) each read the pre-toggle file, so locking only the
+        # write would still let the second save silently overwrite the
+        # first toggle's change with stale data.
+        async with self._session_settings_lock:
+            saved = await asyncio.to_thread(load_session_settings, session_id, self.session_settings_path)
+            await asyncio.to_thread(
+                save_session_settings,
+                session_id,
+                SessionSettings(
+                    cwd=cwd,
+                    model=saved.model if saved is not None else None,
+                    auto_approve=auto_approve if auto_approve is not None else (saved.auto_approve if saved is not None else False),
+                    llm_judge=llm_judge if llm_judge is not None else (saved.llm_judge if saved is not None else False),
+                ),
+                self.session_settings_path,
+            )
 
     def _adapter_for(self, session_id: str):
         if session_id in self.sdk_adapter.discover_sessions():
@@ -620,7 +694,8 @@ class CompanionDaemon:
         )
         if cwd is None:
             return None
-        saved = await asyncio.to_thread(load_session_settings, session_id, self.session_settings_path)
+        async with self._session_settings_lock:
+            saved = await asyncio.to_thread(load_session_settings, session_id, self.session_settings_path)
         try:
             await self.sdk_adapter.connect(
                 session_id,
@@ -630,27 +705,29 @@ class CompanionDaemon:
                 auto_approve=saved.auto_approve if saved is not None else False,
                 llm_judge=saved.llm_judge if saved is not None else False,
                 # Same as the start_session call site above: cli_path/
-                # cli_env are a Mac-level setting, always read from
-                # self.config directly - there's no saved SessionSettings
-                # equivalent for it.
+                # cli_env/risk_judge_use_api are Mac-level settings, always
+                # read from self.config directly - there's no saved
+                # SessionSettings equivalent for any of them.
                 cli_path=self.config.cli_path,
                 cli_env=self.config.cli_env,
+                risk_judge_use_api=self.config.risk_judge_use_api,
             )
         except Exception:
             logger.exception("failed to resume SDK-owned session %r", session_id)
             return None
         resolved_cwd = self.sdk_adapter.get_cwd(session_id) or cwd
-        await asyncio.to_thread(
-            save_session_settings,
-            session_id,
-            SessionSettings(
-                cwd=resolved_cwd,
-                model=saved.model if saved is not None else None,
-                auto_approve=saved.auto_approve if saved is not None else False,
-                llm_judge=saved.llm_judge if saved is not None else False,
-            ),
-            self.session_settings_path,
-        )
+        async with self._session_settings_lock:
+            await asyncio.to_thread(
+                save_session_settings,
+                session_id,
+                SessionSettings(
+                    cwd=resolved_cwd,
+                    model=saved.model if saved is not None else None,
+                    auto_approve=saved.auto_approve if saved is not None else False,
+                    llm_judge=saved.llm_judge if saved is not None else False,
+                ),
+                self.session_settings_path,
+            )
         return self.sdk_adapter
 
     async def _watch_active_sessions(self, ws: "websockets.WebSocketClientProtocol") -> None:

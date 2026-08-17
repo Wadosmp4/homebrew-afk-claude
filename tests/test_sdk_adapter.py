@@ -644,6 +644,53 @@ async def test_llm_judge_safe_verdict_auto_approves(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_llm_judge_caches_an_identical_call_within_the_same_session(adapter, monkeypatch):
+    """Mobile UX follow-up #3b: the same (tool_name, tool_input) judged
+    once this session is never re-judged - the second identical call is
+    still auto-approved (served from the session's own cache), but the
+    judge itself is only actually consulted once."""
+    from claude_agent_sdk import AssistantMessage, TextBlock
+
+    from companion import risk_judge
+
+    call_count = {"n": 0}
+
+    async def counting_query(*, prompt, options):
+        call_count["n"] += 1
+        yield AssistantMessage(content=[TextBlock(text="SAFE: ordinary read-ish command")], model="claude")
+
+    monkeypatch.setattr(risk_judge, "query", counting_query)
+
+    await adapter.connect("s1", auto_approve=True, llm_judge=True)
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    from claude_agent_sdk import ToolPermissionContext
+
+    first = await asyncio.wait_for(
+        client.options.can_use_tool(
+            "Bash", {"command": "some-custom-script.sh"}, ToolPermissionContext(tool_use_id="tool-1")
+        ),
+        timeout=1,
+    )
+    await asyncio.wait_for(events.__anext__(), timeout=1)  # permission_request for the first call
+
+    second = await asyncio.wait_for(
+        client.options.can_use_tool(
+            "Bash", {"command": "some-custom-script.sh"}, ToolPermissionContext(tool_use_id="tool-2")
+        ),
+        timeout=1,
+    )
+    second_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+
+    assert first.behavior == "allow"
+    assert second.behavior == "allow"
+    assert second_event.data["judged_by"] == "llm"
+    assert call_count["n"] == 1
+
+
+@pytest.mark.asyncio
 async def test_llm_judge_review_verdict_falls_through_to_human_prompt(adapter, monkeypatch):
     """A REVIEW (or any non-SAFE) verdict from the judge is not an approval
     - it just means "no auto-approval available", so the call still blocks

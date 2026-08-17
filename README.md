@@ -112,6 +112,39 @@ the formula's `service` block handles `launchd` registration for you.
 Either way, the daemon should appear connected in the relay's device
 registry within one heartbeat interval.
 
+## AI-judgment fast path (optional)
+
+When AI-judgment is on (per-session, from the mobile app), an undecided
+tool call is classified by spawning a real `claude` CLI subprocess -
+correct for every install (works the same for a subscription or an API-key
+`claude` login), but real per-call latency, since a fresh subprocess cold
+start dominates the cost of a one-line SAFE/REVIEW classification.
+
+If you separately have Anthropic API access (`ANTHROPIC_API_KEY`, distinct
+from a Pro/Max subscription's own usage), you can opt this companion into
+skipping the subprocess for a direct API call to a fast/cheap model
+instead:
+
+```bash
+pip install anthropic   # not a default companion dependency - see below
+```
+
+Then set `"risk_judge_use_api": true` in
+`~/.config/remote-claude-companion/config.json` (no phone-side toggle for
+this yet) and make sure `ANTHROPIC_API_KEY` is set wherever the daemon
+itself runs (`launchd`'s plist, or your shell before `afk-claude-companion
+run`).
+
+This is deliberately two explicit steps, not automatic just from having
+the env var present: the CLI-subprocess path stays every existing
+install's unchanged default and safe fallback (any API-layer failure
+falls back to it), so a subscription-only user's behavior and cost never
+change unless they opt in on purpose. `anthropic` also isn't a default
+companion dependency for the same reason `psycopg`/Postgres access never
+became one either - it's real weight in the Homebrew formula's resource
+list that the large majority of installs, which never turn this on,
+shouldn't have to carry.
+
 ## Tests
 
 ```bash

@@ -17,6 +17,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import uuid
 
 import pytest
@@ -1039,34 +1040,99 @@ async def test_get_cli_settings_action_reports_the_current_defaults(running_daem
 
 @pytest.mark.asyncio
 async def test_set_cli_settings_action_persists_to_config_and_reflects_back(running_daemon, phone_token):
+    # sys.executable (the running Python interpreter) is a real, absolute,
+    # executable path on any machine these tests run on - _is_valid_remote_cli_path
+    # (companion/daemon.py) now requires that of a phone-supplied cli_path,
+    # so a fixed made-up path like "/usr/local/bin/claude-custom" would be
+    # rejected here rather than exercising the persist-and-reflect-back path
+    # this test is actually about (see the rejection tests below for that).
     daemon, port, _fake_clients = running_daemon
+    real_cli_path = sys.executable
     phone = await _FakePhone.connect(port, phone_token)
     try:
         await phone.send_action(
             {
                 "kind": "set_cli_settings",
-                "cli_path": "/usr/local/bin/claude-custom",
+                "cli_path": real_cli_path,
                 "cli_env": {"ANTHROPIC_API_KEY": "sk-test"},
             }
         )
 
         event = await phone.next_event()
         assert event["type"] == "cli_settings"
-        assert event["data"]["cli_path"] == "/usr/local/bin/claude-custom"
+        assert event["data"]["cli_path"] == real_cli_path
         assert event["data"]["cli_env"] == {"ANTHROPIC_API_KEY": "sk-test"}
-        assert daemon.config.cli_path == "/usr/local/bin/claude-custom"
+        assert daemon.config.cli_path == real_cli_path
         assert daemon.config.cli_env == {"ANTHROPIC_API_KEY": "sk-test"}
 
         persisted = load_config(daemon.config_path)
-        assert persisted.cli_path == "/usr/local/bin/claude-custom"
+        assert persisted.cli_path == real_cli_path
         assert persisted.cli_env == {"ANTHROPIC_API_KEY": "sk-test"}
 
         # A subsequent get_cli_settings reflects the persisted values too,
         # not just the immediate confirmation reply above.
         await phone.send_action({"kind": "get_cli_settings"})
         confirm = await phone.next_event()
-        assert confirm["data"]["cli_path"] == "/usr/local/bin/claude-custom"
+        assert confirm["data"]["cli_path"] == real_cli_path
         assert confirm["data"]["cli_env"] == {"ANTHROPIC_API_KEY": "sk-test"}
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_set_cli_settings_rejects_a_path_that_does_not_exist_on_this_mac(running_daemon, phone_token):
+    """A phone action is a code-execution-adjacent primitive once accepted
+    (cli_path feeds straight into the subprocess spawned for every later
+    session) - a path with nothing on disk at it is rejected outright
+    rather than persisted and left to fail confusingly at the next
+    start_session."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action(
+            {"kind": "set_cli_settings", "cli_path": "/definitely/not/a/real/path/claude"}
+        )
+
+        confirm = await phone.next_event()
+        assert confirm["data"]["cli_path"] is None
+        assert daemon.config.cli_path is None
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_set_cli_settings_rejects_a_relative_path(running_daemon, phone_token):
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "set_cli_settings", "cli_path": "claude"})
+
+        confirm = await phone.next_event()
+        assert confirm["data"]["cli_path"] is None
+        assert daemon.config.cli_path is None
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_set_cli_settings_rejects_a_dynamic_linker_injection_env_key(running_daemon, phone_token):
+    """DYLD_INSERT_LIBRARIES et al. could hijack the spawned CLI subprocess
+    regardless of what cli_path itself points to - rejected outright
+    (not stripped) so the rejection is visible rather than the change
+    silently landing minus one key."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action(
+            {
+                "kind": "set_cli_settings",
+                "cli_env": {"DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib", "SAFE_VAR": "ok"},
+            }
+        )
+
+        confirm = await phone.next_event()
+        assert confirm["data"]["cli_env"] == {}
+        assert daemon.config.cli_env == {}
     finally:
         await phone.close()
 

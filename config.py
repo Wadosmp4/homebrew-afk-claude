@@ -69,6 +69,24 @@ class CompanionConfig:
     # dict-typed, not Optional, on the SDK side.
     cli_path: Optional[str] = None
     cli_env: dict[str, str] = field(default_factory=dict)
+    # Mobile UX follow-up #3b: opt-in fast path for AI-judgment
+    # (companion/risk_judge.py) - when true AND this daemon process's own
+    # ANTHROPIC_API_KEY environment variable is set, judge_is_safe skips
+    # the CLI-subprocess path entirely for a direct Anthropic API call to
+    # a fast/cheap model instead (no subprocess cold-start per judged
+    # call, the dominant cost the CLI-subprocess path pays every time).
+    # Defaults off, and deliberately a persisted config field rather than
+    # risk_judge.py reading the environment variable on its own - the
+    # CLI-subprocess fallback (works for subscription-only `claude` auth,
+    # no separate API key needed) stays every existing installation's
+    # unchanged behavior unless this is turned on explicitly; it must
+    # never flip on as a side effect of the daemon process merely
+    # inheriting an ANTHROPIC_API_KEY some other tool set in the same
+    # shell. Enabling this also requires `pip install anthropic`
+    # separately (see companion/README.md) - deliberately not a listed
+    # companion dependency, so the default install stays exactly as lean
+    # for the vast majority of users who never turn this on.
+    risk_judge_use_api: bool = False
 
 
 def save_config(path: str, config: CompanionConfig) -> None:

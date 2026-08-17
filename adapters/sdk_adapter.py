@@ -73,6 +73,7 @@ class SDKAdapter:
         resume: Optional[str] = None,
         cli_path: Optional[str] = None,
         cli_env: dict[str, str] = {},
+        risk_judge_use_api: bool = False,
     ) -> None:
         if session_id in self._sessions:
             raise ValueError(f"session already connected: {session_id}")
@@ -97,6 +98,11 @@ class SDKAdapter:
         # rule-based policy, so it's never bundled into the base toggle.
         session.auto_approve = auto_approve
         session.llm_judge = llm_judge
+        # Mac-level opt-in (CompanionConfig.risk_judge_use_api), not a
+        # per-session/phone-side field - same "always sourced from this
+        # companion's own config, never the action payload" treatment as
+        # cli_path/cli_env above.
+        session.risk_judge_use_api = risk_judge_use_api
         self._sessions[session_id] = session
         # `model=None` leaves ClaudeAgentOptions' own default (whatever the
         # bundled CLI resolves on its own) untouched - the phone's model
@@ -268,6 +274,15 @@ class _Session:
         self.auto_allowed_tools: set[str] = set()
         self.auto_approve: bool = False  # opt-in per session - set in SDKAdapter.connect
         self.llm_judge: bool = False  # opt-in per session, separate from auto_approve - see connect()
+        self.risk_judge_use_api: bool = False  # Mac-level opt-in - see connect()
+        # Mobile UX follow-up #3b: an identical (tool_name, tool_input) pair
+        # judged once this session is never re-judged (e.g. the same lint/
+        # test command run twice) - see risk_judge.judge_is_safe's own
+        # `cache` param. Scoped to this one session, same lifetime as
+        # auto_allowed_tools above; never persisted or shared across
+        # sessions, since a judgment's safety can depend on session-local
+        # context an identical call in a *different* session might not share.
+        self.judgment_cache: dict[tuple[str, str], bool] = {}
         self.tool_started_at: dict[str, float] = {}
         self.client: Any = None
         self.reader_task: Optional[asyncio.Task] = None
@@ -328,7 +343,7 @@ class _Session:
         approved), and a REVIEW/ambiguous/failed verdict falls straight
         through to the normal human prompt below (fail closed)."""
         if not _is_structured_question(tool_input) and self.auto_approve:
-            denylisted = approval_policy.is_denylisted(tool_name, tool_input)
+            denylisted = approval_policy.is_denylisted(tool_name, tool_input, self.cwd)
             if not denylisted and approval_policy.is_auto_approvable(tool_name, tool_input, cwd=self.cwd):
                 self.emit(
                     "permission_request",
@@ -340,7 +355,21 @@ class _Session:
                 )
                 return PermissionResultAllow()
             if not denylisted and self.llm_judge:
-                if await risk_judge.judge_is_safe(tool_name, tool_input, self.cwd):
+                # get_api_client() only ever does real work (constructs a
+                # client) when risk_judge_use_api is explicitly on - see
+                # its own docstring for why this indirection matters (a
+                # bare `pytest` run inheriting ANTHROPIC_API_KEY from the
+                # invoking shell must never trigger a real network call).
+                api_client = risk_judge.get_api_client() if self.risk_judge_use_api else None
+                judge_reason: dict[str, Optional[str]] = {}
+                if await risk_judge.judge_is_safe(
+                    tool_name,
+                    tool_input,
+                    self.cwd,
+                    cache=self.judgment_cache,
+                    api_client=api_client,
+                    reason_out=judge_reason,
+                ):
                     self.emit(
                         "permission_request",
                         request_id=str(uuid4()),
@@ -348,6 +377,7 @@ class _Session:
                         input=tool_input,
                         auto_approved=True,
                         judged_by="llm",
+                        judge_reason=judge_reason.get("reason"),
                     )
                     return PermissionResultAllow()
 
