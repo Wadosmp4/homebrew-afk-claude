@@ -87,6 +87,17 @@ class CompanionConfig:
     # companion dependency, so the default install stays exactly as lean
     # for the vast majority of users who never turn this on.
     risk_judge_use_api: bool = False
+    # Which Claude identity new SDK-owned sessions launch under (U1 of the
+    # session-account-switch plan). "vscode" reuses the CLI's existing
+    # default login (the same one the VS Code extension shares) with no
+    # extra config; "personal" requires personal_oauth_token to be set,
+    # merged into cli_env as CLAUDE_CODE_OAUTH_TOKEN only for that spawn
+    # (see daemon.py's session-start call sites and _send_event redaction -
+    # KTD1/KTD8). personal_oauth_token is a `claude setup-token`-minted
+    # credential, not the device_token's bearer-token shape - same 0600
+    # file, same "never echoed back over the wire" posture as device_token.
+    active_account: str = "vscode"
+    personal_oauth_token: Optional[str] = None
 
 
 def save_config(path: str, config: CompanionConfig) -> None:
