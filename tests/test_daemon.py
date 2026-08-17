@@ -1778,7 +1778,7 @@ async def test_an_exception_in_one_of_the_new_sentinel_actions_does_not_kill_the
 
 # --- U6: secret redaction from forwarded event content ---
 
-from companion.daemon import _redact_secrets  # noqa: E402
+from companion.daemon import _redact_secrets, _scrub_action_for_logging  # noqa: E402
 
 
 def test_redact_secrets_replaces_an_exact_substring_match_in_a_string():
@@ -1815,6 +1815,32 @@ def test_redact_secrets_passes_through_non_string_leaf_values():
     value = {"count": 3, "active": True, "missing": None}
 
     assert _redact_secrets(value, ("sk-secret-1",)) == value
+
+
+def test_scrub_action_for_logging_redacts_a_raw_token_field():
+    """KTD4: a pasted token rides straight in set_personal_account_token's
+    action dict, before it's ever written to self.config - _redact_secrets
+    (keyed on already-configured values) can't catch it, so the generic
+    action-failure logger needs its own scrub."""
+    action = {"kind": "set_personal_account_token", "device_id": "mac-1", "token": "sk-ant-oat-not-yet-saved"}
+
+    assert _scrub_action_for_logging(action) == {
+        "kind": "set_personal_account_token",
+        "device_id": "mac-1",
+        "token": "[redacted]",
+    }
+
+
+def test_scrub_action_for_logging_leaves_other_actions_unchanged():
+    action = {"kind": "start_session", "cwd": "/tmp/some-repo"}
+
+    assert _scrub_action_for_logging(action) == action
+
+
+def test_scrub_action_for_logging_is_a_no_op_when_the_token_key_is_absent():
+    action = {"kind": "set_active_account", "active_account": "personal"}
+
+    assert _scrub_action_for_logging(action) == action
 
 
 @pytest.mark.asyncio

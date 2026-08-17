@@ -109,6 +109,20 @@ def _redact_secrets(value: Any, secrets: tuple[str, ...]) -> Any:
 _SETUP_TOKEN_TIMEOUT_SECONDS = 90.0
 _VALID_ACCOUNTS = frozenset({"vscode", "personal"})
 
+# KTD4: set_personal_account_token's raw pasted token rides straight in the
+# action dict - _handle_action's generic exception logger (below) logs the
+# whole action on any dispatch failure, which would otherwise print it even
+# though it was never yet written to self.config (and so isn't caught by
+# _redact_secrets, which only knows about already-configured values).
+_ACTION_KEYS_NEVER_LOGGED = ("token",)
+
+
+def _scrub_action_for_logging(action: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: ("[redacted]" if key in _ACTION_KEYS_NEVER_LOGGED and value is not None else value)
+        for key, value in action.items()
+    }
+
 
 async def _run_setup_token_under_pty(cli_path: Optional[str]) -> Optional[str]:
     """KTD5's automated setup attempt: spawn `claude setup-token` (or a
@@ -376,7 +390,7 @@ class CompanionDaemon:
         try:
             await self._dispatch_action(ws, action)
         except Exception:
-            logger.exception("action %r failed: %r", action.get("kind"), action)
+            logger.exception("action %r failed: %r", action.get("kind"), _scrub_action_for_logging(action))
 
     async def _dispatch_action(self, ws: "websockets.WebSocketClientProtocol", action: dict[str, Any]) -> None:
         kind = action.get("kind")
