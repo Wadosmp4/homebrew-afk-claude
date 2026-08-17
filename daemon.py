@@ -183,6 +183,13 @@ async def _run_setup_token_under_pty(cli_path: Optional[str]) -> Optional[str]:
     return candidate
 
 
+# KTD3: outrank CLAUDE_CODE_OAUTH_TOKEN in the CLI's own auth precedence,
+# so an ambient value (this daemon process's own inherited os.environ, or
+# a phone-set cli_env entry) could otherwise silently defeat the "personal"
+# identity switch.
+_PRECEDENCE_ENV_KEYS_TO_NEUTRALIZE_FOR_PERSONAL = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+
 def _is_valid_remote_cli_path(cli_path: str) -> bool:
     """A phone-supplied cli_path is a code-execution-adjacent primitive
     (it's what gets spawned for every subsequent session on this Mac) -
@@ -387,9 +394,12 @@ class CompanionDaemon:
                     # cli_env (KTD5) and risk_judge_use_api are Mac-level
                     # settings with no phone-side per-request equivalent -
                     # always sourced from this companion's own config,
-                    # never the action payload.
+                    # never the action payload. cli_env goes through
+                    # _effective_cli_env (R2/KTD1/KTD3), not the raw
+                    # config field, so a "personal"-identity spawn gets
+                    # CLAUDE_CODE_OAUTH_TOKEN merged in.
                     cli_path=self.config.cli_path,
-                    cli_env=self.config.cli_env,
+                    cli_env=self._effective_cli_env(),
                     risk_judge_use_api=self.config.risk_judge_use_api,
                 )
             except Exception:
@@ -917,9 +927,10 @@ class CompanionDaemon:
                 # Same as the start_session call site above: cli_path/
                 # cli_env/risk_judge_use_api are Mac-level settings, always
                 # read from self.config directly - there's no saved
-                # SessionSettings equivalent for any of them.
+                # SessionSettings equivalent for any of them. cli_env goes
+                # through _effective_cli_env, same reasoning as start_session.
                 cli_path=self.config.cli_path,
-                cli_env=self.config.cli_env,
+                cli_env=self._effective_cli_env(),
                 risk_judge_use_api=self.config.risk_judge_use_api,
             )
         except Exception:
@@ -983,6 +994,38 @@ class CompanionDaemon:
             logger.exception("event forwarding failed for session %r", session_id)
         finally:
             self._forwarding.pop(session_id, None)
+
+    def _effective_cli_env(self) -> dict[str, str]:
+        """KTD1/KTD3: the env a new SDK-owned session actually launches
+        with. "vscode" (the default) or "personal" with no token configured
+        yet both pass self.config.cli_env through completely unchanged -
+        today's behavior, byte for byte. "personal" with a configured
+        token merges CLAUDE_CODE_OAUTH_TOKEN in.
+
+        claude_agent_sdk's own subprocess transport merges this
+        dict ON TOP OF this daemon process's own inherited os.environ
+        (`{**inherited_env, **options.env}` - see
+        claude_agent_sdk._internal.transport.subprocess_cli), not the
+        other way around - so removing a precedence-key from cli_env only
+        helps when that key was never ambient in the daemon's own
+        environment to begin with. When it IS ambient (e.g. this
+        companion's own ANTHROPIC_API_KEY, set for risk_judge_use_api -
+        see CompanionConfig's docstring), only an explicit override in the
+        returned dict can take precedence over it; an empty string is the
+        best currently-verifiable neutralization available. Whether the
+        `claude` CLI itself treats an empty value as "unset" rather than
+        "set to nothing" is not confirmed outside a real machine - a
+        residual uncertainty of the same shape as KTD1/KTD5's, not
+        something this method can close further from here."""
+        if self.config.active_account != "personal" or self.config.personal_oauth_token is None:
+            return self.config.cli_env
+        env = dict(self.config.cli_env)
+        for key in _PRECEDENCE_ENV_KEYS_TO_NEUTRALIZE_FOR_PERSONAL:
+            env.pop(key, None)
+            if key in os.environ:
+                env[key] = ""
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = self.config.personal_oauth_token
+        return env
 
     def _secret_values(self) -> tuple[str, ...]:
         """KTD8: current secret values to redact from forwarded content -

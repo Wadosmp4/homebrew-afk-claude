@@ -1363,6 +1363,101 @@ async def test_run_setup_token_under_pty_times_out_on_a_hanging_process(tmp_path
     assert result is None
 
 
+# --- U3: active-account-aware cli_env for new session spawns ---
+
+
+def _bare_daemon(tmp_path, **config_kwargs) -> CompanionDaemon:
+    """A CompanionDaemon that's never connected/run - _effective_cli_env
+    only touches self.config and os.environ, so this avoids the full
+    relay/websocket harness for tests that only exercise it directly."""
+    config = CompanionConfig(
+        relay_url="ws://127.0.0.1:1/ws/companion",
+        device_token="t",
+        **config_kwargs,
+    )
+    return CompanionDaemon(
+        config,
+        sdk_adapter=_fake_sdk_adapter()[0],
+        observe_adapter=_test_observe_adapter(tmp_path),
+        recents_path=str(tmp_path / "recent_projects.json"),
+        config_path=str(tmp_path / "companion_config.json"),
+        session_settings_path=str(tmp_path / "session_settings.json"),
+    )
+
+
+def test_effective_cli_env_passes_cli_env_unchanged_for_vscode_identity(tmp_path):
+    daemon = _bare_daemon(tmp_path, cli_env={"SOME_VAR": "x"})
+
+    assert daemon._effective_cli_env() == {"SOME_VAR": "x"}
+
+
+def test_effective_cli_env_falls_back_to_unchanged_when_personal_has_no_token(tmp_path):
+    daemon = _bare_daemon(tmp_path, active_account="personal", cli_env={"SOME_VAR": "x"})
+
+    assert daemon._effective_cli_env() == {"SOME_VAR": "x"}
+
+
+def test_effective_cli_env_merges_the_oauth_token_for_personal_identity(tmp_path):
+    daemon = _bare_daemon(
+        tmp_path, active_account="personal", personal_oauth_token="sk-ant-oat-test", cli_env={"SOME_VAR": "x"}
+    )
+
+    assert daemon._effective_cli_env() == {"SOME_VAR": "x", "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-test"}
+
+
+def test_effective_cli_env_strips_a_configured_precedence_key_only_for_personal(tmp_path):
+    vscode_daemon = _bare_daemon(tmp_path, cli_env={"ANTHROPIC_API_KEY": "sk-ambient"})
+    assert vscode_daemon._effective_cli_env() == {"ANTHROPIC_API_KEY": "sk-ambient"}
+
+    personal_daemon = _bare_daemon(
+        tmp_path,
+        active_account="personal",
+        personal_oauth_token="sk-ant-oat-test",
+        cli_env={"ANTHROPIC_API_KEY": "sk-ambient", "ANTHROPIC_AUTH_TOKEN": "also-ambient"},
+    )
+    assert personal_daemon._effective_cli_env() == {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-test"}
+
+
+def test_effective_cli_env_neutralizes_a_precedence_key_ambient_in_the_daemons_own_environment(tmp_path, monkeypatch):
+    """KTD3's real bite: claude_agent_sdk merges cli_env ON TOP of this
+    process's own inherited os.environ, so a precedence key set in the
+    daemon's own environment (not phone-set cli_env) would otherwise still
+    reach the spawned CLI unless explicitly neutralized here."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-inherited-from-daemon-process")
+    daemon = _bare_daemon(tmp_path, active_account="personal", personal_oauth_token="sk-ant-oat-test")
+
+    env = daemon._effective_cli_env()
+
+    assert env["ANTHROPIC_API_KEY"] == ""
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-test"
+
+
+@pytest.mark.asyncio
+async def test_switching_active_account_does_not_retroactively_affect_an_already_running_session(
+    running_daemon, phone_token
+):
+    """R3: _effective_cli_env() is only consulted at the two connect() call
+    sites (session start / resume) - it has no mechanism to reach back into
+    an already-spawned SDK client, so a later account switch must only be
+    visible to the *next* start_session call, not the one already running."""
+    daemon, port, fake_clients = running_daemon
+    daemon.config.active_account = "personal"
+    daemon.config.personal_oauth_token = "sk-ant-oat-first"
+
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        await phone.next_event()  # session_started
+        assert fake_clients[0].options.env == {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-first"}
+
+        daemon.config.active_account = "vscode"
+        daemon.config.personal_oauth_token = "sk-ant-oat-second"
+
+        assert fake_clients[0].options.env == {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-first"}
+    finally:
+        await phone.close()
+
+
 @pytest.mark.asyncio
 async def test_start_session_action_threads_the_configured_cli_settings_into_the_sdk_adapter(
     running_daemon, phone_token
