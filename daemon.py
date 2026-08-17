@@ -77,6 +77,30 @@ _DANGEROUS_CLI_ENV_KEYS = frozenset({
 })
 
 
+def _redact_secrets(value: Any, secrets: tuple[str, ...]) -> Any:
+    """KTD8: exact-substring redaction of currently-configured secret
+    values (device_token, personal_oauth_token) from anything forwarded to
+    the phone. Recurses through dicts/lists so it covers every event
+    shape uniformly - tool_result content (str or list of content
+    blocks), tool_call input (dict), assistant_message text (str) - without
+    needing per-event-type handling. Applied at `_send_event` (the one
+    function every live-forwarded event already passes through) and at the
+    history-replay path, which bypasses `_send_event` entirely.
+
+    `secrets` must already have falsy/empty values filtered out - an empty
+    string as a `str.replace` target would insert the placeholder between
+    every character."""
+    if isinstance(value, str):
+        for secret in secrets:
+            value = value.replace(secret, "[redacted]")
+        return value
+    if isinstance(value, dict):
+        return {key: _redact_secrets(item, secrets) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_secrets(item, secrets) for item in value]
+    return value
+
+
 def _is_valid_remote_cli_path(cli_path: str) -> bool:
     """A phone-supplied cli_path is a code-execution-adjacent primitive
     (it's what gets spawned for every subsequent session on this Mac) -
@@ -492,12 +516,16 @@ class CompanionDaemon:
             logger.warning("read_session_history action missing session_id")
             return
         events = await asyncio.to_thread(history.read_session_history, session_id)
+        # KTD8: this path sends directly over the websocket and bypasses
+        # _send_event entirely, so it needs its own redaction pass rather
+        # than inheriting _send_event's.
+        redacted_events = _redact_secrets(events if events is not None else [], self._secret_values())
         event = {
             "session_id": f"_history:{session_id}",
             "event_id": 0,
             "type": "session_history",
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "data": {"session_id": session_id, "events": events if events is not None else []},
+            "data": {"session_id": session_id, "events": redacted_events},
         }
         await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
 
@@ -774,8 +802,16 @@ class CompanionDaemon:
         finally:
             self._forwarding.pop(session_id, None)
 
+    def _secret_values(self) -> tuple[str, ...]:
+        """KTD8: current secret values to redact from forwarded content -
+        filters out personal_oauth_token when unset (None) rather than
+        passing an empty-string redaction target."""
+        return tuple(value for value in (self.config.device_token, self.config.personal_oauth_token) if value)
+
     async def _send_event(self, ws: "websockets.WebSocketClientProtocol", event: Event) -> None:
-        await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event.to_dict()}))
+        wire = event.to_dict()
+        wire["data"] = _redact_secrets(wire["data"], self._secret_values())
+        await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": wire}))
 
     async def _sleep_or_stop(self, delay: float) -> None:
         """Sleep for `delay` seconds, but wake immediately if `stop()` is called."""

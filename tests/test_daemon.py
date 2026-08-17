@@ -1453,3 +1453,98 @@ async def test_an_exception_in_one_of_the_new_sentinel_actions_does_not_kill_the
         assert event["type"] == "observe_settings"
     finally:
         await phone.close()
+
+
+# --- U6: secret redaction from forwarded event content ---
+
+from companion.daemon import _redact_secrets  # noqa: E402
+
+
+def test_redact_secrets_replaces_an_exact_substring_match_in_a_string():
+    assert _redact_secrets("token=sk-secret-1 end", ("sk-secret-1",)) == "token=[redacted] end"
+
+
+def test_redact_secrets_recurses_through_nested_dicts_and_lists():
+    value = {
+        "content": [{"type": "text", "text": "leaked: sk-secret-1"}],
+        "nested": {"deep": ["sk-secret-2", "unrelated"]},
+    }
+
+    redacted = _redact_secrets(value, ("sk-secret-1", "sk-secret-2"))
+
+    assert redacted == {
+        "content": [{"type": "text", "text": "leaked: [redacted]"}],
+        "nested": {"deep": ["[redacted]", "unrelated"]},
+    }
+
+
+def test_redact_secrets_leaves_content_with_no_secret_substring_unchanged():
+    value = {"text": "nothing sensitive here"}
+
+    assert _redact_secrets(value, ("sk-secret-1",)) == value
+
+
+def test_redact_secrets_is_a_no_op_with_no_secrets_configured():
+    value = {"text": "some content"}
+
+    assert _redact_secrets(value, ()) == value
+
+
+def test_redact_secrets_passes_through_non_string_leaf_values():
+    value = {"count": 3, "active": True, "missing": None}
+
+    assert _redact_secrets(value, ("sk-secret-1",)) == value
+
+
+@pytest.mark.asyncio
+async def test_send_event_redacts_the_configured_secrets_from_forwarded_content(running_daemon, phone_token):
+    daemon, port, _fake_clients = running_daemon
+    daemon.config.personal_oauth_token = "sk-ant-oat-leaked"
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        secret_bearing_text = f"my device token is {daemon.config.device_token} and oauth is sk-ant-oat-leaked"
+        await phone.send_action({"kind": "send_message", "session_id": session_id, "text": secret_bearing_text})
+
+        event = await phone.next_event()
+        assert event["type"] == "user_message"
+        assert daemon.config.device_token not in event["data"]["text"]
+        assert "sk-ant-oat-leaked" not in event["data"]["text"]
+        assert event["data"]["text"] == "my device token is [redacted] and oauth is [redacted]"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_read_session_history_redacts_secrets_from_the_replayed_transcript(
+    running_daemon, phone_token, tmp_path, monkeypatch
+):
+    from companion import history
+
+    daemon, port, _fake_clients = running_daemon
+    daemon.config.personal_oauth_token = "sk-ant-oat-leaked"
+
+    projects_dir = tmp_path / "claude-projects"
+    project_dir = projects_dir / "-Users-x-app"
+    project_dir.mkdir(parents=True)
+    secret_bearing_message = f"leaked token: {daemon.config.device_token}"
+    (project_dir / "session-1.jsonl").write_text(
+        json.dumps({"type": "user", "cwd": "/Users/x/app", "message": {"role": "user", "content": secret_bearing_message}})
+        + "\n"
+    )
+    monkeypatch.setattr(history, "DEFAULT_PROJECTS_DIR", str(projects_dir))
+
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "read_session_history", "session_id": "session-1"})
+
+        event = await phone.next_event()
+        assert event["type"] == "session_history"
+        replayed_text = event["data"]["events"][0]["data"]["text"]
+        assert daemon.config.device_token not in replayed_text
+        assert replayed_text == "leaked token: [redacted]"
+    finally:
+        await phone.close()
