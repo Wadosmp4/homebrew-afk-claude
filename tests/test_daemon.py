@@ -1137,6 +1137,232 @@ async def test_set_cli_settings_rejects_a_dynamic_linker_injection_env_key(runni
         await phone.close()
 
 
+# --- U2: account-settings actions and custom-token setup ---
+
+
+@pytest.mark.asyncio
+async def test_get_account_settings_action_reports_the_current_defaults(running_daemon, phone_token):
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "get_account_settings"})
+
+        event = await phone.next_event()
+        assert event["type"] == "account_settings"
+        assert event["data"]["active_account"] == "vscode"
+        assert event["data"]["personal_configured"] is False
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_set_personal_account_token_persists_and_reports_configured(running_daemon, phone_token):
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "set_personal_account_token", "token": "sk-ant-oat-test-token"})
+
+        confirm = await phone.next_event()
+        assert confirm["type"] == "account_settings"
+        assert confirm["data"]["personal_configured"] is True
+        # The raw token value never rides this confirmation.
+        assert "token" not in confirm["data"]
+        assert daemon.config.personal_oauth_token == "sk-ant-oat-test-token"
+
+        persisted = load_config(daemon.config_path)
+        assert persisted.personal_oauth_token == "sk-ant-oat-test-token"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_set_personal_account_token_rejects_empty_or_whitespace(running_daemon, phone_token):
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "set_personal_account_token", "token": "   "})
+
+        confirm = await phone.next_event()
+        assert confirm["data"]["personal_configured"] is False
+        assert daemon.config.personal_oauth_token is None
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_set_active_account_switches_once_a_token_is_configured(running_daemon, phone_token):
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "set_personal_account_token", "token": "sk-ant-oat-test-token"})
+        await phone.next_event()
+
+        await phone.send_action({"kind": "set_active_account", "active_account": "personal"})
+
+        confirm = await phone.next_event()
+        assert confirm["data"]["active_account"] == "personal"
+        assert daemon.config.active_account == "personal"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_set_active_account_rejects_an_unknown_value(running_daemon, phone_token):
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "set_active_account", "active_account": "bogus"})
+
+        confirm = await phone.next_event()
+        assert confirm["data"]["active_account"] == "vscode"
+        assert daemon.config.active_account == "vscode"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_set_active_account_rejects_personal_before_any_token_is_configured(running_daemon, phone_token):
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "set_active_account", "active_account": "personal"})
+
+        confirm = await phone.next_event()
+        assert confirm["data"]["active_account"] == "vscode"
+        assert daemon.config.active_account == "vscode"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_start_personal_account_setup_reports_unavailable_when_automation_fails(
+    running_daemon, phone_token, monkeypatch
+):
+    from companion import daemon as daemon_module
+
+    async def _fake_run_setup_token_under_pty(cli_path):
+        return None
+
+    monkeypatch.setattr(daemon_module, "_run_setup_token_under_pty", _fake_run_setup_token_under_pty)
+
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_personal_account_setup"})
+
+        event = await phone.next_event()
+        assert event["type"] == "personal_account_setup_result"
+        assert event["data"] == {"available": False}
+        assert daemon.config.personal_oauth_token is None
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_start_personal_account_setup_stores_the_captured_token_via_the_shared_path(
+    running_daemon, phone_token, monkeypatch
+):
+    """Same persistence path as set_personal_account_token - no duplicated
+    logic (U2's own test scenario)."""
+    from companion import daemon as daemon_module
+
+    async def _fake_run_setup_token_under_pty(cli_path):
+        return "sk-ant-oat-captured-token"
+
+    monkeypatch.setattr(daemon_module, "_run_setup_token_under_pty", _fake_run_setup_token_under_pty)
+
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_personal_account_setup"})
+
+        event = await phone.next_event()
+        assert event["type"] == "account_settings"
+        assert event["data"]["personal_configured"] is True
+        assert daemon.config.personal_oauth_token == "sk-ant-oat-captured-token"
+
+        persisted = load_config(daemon.config_path)
+        assert persisted.personal_oauth_token == "sk-ant-oat-captured-token"
+    finally:
+        await phone.close()
+
+
+def _fake_claude_binary(tmp_path, script_body: str):
+    """A standalone executable that stands in for `claude` -
+    _run_setup_token_under_pty always execs `[cli_path, "setup-token"]`
+    directly (no shell), so the fake has to be one real executable file,
+    not an "interpreter + script" string."""
+    script = tmp_path / "fake-claude"
+    script.write_text(f"#!{sys.executable}\n{script_body}\n")
+    script.chmod(0o755)
+    return str(script)
+
+
+@pytest.mark.asyncio
+async def test_run_setup_token_under_pty_returns_none_when_the_binary_does_not_exist():
+    from companion.daemon import _run_setup_token_under_pty
+
+    result = await _run_setup_token_under_pty("/definitely/not/a/real/claude/binary")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_run_setup_token_under_pty_returns_none_on_multi_line_output(tmp_path):
+    from companion.daemon import _run_setup_token_under_pty
+
+    binary = _fake_claude_binary(tmp_path, "print('line one')\nprint('line two')\n")
+
+    result = await _run_setup_token_under_pty(binary)
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_run_setup_token_under_pty_returns_none_on_nonzero_exit(tmp_path):
+    from companion.daemon import _run_setup_token_under_pty
+
+    binary = _fake_claude_binary(tmp_path, "import sys\nprint('sk-ant-oat-should-be-discarded')\nsys.exit(1)\n")
+
+    result = await _run_setup_token_under_pty(binary)
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_run_setup_token_under_pty_captures_a_single_clean_token_line(tmp_path):
+    from companion.daemon import _run_setup_token_under_pty
+
+    binary = _fake_claude_binary(tmp_path, "print('sk-ant-oat-fake-captured-token-value')\n")
+
+    result = await _run_setup_token_under_pty(binary)
+
+    assert result == "sk-ant-oat-fake-captured-token-value"
+
+
+@pytest.mark.asyncio
+async def test_run_setup_token_under_pty_returns_none_when_output_is_too_short_to_be_a_token(tmp_path):
+    from companion.daemon import _run_setup_token_under_pty
+
+    binary = _fake_claude_binary(tmp_path, "print('short')\n")
+
+    result = await _run_setup_token_under_pty(binary)
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_run_setup_token_under_pty_times_out_on_a_hanging_process(tmp_path, monkeypatch):
+    from companion import daemon as daemon_module
+
+    monkeypatch.setattr(daemon_module, "_SETUP_TOKEN_TIMEOUT_SECONDS", 0.2)
+    binary = _fake_claude_binary(tmp_path, "import time\ntime.sleep(5)\n")
+
+    result = await daemon_module._run_setup_token_under_pty(binary)
+
+    assert result is None
+
+
 @pytest.mark.asyncio
 async def test_start_session_action_threads_the_configured_cli_settings_into_the_sdk_adapter(
     running_daemon, phone_token

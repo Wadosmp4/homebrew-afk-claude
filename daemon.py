@@ -45,6 +45,7 @@ import asyncio
 import json
 import logging
 import os
+import pty
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -99,6 +100,87 @@ def _redact_secrets(value: Any, secrets: tuple[str, ...]) -> Any:
     if isinstance(value, list):
         return [_redact_secrets(item, secrets) for item in value]
     return value
+
+
+# KTD5: `claude setup-token` performs its own full OAuth flow (opens a
+# browser, waits for the user to approve there) - 90s gives a human enough
+# room to notice the browser, log in if needed, and approve, unlike the
+# near-instant SDK-connect case elsewhere in this module.
+_SETUP_TOKEN_TIMEOUT_SECONDS = 90.0
+_VALID_ACCOUNTS = frozenset({"vscode", "personal"})
+
+
+async def _run_setup_token_under_pty(cli_path: Optional[str]) -> Optional[str]:
+    """KTD5's automated setup attempt: spawn `claude setup-token` (or a
+    configured custom cli_path) under a pseudo-terminal so the CLI believes
+    it has a real terminal, wait up to _SETUP_TOKEN_TIMEOUT_SECONDS for it
+    to exit, and return the captured token if the output looks like exactly
+    one clean token line - or None on any failure (binary not found, spawn
+    error, timeout, non-zero exit, or ambiguous output), which the caller
+    treats as "automation unavailable, fall back to manual entry".
+
+    Per security review: never logs the raw pty buffer or the returned
+    token, at any level - only the caller's success/failure boolean is
+    ever observable outside this function.
+
+    Whether `claude setup-token` actually tolerates running under a pty
+    non-interactively is unverified in any environment this plan's
+    research could reach (see Planning Contract Assumptions) - this
+    function is written to the documented contract (opens its own OAuth
+    flow, prints the token, exits) and fails closed to "unavailable" on
+    anything it doesn't recognize, rather than guessing at a wrong token.
+    """
+    binary = cli_path or "claude"
+    master_fd, slave_fd = pty.openpty()
+    output_chunks: list[bytes] = []
+    loop = asyncio.get_event_loop()
+
+    def _drain() -> None:
+        try:
+            chunk = os.read(master_fd, 4096)
+        except OSError:
+            chunk = b""
+        if chunk:
+            output_chunks.append(chunk)
+        else:
+            loop.remove_reader(master_fd)
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            binary, "setup-token", stdin=slave_fd, stdout=slave_fd, stderr=slave_fd
+        )
+    except OSError:
+        os.close(master_fd)
+        os.close(slave_fd)
+        return None
+    os.close(slave_fd)  # only the child needs the slave end
+
+    os.set_blocking(master_fd, False)
+    loop.add_reader(master_fd, _drain)
+    try:
+        try:
+            await asyncio.wait_for(process.wait(), timeout=_SETUP_TOKEN_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            return None
+        if process.returncode != 0:
+            return None
+    finally:
+        try:
+            loop.remove_reader(master_fd)
+        except (ValueError, OSError):
+            pass
+        os.close(master_fd)
+
+    raw = b"".join(output_chunks).decode("utf-8", errors="ignore")
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return None
+    candidate = lines[0]
+    if " " in candidate or len(candidate) < 20:
+        return None
+    return candidate
 
 
 def _is_valid_remote_cli_path(cli_path: str) -> bool:
@@ -383,6 +465,22 @@ class CompanionDaemon:
             await self._handle_set_cli_settings(ws, action.get("cli_path"), action.get("cli_env"))
             return
 
+        if kind == "get_account_settings":
+            await self._handle_get_account_settings(ws)
+            return
+
+        if kind == "set_active_account":
+            await self._handle_set_active_account(ws, action.get("active_account"))
+            return
+
+        if kind == "set_personal_account_token":
+            await self._handle_set_personal_account_token(ws, action.get("token"))
+            return
+
+        if kind == "start_personal_account_setup":
+            await self._handle_start_personal_account_setup(ws)
+            return
+
         session_id = action.get("session_id")
         if not session_id:
             logger.warning("action missing session_id: %r", action)
@@ -640,6 +738,90 @@ class CompanionDaemon:
                 logger.warning("rejected set_cli_settings cli_env: disallowed key(s) %r", sorted(dangerous))
         await asyncio.to_thread(save_config, self.config_path, self.config)
         await self._handle_get_cli_settings(ws)  # confirm back with the (possibly-unchanged) state
+
+    async def _handle_get_account_settings(self, ws: "websockets.WebSocketClientProtocol") -> None:
+        """R1/R2 (session-account-switch): which identity new SDK-owned
+        sessions launch under. Never reports personal_oauth_token's raw
+        value (KTD4) - only whether it's configured, so the phone can show
+        the "Custom auth token" option as available/unavailable without the
+        secret ever riding this response."""
+        event = {
+            "session_id": "_account_settings",
+            "event_id": 0,
+            "type": "account_settings",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "data": {
+                "active_account": self.config.active_account,
+                "personal_configured": self.config.personal_oauth_token is not None,
+            },
+        }
+        await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
+
+    async def _handle_set_active_account(
+        self, ws: "websockets.WebSocketClientProtocol", active_account: Optional[str]
+    ) -> None:
+        """R2: rejects an unknown value, and rejects switching to
+        "personal" before a token exists (the daemon-side backstop for
+        what U4's UI already prevents by disabling that option) - same
+        reject-outright-but-still-confirm-back convention as
+        _handle_set_cli_settings."""
+        if active_account is None:
+            logger.warning("set_active_account action missing active_account")
+            await self._handle_get_account_settings(ws)
+            return
+        if active_account not in _VALID_ACCOUNTS:
+            logger.warning("rejected set_active_account %r: must be one of %r", active_account, sorted(_VALID_ACCOUNTS))
+            await self._handle_get_account_settings(ws)
+            return
+        if active_account == "personal" and self.config.personal_oauth_token is None:
+            logger.warning("rejected set_active_account 'personal': no personal_oauth_token configured yet")
+            await self._handle_get_account_settings(ws)
+            return
+        self.config.active_account = active_account
+        await asyncio.to_thread(save_config, self.config_path, self.config)
+        await self._handle_get_account_settings(ws)
+
+    async def _store_personal_account_token(self, token: str) -> None:
+        """Shared persistence path for both the manual paste-in
+        (_handle_set_personal_account_token) and the automated pty-capture
+        (_handle_start_personal_account_setup) flows, so success is
+        recorded identically either way (U2's own test scenario)."""
+        self.config.personal_oauth_token = token
+        await asyncio.to_thread(save_config, self.config_path, self.config)
+
+    async def _handle_set_personal_account_token(
+        self, ws: "websockets.WebSocketClientProtocol", token: Optional[str]
+    ) -> None:
+        """KTD5's manual-fallback entry point."""
+        if token is None or not token.strip():
+            logger.warning("rejected set_personal_account_token: empty or missing token")
+            await self._handle_get_account_settings(ws)
+            return
+        await self._store_personal_account_token(token.strip())
+        await self._handle_get_account_settings(ws)
+
+    async def _handle_start_personal_account_setup(self, ws: "websockets.WebSocketClientProtocol") -> None:
+        """KTD5's automated-first attempt. On success, confirms back
+        through the same _handle_get_account_settings every other change
+        does - the phone infers success from personal_configured flipping
+        true, no separate "it worked" signal needed. On failure, emits an
+        explicit personal_account_setup_result(available=False) - unlike
+        success, there is nothing else that would tell the phone "an
+        attempt just failed, show the manual fallback" versus "nothing has
+        happened yet"."""
+        token = await _run_setup_token_under_pty(self.config.cli_path)
+        if token is not None:
+            await self._store_personal_account_token(token)
+            await self._handle_get_account_settings(ws)
+            return
+        event = {
+            "session_id": "_account_settings",
+            "event_id": 0,
+            "type": "personal_account_setup_result",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "data": {"available": False},
+        }
+        await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
 
     async def _handle_git_status(self, adapter, session_id: str) -> None:
         """U10 (R16): computes git status for the session's cwd off the
