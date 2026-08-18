@@ -64,6 +64,13 @@ EVENT_TYPES = frozenset(
         # RateLimitEvent. ObserveAdapter never emits this, same reasoning
         # as context_usage above.
         "rate_limit",
+        # Connection-resilience plan U1: emitted once a permission_request
+        # is resolved - manually (respond_to_permission) or via an
+        # interrupt's deny-pending loop - so resolution is a durable,
+        # replayable fact rather than only held in the answering device's
+        # own memory. Mirrors "permission_request"'s own auto_approved=True
+        # self-documenting shape for the manual/interrupt-denied path.
+        "permission_resolved",
     }
 )
 

@@ -413,6 +413,12 @@ class _Session:
         if future is None:
             raise KeyError(f"no pending permission request: {request_id}")
         future.set_result((decision, message))
+        # U1 (connection-resilience plan): the one call site every
+        # resolution path shares - respond_to_permission and interrupt()'s
+        # deny-pending loop both land here - so both get durable recording
+        # for free, symmetric with permission_request's own auto_approved
+        # self-documenting shape.
+        self.emit("permission_resolved", request_id=request_id, decision=decision, message=message)
 
     async def read_loop(self) -> None:
         try:

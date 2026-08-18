@@ -396,6 +396,38 @@ async def test_permission_request_hook_round_trips_through_socket(adapter, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_respond_to_permission_emits_a_durable_resolution_event(adapter, tmp_path):
+    """U1 (connection-resilience plan): parity with SDKAdapter - an
+    observe-only session's manually-resolved permission is durable too,
+    not only held in the answering phone's own memory."""
+    project_dir = tmp_path / "projects" / "my-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-perm-resolved.jsonl"
+    transcript.touch()
+    await _wait_until(lambda: "session-perm-resolved" in adapter.discover_sessions())
+    events = adapter.subscribe("session-perm-resolved")
+    await events.__anext__()  # session_started
+
+    hook_task = asyncio.create_task(
+        _send_hook_async(
+            adapter.socket_path,
+            "PermissionRequest",
+            {"session_id": "session-perm-resolved", "tool_use_id": "tool-9", "tool_name": "Bash", "tool_input": {}},
+        )
+    )
+    permission_event = await events.__anext__()
+    assert permission_event.type == "permission_request"
+
+    await adapter.respond_to_permission("session-perm-resolved", "tool-9", "allow")
+    await asyncio.wait_for(hook_task, timeout=2)
+
+    resolved_event = await asyncio.wait_for(events.__anext__(), timeout=2)
+    assert resolved_event.type == "permission_resolved"
+    assert resolved_event.data["request_id"] == "tool-9"
+    assert resolved_event.data["decision"] == "allow"
+
+
+@pytest.mark.asyncio
 async def test_auto_approve_policy_allows_an_allowlisted_command_without_a_phone_round_trip(tmp_path):
     """A terminal-started session's PermissionRequest hook gets the same
     treatment as a phone-started one once the observed-session policy is

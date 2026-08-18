@@ -520,6 +520,83 @@ async def test_permission_request_deny_rejects_tool_back_to_claude(adapter):
 
 
 @pytest.mark.asyncio
+async def test_respond_to_permission_allow_emits_a_durable_resolution_event(adapter):
+    """U1 (connection-resilience plan): resolving a permission must be a
+    durable, replayable fact (R5/R6), not only held in the phone's own
+    memory - respond_to_permission's existing allow path now also emits
+    permission_resolved, in order right after permission_request."""
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    from claude_agent_sdk import ToolPermissionContext
+
+    asyncio.create_task(
+        client.options.can_use_tool("Bash", {"command": "ls"}, ToolPermissionContext(tool_use_id="tool-9"))
+    )
+    request_event = await events.__anext__()
+    assert request_event.type == "permission_request"
+
+    await adapter.respond_to_permission("s1", "tool-9", "allow")
+
+    resolved_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert resolved_event.type == "permission_resolved"
+    assert resolved_event.data["request_id"] == "tool-9"
+    assert resolved_event.data["decision"] == "allow"
+
+
+@pytest.mark.asyncio
+async def test_respond_to_permission_deny_emits_a_durable_resolution_event(adapter):
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    from claude_agent_sdk import ToolPermissionContext
+
+    asyncio.create_task(
+        client.options.can_use_tool("Bash", {"command": "rm -rf /"}, ToolPermissionContext(tool_use_id="tool-9"))
+    )
+    await events.__anext__()  # permission_request
+
+    await adapter.respond_to_permission("s1", "tool-9", "deny", message="not allowed")
+
+    resolved_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert resolved_event.type == "permission_resolved"
+    assert resolved_event.data["decision"] == "deny"
+    assert resolved_event.data["message"] == "not allowed"
+
+
+@pytest.mark.asyncio
+async def test_structured_question_answer_carries_through_onto_the_resolution_event(adapter):
+    """The chosen option text (sent as decision="allow", message=<option>)
+    must reach permission_resolved verbatim - resolve_permission emits
+    before can_use_tool's own structured-question reinterpretation of the
+    Future's result, so the durable record reflects what the phone
+    actually sent, not the internal deny-translation."""
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    from claude_agent_sdk import ToolPermissionContext
+
+    tool_input = {"questions": [{"question": "Red or blue?", "options": [{"label": "Red"}, {"label": "Blue"}]}]}
+    asyncio.create_task(
+        client.options.can_use_tool("AskUserQuestion", tool_input, ToolPermissionContext(tool_use_id="tool-9"))
+    )
+    await events.__anext__()  # permission_request
+
+    await adapter.respond_to_permission("s1", "tool-9", "allow", message="Red")
+
+    resolved_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert resolved_event.type == "permission_resolved"
+    assert resolved_event.data["decision"] == "allow"
+    assert resolved_event.data["message"] == "Red"
+
+
+@pytest.mark.asyncio
 async def test_auto_approve_policy_allows_a_read_only_tool_without_prompting(adapter):
     """A session opted into policy auto-approval (connect(auto_approve=True))
     never blocks on Read/Grep/Glob/WebSearch - companion/auto_approve.py's
@@ -880,6 +957,7 @@ async def test_auto_allow_is_scoped_to_the_specific_tool_name(adapter):
     )
     await events.__anext__()  # permission_request
     await adapter.respond_to_permission("s1", "tool-1", "allow")
+    await events.__anext__()  # permission_resolved
     await asyncio.wait_for(edit_call, timeout=1)
 
     bash_call = asyncio.create_task(
@@ -906,6 +984,7 @@ async def test_denying_a_tool_does_not_auto_allow_it_later(adapter):
     )
     await events.__anext__()  # permission_request
     await adapter.respond_to_permission("s1", "tool-1", "deny", message="no")
+    await events.__anext__()  # permission_resolved
     first_result = await asyncio.wait_for(first_call, timeout=1)
     assert first_result.behavior == "deny"
 
@@ -936,6 +1015,7 @@ async def test_structured_questions_are_never_auto_allowed(adapter):
     )
     await events.__anext__()  # permission_request
     await adapter.respond_to_permission("s1", "tool-1", "allow", message="Red")
+    await events.__anext__()  # permission_resolved
     await asyncio.wait_for(first_call, timeout=1)
 
     second_input = {"questions": [{"question": "Cat or dog?", "options": [{"label": "Cat"}, {"label": "Dog"}]}]}
@@ -1089,6 +1169,13 @@ async def test_interrupt_denies_a_pending_permission_request_first(adapter):
     # the interrupt.
     result = await asyncio.wait_for(call_task, timeout=1)
     assert result.behavior == "deny"
+
+    # U1 (connection-resilience plan): the deny-pending loop's own
+    # resolve_permission call durably records the denial too.
+    resolved_event = await events.__anext__()
+    assert resolved_event.type == "permission_resolved"
+    assert resolved_event.data["request_id"] == "tool-1"
+    assert resolved_event.data["decision"] == "deny"
 
     lifecycle_event = await events.__anext__()
     assert lifecycle_event.type == "session_ended"

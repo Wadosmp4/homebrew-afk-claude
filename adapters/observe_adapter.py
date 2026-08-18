@@ -577,7 +577,22 @@ class ObserveAdapter:
 # phone-sent `open_session` action - see daemon.py). Content from before
 # that point isn't backfilled - companion/history.py's read-only
 # transcript browsing covers "what happened before I looked."
-_ALWAYS_FORWARD_TYPES = frozenset({"session_started", "session_ended", "error", "permission_request", "waiting_for_input"})
+_ALWAYS_FORWARD_TYPES = frozenset(
+    {
+        "session_started",
+        "session_ended",
+        "error",
+        "permission_request",
+        "waiting_for_input",
+        # U1 (connection-resilience plan): resolves an already-always-
+        # forwarded permission_request - if this were gated on `opened`
+        # like ordinary conversation content, a phone that saw the
+        # request (e.g. via push notification) but never opened the
+        # dashboard would never learn it was resolved, reintroducing the
+        # exact "looks pending forever" bug R5/R6 exist to fix.
+        "permission_resolved",
+    }
+)
 
 
 class _ObserveSession:
@@ -660,3 +675,7 @@ class _ObserveSession:
         if future is None:
             raise KeyError(f"no pending permission request: {request_id}")
         future.set_result((decision, message))
+        # U1 (connection-resilience plan): parity with SDKAdapter's own
+        # _Session.resolve_permission - durable recording for an
+        # observe-only session's manually-resolved permission too.
+        self.emit("permission_resolved", request_id=request_id, decision=decision, message=message)

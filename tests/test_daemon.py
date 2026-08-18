@@ -488,6 +488,37 @@ async def test_start_session_action_with_llm_judge_off_by_default_still_prompts(
 
 
 @pytest.mark.asyncio
+async def test_respond_to_permission_action_forwards_a_durable_resolution_event(running_daemon, phone_token):
+    """U1 (connection-resilience plan): the phone sees permission_resolved
+    over the wire too, not just internally on the adapter - it must
+    survive the full daemon -> _send_event -> relay -> phone path."""
+    from claude_agent_sdk import ToolPermissionContext
+
+    daemon, port, fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        await phone.next_event()  # session_started
+        client = fake_clients[0]
+
+        asyncio.create_task(
+            client.options.can_use_tool("Bash", {"command": "ls"}, ToolPermissionContext(tool_use_id="tool-1"))
+        )
+        event = await phone.next_event()
+        assert event["type"] == "permission_request"
+
+        await phone.send_action(
+            {"kind": "respond_to_permission", "session_id": event["session_id"], "request_id": "tool-1", "decision": "allow"}
+        )
+        resolved_event = await phone.next_event()
+        assert resolved_event["type"] == "permission_resolved"
+        assert resolved_event["data"]["request_id"] == "tool-1"
+        assert resolved_event["data"]["decision"] == "allow"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
 async def test_send_message_action_routes_to_the_owning_sdk_session(running_daemon, phone_token):
     daemon, port, _fake_clients = running_daemon
     phone = await _FakePhone.connect(port, phone_token)
