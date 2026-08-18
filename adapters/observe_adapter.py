@@ -244,6 +244,13 @@ class ObserveAdapter:
         place (see events.py's registration comment)."""
         return UnsupportedOperation(operation="compact")
 
+    async def disconnect(self, session_id: str) -> UnsupportedOperation:
+        """U5: ending a session (as opposed to interrupt()'s turn-only
+        Cancel) isn't this phone's call to make for a session it's only
+        observing - server-side backstop mirroring send_message/interrupt/
+        compact above, alongside the mobile-side End Session gate."""
+        return UnsupportedOperation(operation="end_session")
+
     # --- permission round-trip ----------------------------------------------
 
     async def respond_to_permission(

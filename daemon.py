@@ -524,6 +524,8 @@ class CompanionDaemon:
                 await adapter.interrupt(session_id)
             elif kind == "compact":
                 await adapter.compact(session_id)
+            elif kind == "end_session":
+                await adapter.disconnect(session_id)
             elif kind == "respond_to_permission":
                 await adapter.respond_to_permission(
                     session_id,

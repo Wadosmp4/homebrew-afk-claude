@@ -1110,7 +1110,9 @@ async def test_structured_question_deny_with_a_reason_is_not_misread_as_an_answe
 
 
 @pytest.mark.asyncio
-async def test_interrupt_stops_session_and_emits_lifecycle_event(adapter):
+async def test_interrupt_cancels_the_turn_but_leaves_the_session_open(adapter):
+    """U5: Cancel is turn-only now - unlike disconnect() (see below), it
+    must not end the session, so a subsequent send_message still works."""
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
     events = adapter.subscribe("s1")
@@ -1119,23 +1121,81 @@ async def test_interrupt_stops_session_and_emits_lifecycle_event(adapter):
     await adapter.interrupt("s1")
     assert client.interrupted is True
 
-    lifecycle_event = await events.__anext__()
-    assert lifecycle_event.type == "session_ended"
-    assert lifecycle_event.data["reason"] == "interrupted"
+    await adapter.send_message("s1", "still there?")
+    user_message_event = await events.__anext__()
+    assert user_message_event.type == "user_message"
+    assert user_message_event.data["text"] == "still there?"
 
 
 @pytest.mark.asyncio
-async def test_is_active_is_false_after_interrupt_even_though_the_session_stays_discoverable(adapter):
-    """interrupt() (unlike disconnect()) doesn't remove the session from
-    _sessions - discover_sessions() alone can't distinguish it from one
-    still actually running, hence is_active()."""
+async def test_disconnect_stops_session_and_emits_lifecycle_event(adapter):
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    await adapter.disconnect("s1")
+    assert client.disconnected is True
+
+    lifecycle_event = await events.__anext__()
+    assert lifecycle_event.type == "session_ended"
+    assert lifecycle_event.data["reason"] == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_disconnect_denies_a_pending_permission_request_first(adapter):
+    """F3/R5: ending a session must durably deny any still-open permission
+    request on it, same as interrupt()'s own deny-pending loop."""
+    from claude_agent_sdk import ToolPermissionContext
+
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    call_task = asyncio.create_task(
+        client.options.can_use_tool("Bash", {"command": "rm -rf /"}, ToolPermissionContext(tool_use_id="tool-1"))
+    )
+    permission_event = await events.__anext__()
+    assert permission_event.type == "permission_request"
+
+    await adapter.disconnect("s1")
+
+    result = await asyncio.wait_for(call_task, timeout=1)
+    assert result.behavior == "deny"
+
+    resolved_event = await events.__anext__()
+    assert resolved_event.type == "permission_resolved"
+    assert resolved_event.data["request_id"] == "tool-1"
+    assert resolved_event.data["decision"] == "deny"
+
+    lifecycle_event = await events.__anext__()
+    assert lifecycle_event.type == "session_ended"
+    assert lifecycle_event.data["reason"] == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_is_active_is_true_after_interrupt_since_the_session_stays_open(adapter):
+    """U5: interrupt() (unlike disconnect()) no longer ends the session or
+    removes it from _sessions - a cancelled turn still reads as active."""
     await adapter.connect("s1")
     assert adapter.is_active("s1") is True
 
     await adapter.interrupt("s1")
 
     assert "s1" in adapter.discover_sessions()
-    assert adapter.is_active("s1") is False
+    assert adapter.is_active("s1") is True
+
+
+@pytest.mark.asyncio
+async def test_is_active_is_false_after_disconnect(adapter):
+    await adapter.connect("s1")
+    assert adapter.is_active("s1") is True
+
+    await adapter.disconnect("s1")
+
+    assert "s1" not in adapter.discover_sessions()
+    assert adapter.is_active("s1") is None
 
 
 @pytest.mark.asyncio
@@ -1177,9 +1237,8 @@ async def test_interrupt_denies_a_pending_permission_request_first(adapter):
     assert resolved_event.data["request_id"] == "tool-1"
     assert resolved_event.data["decision"] == "deny"
 
-    lifecycle_event = await events.__anext__()
-    assert lifecycle_event.type == "session_ended"
-    assert lifecycle_event.data["reason"] == "interrupted"
+    # U5: Cancel is turn-only now - no session_ended follows.
+    assert adapter.is_active("s1") is True
 
 
 @pytest.mark.asyncio

@@ -743,6 +743,12 @@ async def test_send_message_and_interrupt_return_unsupported_result(adapter, tmp
     assert compact_result.operation == "compact"
     assert "not supported" in compact_result.reason
 
+    # U5: End Session isn't this phone's call to make for a session it's
+    # only observing - server-side backstop alongside the mobile gate.
+    disconnect_result = await adapter.disconnect("session-ro")
+    assert disconnect_result.operation == "end_session"
+    assert "not supported" in disconnect_result.reason
+
 
 # --- Safeguards for watching the real ~/.claude/projects (not just test
 # fixtures) - reproducing the CPU-storm incident at unit-test scale would

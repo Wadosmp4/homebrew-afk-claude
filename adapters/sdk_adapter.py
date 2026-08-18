@@ -153,6 +153,10 @@ class SDKAdapter:
         await session.outbound.put(text)
 
     async def interrupt(self, session_id: str) -> None:
+        """Cancels the in-flight turn only - the session itself stays open
+        and usable afterward (U5/R7: "Cancel" is turn-only; ending the
+        session entirely is a separate, explicit action - see disconnect()
+        below)."""
         session = self._get(session_id)
         # A tool call still awaiting an answer (can_use_tool blocked on its
         # own Future - see resolve_permission) never gets resolved by
@@ -165,7 +169,6 @@ class SDKAdapter:
         for request_id in list(session.pending):
             session.resolve_permission(request_id, "deny", "Session interrupted before this was answered")
         await session.client.interrupt()
-        session.end("interrupted")
 
     async def compact(self, session_id: str) -> None:
         """Trigger the CLI's own compaction on demand, rather than waiting
@@ -212,6 +215,13 @@ class SDKAdapter:
         session = self._sessions.pop(session_id, None)
         if session is None:
             return
+        # F3/R5: ending a session must durably deny any permission request
+        # still open on it, same as interrupt()'s own deny-pending loop
+        # above - otherwise a phone that replays this session's history
+        # later sees a permission_request with no matching resolution and
+        # reads it as still pending forever.
+        for request_id in list(session.pending):
+            session.resolve_permission(request_id, "deny", "Session ended before this was answered")
         if session.reader_task is not None:
             session.reader_task.cancel()
         await session.client.disconnect()
@@ -226,11 +236,11 @@ class SDKAdapter:
 
     def is_active(self, session_id: str) -> Optional[bool]:
         """For the Sessions screen's list_active_sessions snapshot
-        (daemon.py) - interrupt() ends a session (_ended=True, a
-        session_ended event) without removing it from _sessions (only
-        disconnect() does that), so discover_sessions() alone can't tell
-        an interrupted/stopped session from one still actually running.
-        None for an unknown session_id, distinct from False."""
+        (daemon.py) - disconnect() ends a session (_ended=True, a
+        session_ended event) and removes it from _sessions; interrupt()
+        (U5: turn-only) leaves both untouched, so a cancelled turn still
+        reads as active here. None for an unknown session_id, distinct
+        from False."""
         session = self._sessions.get(session_id)
         return None if session is None else not session._ended
 

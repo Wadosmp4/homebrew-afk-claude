@@ -869,15 +869,13 @@ async def test_list_active_sessions_action_returns_a_snapshot_of_both_adapters(r
 
 
 @pytest.mark.asyncio
-async def test_list_active_sessions_reports_an_interrupted_sdk_session_as_inactive(
+async def test_list_active_sessions_omits_a_session_ended_via_end_session(
     running_daemon, phone_token
 ):
-    """Regression test: interrupt() ends a session (session_ended,
-    _ended=True) without removing it from SDKAdapter's own _sessions dict
-    - only disconnect() does that - so discover_sessions() alone still
-    lists it. Without checking is_active(), the snapshot reported it as
-    still running, which looked to the phone like a stopped session
-    reappeared/"restarted" the next time the Sessions screen remounted."""
+    """U5: end_session -> SDKAdapter.disconnect() removes the session from
+    _sessions entirely (unlike interrupt(), which now leaves it in place
+    and still active - see the sibling test below) - it must not reappear
+    in a later snapshot at all, active or not."""
     daemon, port, _fake_clients = running_daemon
     phone = await _FakePhone.connect(port, phone_token)
     try:
@@ -885,7 +883,7 @@ async def test_list_active_sessions_reports_an_interrupted_sdk_session_as_inacti
         started = await phone.next_event()
         session_id = started["session_id"]
 
-        await phone.send_action({"kind": "interrupt", "session_id": session_id})
+        await phone.send_action({"kind": "end_session", "session_id": session_id})
         ended = await phone.next_event()
         assert ended["type"] == "session_ended"
 
@@ -893,7 +891,35 @@ async def test_list_active_sessions_reports_an_interrupted_sdk_session_as_inacti
         event = await phone.next_event()
 
         by_id = {s["session_id"]: s for s in event["data"]["sessions"]}
-        assert by_id[session_id]["active"] is False
+        assert session_id not in by_id
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_list_active_sessions_reports_a_cancelled_turn_as_still_active(
+    running_daemon, phone_token
+):
+    """U5: Cancel (interrupt) is turn-only - the session stays open and
+    usable, so it must still read as active afterward."""
+    daemon, port, fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action({"kind": "interrupt", "session_id": session_id})
+        # _handle_action runs as its own unordered asyncio.create_task (see
+        # its own comment) - wait for the fake client to actually observe
+        # the interrupt before trusting the snapshot below reflects it.
+        await _wait_until(lambda: fake_clients[0].interrupted is True)
+
+        await phone.send_action({"kind": "list_active_sessions"})
+        event = await phone.next_event()
+
+        by_id = {s["session_id"]: s for s in event["data"]["sessions"]}
+        assert by_id[session_id]["active"] is True
     finally:
         await phone.close()
 
