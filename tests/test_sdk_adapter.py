@@ -1128,6 +1128,19 @@ async def test_interrupt_cancels_the_turn_but_leaves_the_session_open(adapter):
 
 
 @pytest.mark.asyncio
+async def test_interrupt_is_a_clean_noop_when_end_session_already_won_the_race(adapter):
+    """Regression test: daemon.py dispatches every phone action as its own
+    unordered asyncio.create_task - if a concurrently-dispatched End
+    Session's disconnect() pops the session first, a losing Cancel tap's
+    interrupt() must not raise (previously KeyError via _get(), silently
+    swallowed by daemon.py with no signal back to the phone)."""
+    await adapter.connect("s1")
+    await adapter.disconnect("s1")
+
+    await adapter.interrupt("s1")  # must not raise
+
+
+@pytest.mark.asyncio
 async def test_disconnect_stops_session_and_emits_lifecycle_event(adapter):
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]

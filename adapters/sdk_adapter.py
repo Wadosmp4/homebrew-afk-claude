@@ -157,7 +157,16 @@ class SDKAdapter:
         and usable afterward (U5/R7: "Cancel" is turn-only; ending the
         session entirely is a separate, explicit action - see disconnect()
         below)."""
-        session = self._get(session_id)
+        session = self._sessions.get(session_id)
+        if session is None:
+            # daemon.py dispatches every phone action as its own unordered
+            # asyncio.create_task, so a concurrently-dispatched End Session
+            # (disconnect(), which pops from _sessions) can beat this
+            # Cancel here - the session is already gone, so there's no
+            # turn left to cancel. Using _get() here would raise KeyError,
+            # caught only by daemon.py's generic action-failure logger with
+            # no signal back to the phone that tapped Cancel.
+            return
         # A tool call still awaiting an answer (can_use_tool blocked on its
         # own Future - see resolve_permission) never gets resolved by
         # client.interrupt() itself - the CLI then has to abandon a turn
