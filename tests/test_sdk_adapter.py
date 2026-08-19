@@ -1044,6 +1044,45 @@ async def test_risk_explanation_task_exception_does_not_crash_the_permission_flo
 
 
 @pytest.mark.asyncio
+async def test_disconnect_cancels_an_in_flight_risk_explanation_task(adapter, monkeypatch):
+    """Code-review fix: a session ending while its explanation task is
+    still awaiting a (slow/never-resolving) explain_risk call must not
+    leave that task running against an orphaned _Session - disconnect()
+    tracks and cancels it via explanation_tasks, the same way it already
+    cancels reader_task."""
+    from claude_agent_sdk import ToolPermissionContext
+
+    from companion import risk_judge
+
+    async def never_resolving_explain_risk(*args, **kwargs):
+        await asyncio.sleep(3600)
+        return "should never be reached"  # pragma: no cover
+
+    monkeypatch.setattr(risk_judge, "explain_risk", never_resolving_explain_risk)
+
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    asyncio.create_task(
+        client.options.can_use_tool("Bash", {"command": "ls"}, ToolPermissionContext(tool_use_id="tool-1"))
+    )
+    await asyncio.wait_for(events.__anext__(), timeout=1)  # permission_request
+
+    session = adapter._sessions["s1"]
+    assert len(session.explanation_tasks) == 1
+    explanation_task = next(iter(session.explanation_tasks))
+
+    await adapter.disconnect("s1")
+    # A cancelled task needs one event-loop tick to actually observe the
+    # cancellation and finish.
+    await asyncio.sleep(0)
+
+    assert explanation_task.cancelled()
+
+
+@pytest.mark.asyncio
 async def test_permission_risk_explanation_carries_none_with_no_api_key_and_failed_cli(adapter, monkeypatch):
     """Covers AE3: no ANTHROPIC_API_KEY configured (so get_api_client()
     returns None) and a CLI path that also fails - the emitted event

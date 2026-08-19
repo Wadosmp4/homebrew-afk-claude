@@ -245,6 +245,12 @@ class SDKAdapter:
             session.resolve_permission(request_id, "deny", "Session ended before this was answered")
         if session.reader_task is not None:
             session.reader_task.cancel()
+        # Code-review fix: any still-in-flight explanation task (see
+        # explanation_tasks' own comment) must not keep running - and,
+        # more importantly, must not emit() into this session's queue -
+        # after the session it was generating an explanation for is gone.
+        for explanation_task in list(session.explanation_tasks):
+            explanation_task.cancel()
         await session.client.disconnect()
         session.end("disconnected")
 
@@ -319,6 +325,15 @@ class _Session:
         self.reader_task: Optional[asyncio.Task] = None
         self.cwd: Optional[str] = None
         self._ended = False
+        # Risk Explanation plan (008), code-review fix: every _emit_risk_
+        # explanation task dispatched by can_use_tool is tracked here so
+        # disconnect() can cancel any still in flight - otherwise a session
+        # torn down mid-explanation left its CLI-subprocess fallback (up to
+        # 15s) running against a now-orphaned _Session whose emit() nobody
+        # would ever read again. Self-discarding via add_done_callback, the
+        # same pattern this codebase already uses for its other detached-
+        # task bookkeeping.
+        self.explanation_tasks: set[asyncio.Task] = set()
 
     def emit(self, type_: str, **data: Any) -> Event:
         event = self.sequencer.emit(type_, **data)
@@ -421,8 +436,12 @@ class _Session:
         self.emit("permission_request", request_id=request_id, tool=tool_name, input=tool_input)
         # Risk Explanation plan (U1): fired concurrently with the human's
         # own Allow/Deny wait below, never awaited here - a slow or failed
-        # explanation call must never delay `future = await future`.
-        asyncio.create_task(self._emit_risk_explanation(request_id, tool_name, tool_input))
+        # explanation call must never delay `future = await future`. Tracked
+        # in explanation_tasks (see its own comment) so disconnect() can
+        # cancel it if the session ends first.
+        explanation_task = asyncio.create_task(self._emit_risk_explanation(request_id, tool_name, tool_input))
+        self.explanation_tasks.add(explanation_task)
+        explanation_task.add_done_callback(self.explanation_tasks.discard)
 
         decision, message = await future
         if decision == "allow" and _is_structured_question(tool_input) and message:
