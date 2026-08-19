@@ -419,6 +419,10 @@ class _Session:
         future: asyncio.Future = asyncio.get_event_loop().create_future()
         self.pending[request_id] = future
         self.emit("permission_request", request_id=request_id, tool=tool_name, input=tool_input)
+        # Risk Explanation plan (U1): fired concurrently with the human's
+        # own Allow/Deny wait below, never awaited here - a slow or failed
+        # explanation call must never delay `future = await future`.
+        asyncio.create_task(self._emit_risk_explanation(request_id, tool_name, tool_input))
 
         decision, message = await future
         if decision == "allow" and _is_structured_question(tool_input) and message:
@@ -450,6 +454,26 @@ class _Session:
         # for free, symmetric with permission_request's own auto_approved
         # self-documenting shape.
         self.emit("permission_resolved", request_id=request_id, decision=decision, message=message)
+
+    async def _emit_risk_explanation(self, request_id: str, tool_name: str, tool_input: dict) -> None:
+        """Risk Explanation plan (U1): generates and emits a plain-English
+        explanation for a permission request that reached the human,
+        correlated back by request_id the same way permission_resolved
+        already correlates to its permission_request. Gated only on
+        risk_judge_use_api (the Mac-level API-key opt-in), not on
+        self.llm_judge - that flag controls auto-approval judgment, a
+        different, unrelated opt-in. Wrapped in a broad try/except: this
+        runs as a detached asyncio.create_task with nothing awaiting it, so
+        an unhandled exception here would otherwise vanish into the event
+        loop's default exception handler rather than being caught by any
+        caller - it must never crash the session's read loop or the
+        permission wait it runs alongside."""
+        try:
+            api_client = risk_judge.get_api_client() if self.risk_judge_use_api else None
+            explanation = await risk_judge.explain_risk(tool_name, tool_input, self.cwd, api_client=api_client)
+            self.emit("permission_risk_explanation", request_id=request_id, explanation=explanation)
+        except Exception:
+            logger.exception("risk explanation task failed for request_id=%r", request_id)
 
     async def read_loop(self) -> None:
         try:

@@ -24,7 +24,32 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
+from companion import risk_judge
 from companion.adapters.sdk_adapter import SDKAdapter
+from companion.risk_judge import explain_risk as _real_explain_risk
+
+
+@pytest.fixture(autouse=True)
+async def _stub_risk_explanation(monkeypatch):
+    """Risk Explanation plan (008): can_use_tool now fires a fire-and-
+    forget risk_judge.explain_risk() background task on every human-facing
+    permission_request, regardless of llm_judge/auto_approve (KTD2) - so,
+    unlike the pre-existing judge_is_safe path (only ever consulted when a
+    test opts into llm_judge=True), this one fires in *every* test that
+    reaches that path, including the many pre-existing tests that never
+    anticipated it and never monkeypatch risk_judge.query themselves.
+    Without this default stub, those tests would fall through to the real
+    `query_fn or query` default and attempt to spawn a real `claude` CLI
+    subprocess as an untracked side effect - exactly the kind of thing
+    this test file's own module docstring says never happens here. A test
+    that specifically wants to exercise the explanation feature overrides
+    this with its own monkeypatch.setattr(risk_judge, ...) call, which
+    simply replaces this stub for that test."""
+
+    async def _stub(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(risk_judge, "explain_risk", _stub)
 
 
 class FakeSDKClient:
@@ -85,6 +110,21 @@ async def adapter():
 async def _next_event(adapter: SDKAdapter, session_id: str):
     gen = adapter.subscribe(session_id)
     return await gen.__anext__(), gen
+
+
+async def _skip_explanations(events):
+    """Risk Explanation plan (008): permission_risk_explanation is emitted
+    from a background asyncio task (KTD2) with no fixed position in the
+    event stream, unlike every other event type this file's tests were
+    written against - it can land between any two events a test expects
+    back-to-back. Tests that don't care about this feature (the vast
+    majority - only a handful of tests further down assert on the
+    explanation event directly) wrap their subscription in this helper so
+    a stray explanation event is transparently skipped rather than being
+    misread as whatever the test actually expected next."""
+    async for event in events:
+        if event.type != "permission_risk_explanation":
+            yield event
 
 
 @pytest.mark.asyncio
@@ -296,7 +336,7 @@ async def test_context_usage_is_emitted_after_each_completed_turn(adapter):
 
     client.get_context_usage = fake_get_context_usage
 
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     started = await events.__anext__()
     assert started.type == "session_started"
 
@@ -330,7 +370,7 @@ async def test_context_usage_poll_failure_does_not_crash_the_read_loop(adapter):
     over what's a nice-to-have status update."""
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     started = await events.__anext__()
     assert started.type == "session_started"
 
@@ -357,7 +397,7 @@ async def test_rate_limit_event_is_emitted_when_the_cli_reports_one(adapter):
     has to forward it, normalized into the shared event model."""
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     started = await events.__anext__()
     assert started.type == "session_started"
 
@@ -389,7 +429,7 @@ async def test_compact_sends_slash_compact_without_a_user_message_event(adapter)
     bypassing send_message's own user_message emit entirely."""
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     started = await events.__anext__()
     assert started.type == "session_started"
 
@@ -412,7 +452,7 @@ async def test_send_message_then_assistant_reply_then_waiting_for_input(adapter)
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
 
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     started = await events.__anext__()
     assert started.type == "session_started"
 
@@ -444,7 +484,7 @@ async def test_send_message_then_assistant_reply_then_waiting_for_input(adapter)
 async def test_tool_call_and_result_produce_events_with_duration(adapter):
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     client.push(
@@ -478,7 +518,7 @@ async def test_large_tool_result_content_is_truncated(adapter):
     bounded event cache untruncated."""
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     client.push(
@@ -504,7 +544,7 @@ async def test_large_tool_result_content_is_truncated(adapter):
 async def test_permission_request_blocks_until_respond_to_permission_allow(adapter):
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     # Simulate the real subprocess asking the wired-up can_use_tool callback
@@ -534,7 +574,7 @@ async def test_permission_request_blocks_until_respond_to_permission_allow(adapt
 async def test_permission_request_deny_rejects_tool_back_to_claude(adapter):
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -558,7 +598,7 @@ async def test_respond_to_permission_allow_emits_a_durable_resolution_event(adap
     permission_resolved, in order right after permission_request."""
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -581,7 +621,7 @@ async def test_respond_to_permission_allow_emits_a_durable_resolution_event(adap
 async def test_respond_to_permission_deny_emits_a_durable_resolution_event(adapter):
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -608,7 +648,7 @@ async def test_structured_question_answer_carries_through_onto_the_resolution_ev
     actually sent, not the internal deny-translation."""
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -634,7 +674,7 @@ async def test_auto_approve_policy_allows_a_read_only_tool_without_prompting(ada
     is_auto_approvable is the source of truth for which tools qualify."""
     await adapter.connect("s1", auto_approve=True)
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -652,7 +692,7 @@ async def test_auto_approve_policy_still_emits_a_visible_event(adapter):
     happened (tagged auto_approved), just without a blocking prompt."""
     await adapter.connect("s1", auto_approve=True)
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -674,7 +714,7 @@ async def test_auto_approve_policy_still_prompts_for_a_denylisted_bash_command(a
     wins, regardless of the auto_approve flag."""
     await adapter.connect("s1", auto_approve=True)
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -699,7 +739,7 @@ async def test_auto_approve_policy_still_prompts_for_a_write(adapter):
     connect(), so the policy fails closed and still prompts."""
     await adapter.connect("s1", auto_approve=True)
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -732,7 +772,7 @@ async def test_llm_judge_safe_verdict_auto_approves(adapter, monkeypatch):
 
     await adapter.connect("s1", auto_approve=True, llm_judge=True)
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -771,7 +811,7 @@ async def test_llm_judge_caches_an_identical_call_within_the_same_session(adapte
 
     await adapter.connect("s1", auto_approve=True, llm_judge=True)
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -814,7 +854,7 @@ async def test_llm_judge_review_verdict_falls_through_to_human_prompt(adapter, m
 
     await adapter.connect("s1", auto_approve=True, llm_judge=True)
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -847,7 +887,7 @@ async def test_llm_judge_is_never_consulted_for_a_denylisted_command(adapter, mo
 
     await adapter.connect("s1", auto_approve=True, llm_judge=True)
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -878,7 +918,7 @@ async def test_llm_judge_defaults_off_even_with_auto_approve_on(adapter, monkeyp
 
     await adapter.connect("s1", auto_approve=True)
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -897,12 +937,156 @@ async def test_llm_judge_defaults_off_even_with_auto_approve_on(adapter, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_permission_request_also_emits_a_matching_risk_explanation_event(adapter, monkeypatch):
+    """Covers AE1: once a permission_request reaches the human, a
+    permission_risk_explanation event carrying the same request_id follows,
+    with the explanation text."""
+    from claude_agent_sdk import AssistantMessage, TextBlock, ToolPermissionContext
+
+    from companion import risk_judge
+
+    async def fake_query(*, prompt, options):
+        yield AssistantMessage(
+            content=[TextBlock(text="Deletes your local node_modules folder - reversible via a fresh install.")],
+            model="claude",
+        )
+
+    monkeypatch.setattr(risk_judge, "explain_risk", _real_explain_risk)
+    monkeypatch.setattr(risk_judge, "query", fake_query)
+
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    call_task = asyncio.create_task(
+        client.options.can_use_tool(
+            "Bash", {"command": "rm -rf node_modules"}, ToolPermissionContext(tool_use_id="tool-1")
+        )
+    )
+    permission_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    request_id = permission_event.data["request_id"]
+
+    explanation_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert explanation_event.type == "permission_risk_explanation"
+    assert explanation_event.data["request_id"] == request_id
+    assert explanation_event.data["explanation"] == (
+        "Deletes your local node_modules folder - reversible via a fresh install."
+    )
+
+    await adapter.respond_to_permission("s1", request_id, "allow")
+    await asyncio.wait_for(call_task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_risk_explanation_never_delays_the_permission_wait(adapter, monkeypatch):
+    """Covers R3/AE2: a slow (here, never-resolving) explanation call must
+    not delay can_use_tool's own Allow/Deny wait - resolving the permission
+    directly must let the call return promptly regardless of the
+    explanation task's own state."""
+    from claude_agent_sdk import ToolPermissionContext
+
+    from companion import risk_judge
+
+    async def never_resolving_explain_risk(*args, **kwargs):
+        await asyncio.sleep(3600)
+        return "should never be reached"
+
+    monkeypatch.setattr(risk_judge, "explain_risk", never_resolving_explain_risk)
+
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = _skip_explanations(adapter.subscribe("s1"))
+    await events.__anext__()  # session_started
+
+    call_task = asyncio.create_task(
+        client.options.can_use_tool("Bash", {"command": "ls"}, ToolPermissionContext(tool_use_id="tool-1"))
+    )
+    permission_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    request_id = permission_event.data["request_id"]
+
+    result = await asyncio.wait_for(
+        adapter.respond_to_permission("s1", request_id, "allow"), timeout=1
+    )
+    await asyncio.wait_for(call_task, timeout=1)  # would hang if explanation blocked the wait
+
+
+@pytest.mark.asyncio
+async def test_risk_explanation_task_exception_does_not_crash_the_permission_flow(adapter, monkeypatch):
+    """Given the background explanation task raises an unexpected
+    exception, it is caught and logged, and never propagates to crash
+    can_use_tool or the session's read loop - the human-facing Allow/Deny
+    flow proceeds completely unaffected."""
+    from claude_agent_sdk import ToolPermissionContext
+
+    from companion import risk_judge
+
+    async def explain_risk_raises(*args, **kwargs):
+        raise RuntimeError("unexpected failure")
+
+    monkeypatch.setattr(risk_judge, "explain_risk", explain_risk_raises)
+
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = _skip_explanations(adapter.subscribe("s1"))
+    await events.__anext__()  # session_started
+
+    call_task = asyncio.create_task(
+        client.options.can_use_tool("Bash", {"command": "ls"}, ToolPermissionContext(tool_use_id="tool-1"))
+    )
+    permission_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    request_id = permission_event.data["request_id"]
+
+    await adapter.respond_to_permission("s1", request_id, "allow")
+    result = await asyncio.wait_for(call_task, timeout=1)
+
+    assert result.behavior == "allow"
+
+
+@pytest.mark.asyncio
+async def test_permission_risk_explanation_carries_none_with_no_api_key_and_failed_cli(adapter, monkeypatch):
+    """Covers AE3: no ANTHROPIC_API_KEY configured (so get_api_client()
+    returns None) and a CLI path that also fails - the emitted event
+    carries explanation: None, with no exception surfacing."""
+    from claude_agent_sdk import ToolPermissionContext
+
+    from companion import risk_judge
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    async def failing_query(*, prompt, options):
+        raise RuntimeError("no claude CLI available")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(risk_judge, "explain_risk", _real_explain_risk)
+    monkeypatch.setattr(risk_judge, "query", failing_query)
+
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    call_task = asyncio.create_task(
+        client.options.can_use_tool("Bash", {"command": "ls"}, ToolPermissionContext(tool_use_id="tool-1"))
+    )
+    permission_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    request_id = permission_event.data["request_id"]
+
+    explanation_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert explanation_event.type == "permission_risk_explanation"
+    assert explanation_event.data["explanation"] is None
+
+    await adapter.respond_to_permission("s1", request_id, "allow")
+    await asyncio.wait_for(call_task, timeout=1)
+
+
+@pytest.mark.asyncio
 async def test_auto_approve_defaults_off(adapter):
     """connect() with no auto_approve argument behaves exactly like before
     this feature existed - opt-in, not opt-out."""
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -925,7 +1109,7 @@ async def test_auto_approve_policy_does_not_apply_to_structured_questions(adapte
     applies to it as a category (matches the auto_allowed_tools exemption)."""
     await adapter.connect("s1", auto_approve=True)
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -949,7 +1133,7 @@ async def test_a_tool_allowed_once_is_auto_allowed_on_later_calls_this_session(a
     one Edit shouldn't mean re-approving every subsequent edit."""
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -978,7 +1162,7 @@ async def test_auto_allow_is_scoped_to_the_specific_tool_name(adapter):
     name, not "the phone said allow once, allow everything forever"."""
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -1005,7 +1189,7 @@ async def test_auto_allow_is_scoped_to_the_specific_tool_name(adapter):
 async def test_denying_a_tool_does_not_auto_allow_it_later(adapter):
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -1035,7 +1219,7 @@ async def test_structured_questions_are_never_auto_allowed(adapter):
     every one must still prompt even after a prior one was answered."""
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -1069,7 +1253,7 @@ async def test_structured_question_answer_rides_back_as_a_deny_reason(adapter):
     the only channel this callback has for returning free-form text."""
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -1097,7 +1281,7 @@ async def test_structured_question_with_no_answer_falls_back_to_plain_allow_deny
     behaves like any other tool: allow really allows."""
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -1123,7 +1307,7 @@ async def test_structured_question_deny_with_a_reason_is_not_misread_as_an_answe
     as an answered question."""
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     from claude_agent_sdk import ToolPermissionContext
@@ -1146,7 +1330,7 @@ async def test_interrupt_cancels_the_turn_but_leaves_the_session_open(adapter):
     must not end the session, so a subsequent send_message still works."""
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     await adapter.interrupt("s1")
@@ -1175,7 +1359,7 @@ async def test_interrupt_is_a_clean_noop_when_end_session_already_won_the_race(a
 async def test_disconnect_stops_session_and_emits_lifecycle_event(adapter):
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     await adapter.disconnect("s1")
@@ -1194,7 +1378,7 @@ async def test_disconnect_denies_a_pending_permission_request_first(adapter):
 
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     call_task = asyncio.create_task(
@@ -1258,7 +1442,7 @@ async def test_interrupt_denies_a_pending_permission_request_first(adapter):
 
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     call_task = asyncio.create_task(
@@ -1289,7 +1473,7 @@ async def test_interrupt_denies_a_pending_permission_request_first(adapter):
 async def test_client_crash_emits_error_event_not_silence(adapter):
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]
-    events = adapter.subscribe("s1")
+    events = _skip_explanations(adapter.subscribe("s1"))
     await events.__anext__()  # session_started
 
     client.push(RuntimeError("subprocess died"))  # simulate the SDK stream blowing up

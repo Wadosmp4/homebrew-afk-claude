@@ -75,6 +75,12 @@ EVENT_TYPES = frozenset(
         # own memory. Mirrors "permission_request"'s own auto_approved=True
         # self-documenting shape for the manual/interrupt-denied path.
         "permission_resolved",
+        # Risk Explanation plan U1: emitted asynchronously, shortly after a
+        # permission_request that reached the human, correlating back to it
+        # by request_id the same way permission_resolved does above. Purely
+        # additive - explanation: None means no explanation is available
+        # (no API key configured, or the call failed), not an error.
+        "permission_risk_explanation",
     }
 )
 
