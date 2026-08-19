@@ -1392,6 +1392,98 @@ async def test_get_session_digest_action_reports_unavailable_when_generation_fai
         await phone.close()
 
 
+# --- Cross-Session Digest plan (010), U1: compose_digest action --------
+
+
+@pytest.mark.asyncio
+async def test_compose_digest_action_responds_on_the_cross_session_digest_sentinel(running_daemon, phone_token):
+    """Covers the plan's own sentinel-session_id convention - not scoped
+    to a real session_id, so this rides a raw event the same way
+    get_account_settings does, not an adapter's emit_custom."""
+    from companion import digest as digest_module
+
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        summaries = [{"device_label": "Mac A", "cwd": "/repo", "agent": "claude_code", "text": "doing a thing"}]
+
+        async def _fake_compose(received_summaries, **kwargs):
+            assert received_summaries == summaries
+            return "- Mac A (claude_code): doing a thing"
+
+        original_compose = digest_module.compose_cross_session_digest
+        digest_module.compose_cross_session_digest = _fake_compose
+        try:
+            await phone.send_action({"kind": "compose_digest", "session_summaries": summaries})
+            event = await phone.next_event()
+        finally:
+            digest_module.compose_cross_session_digest = original_compose
+
+        assert event["session_id"] == "_cross_session_digest"
+        assert event["type"] == "cross_session_digest"
+        assert event["data"]["available"] is True
+        assert event["data"]["text"] == "- Mac A (claude_code): doing a thing"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_compose_digest_action_reports_unavailable_when_composition_fails(running_daemon, phone_token):
+    from companion import digest as digest_module
+
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        async def _fake_compose_returns_none(*args, **kwargs):
+            return None
+
+        original_compose = digest_module.compose_cross_session_digest
+        digest_module.compose_cross_session_digest = _fake_compose_returns_none
+        try:
+            await phone.send_action({"kind": "compose_digest", "session_summaries": []})
+            event = await phone.next_event()
+        finally:
+            digest_module.compose_cross_session_digest = original_compose
+
+        assert event["type"] == "cross_session_digest"
+        assert event["data"]["available"] is False
+        assert event["data"]["text"] is None
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_compose_digest_action_with_no_session_summaries_field_defaults_to_an_empty_list(
+    running_daemon, phone_token
+):
+    """A malformed/absent session_summaries must not crash the dispatch -
+    treated as an empty list of active sessions, same fail-soft posture
+    as every other action handler in this file."""
+    from companion import digest as digest_module
+
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        received = {}
+
+        async def _fake_compose(received_summaries, **kwargs):
+            received["summaries"] = received_summaries
+            return "Nothing active."
+
+        original_compose = digest_module.compose_cross_session_digest
+        digest_module.compose_cross_session_digest = _fake_compose
+        try:
+            await phone.send_action({"kind": "compose_digest"})
+            event = await phone.next_event()
+        finally:
+            digest_module.compose_cross_session_digest = original_compose
+
+        assert received["summaries"] == []
+        assert event["data"]["available"] is True
+    finally:
+        await phone.close()
+
+
 @pytest.mark.asyncio
 async def test_start_session_records_the_resolved_cwd_as_recent(running_daemon, phone_token, tmp_path):
     # Same tmp_path the running_daemon fixture used to build daemon.recents_path.

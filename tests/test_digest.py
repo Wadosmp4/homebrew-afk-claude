@@ -214,3 +214,69 @@ def test_generate_digest_reuses_risk_judges_get_api_client():
     """digest.py must not redefine get_api_client - it imports risk_judge's
     (KTD1's own reasoning: no duplicated ANTHROPIC_API_KEY-gating logic)."""
     assert digest.get_api_client is risk_judge.get_api_client
+
+
+# --- Cross-Session Digest plan (010), U1: compose_cross_session_digest --
+
+_SAMPLE_SESSION_SUMMARIES = [
+    {"device_label": "Vadym's MacBook Pro", "cwd": "/repo/app", "agent": "claude_code", "text": "Adding tests, all passing."},
+    {"device_label": "Vadym's Mac Studio", "cwd": "/repo/api", "agent": "codex", "text": "Refactoring the auth module."},
+]
+
+
+@pytest.mark.asyncio
+async def test_compose_cross_session_digest_returns_the_merged_text():
+    result = await digest.compose_cross_session_digest(
+        _SAMPLE_SESSION_SUMMARIES, query_fn=_fake_query("- MacBook Pro (claude_code): adding tests\n- Mac Studio (codex): refactoring auth")
+    )
+
+    assert result == "- MacBook Pro (claude_code): adding tests\n- Mac Studio (codex): refactoring auth"
+
+
+@pytest.mark.asyncio
+async def test_compose_cross_session_digest_fails_closed_to_none_on_a_query_exception():
+    async def _raising_query_fn(*, prompt, options):
+        raise RuntimeError("subprocess crashed")
+        yield  # pragma: no cover - makes this an async generator
+
+    result = await digest.compose_cross_session_digest(_SAMPLE_SESSION_SUMMARIES, query_fn=_raising_query_fn)
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_compose_cross_session_digest_uses_the_api_client_without_calling_query_fn_when_it_succeeds():
+    api_client = _FakeApiClient(response_text="Merged via the API path.")
+    query_fn_calls: list[str] = []
+
+    async def _tracking_query_fn(*, prompt, options):
+        query_fn_calls.append(prompt)
+        yield AssistantMessage(content=[TextBlock(text="should not be used")], model="claude")
+
+    result = await digest.compose_cross_session_digest(
+        _SAMPLE_SESSION_SUMMARIES, query_fn=_tracking_query_fn, api_client=api_client
+    )
+
+    assert result == "Merged via the API path."
+    assert query_fn_calls == []
+
+
+@pytest.mark.asyncio
+async def test_compose_cross_session_digest_falls_back_to_query_fn_when_the_api_client_fails():
+    api_client = _FakeApiClient(raises=RuntimeError("connection reset"))
+
+    result = await digest.compose_cross_session_digest(
+        _SAMPLE_SESSION_SUMMARIES, query_fn=_fake_query("Merged via the CLI path."), api_client=api_client
+    )
+
+    assert result == "Merged via the CLI path."
+
+
+@pytest.mark.asyncio
+async def test_compose_cross_session_digest_with_an_empty_list_still_calls_through():
+    """No active sessions anywhere is a real (if unlikely) input the phone
+    could send - must not raise, same fail-closed contract as any other
+    input."""
+    result = await digest.compose_cross_session_digest([], query_fn=_fake_query("Nothing active right now."))
+
+    assert result == "Nothing active right now."

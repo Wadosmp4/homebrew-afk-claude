@@ -48,6 +48,21 @@ _SYSTEM_PROMPT = (
     "error. Keep it scannable at a glance, not a wall of text."
 )
 
+# Cross-Session Digest plan (010), U1: composes multiple already-generated
+# per-session digests (from generate_digest above, one per active session
+# across every online paired Mac) into one overview - a short, different
+# system prompt from _SYSTEM_PROMPT since the input here is pre-summarized
+# text per session, not a raw transcript.
+_COMPOSE_SYSTEM_PROMPT = (
+    "You are given short summaries of several currently-active coding agent "
+    "sessions, each already condensed to a few sentences, spanning one or more "
+    "Macs and one or more agent CLIs. Each entry names which Mac, which "
+    "directory, and which agent it belongs to. Respond with a short bulleted "
+    "overview, one bullet per session, each starting with the device and agent "
+    "label, briefly stating what that session is doing or waiting on. Be "
+    "concrete, not generic. You cannot use any tools yourself; only answer."
+)
+
 QueryFn = Callable[..., Any]
 
 
@@ -57,16 +72,20 @@ def _format_events(transcript_events: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-async def _via_api(prompt: str, *, api_client: Any, timeout_seconds: float) -> Optional[str]:
+async def _via_api(
+    prompt: str, *, api_client: Any, timeout_seconds: float, system_prompt: str = _SYSTEM_PROMPT
+) -> Optional[str]:
     """Mirrors risk_judge.py's own _judge_via_api: returns None on any
     failure so the caller falls back to the CLI-subprocess path rather
-    than treating an API-layer failure as "no summary exists"."""
+    than treating an API-layer failure as "no summary exists". Shared by
+    generate_digest and compose_cross_session_digest - system_prompt is
+    the only thing that differs between the two."""
     try:
         async with asyncio.timeout(timeout_seconds):
             response = await api_client.messages.create(
                 model=DEFAULT_API_MODEL,
                 max_tokens=300,
-                system=_SYSTEM_PROMPT,
+                system=system_prompt,
                 messages=[{"role": "user", "content": prompt}],
             )
         for block in response.content:
@@ -141,4 +160,57 @@ async def generate_digest(
     logger.warning(
         "digest generation produced no usable text block - message types seen: %r", message_types_seen
     )
+    return None
+
+
+def _format_session_summaries(session_summaries: list[dict[str, Any]]) -> str:
+    lines = [
+        f"{s.get('device_label', 'unknown device')} / {s.get('agent', 'unknown agent')} "
+        f"({s.get('cwd', 'unknown directory')}): {s.get('text', '')}"
+        for s in session_summaries
+    ]
+    return "\n".join(lines)
+
+
+async def compose_cross_session_digest(
+    session_summaries: list[dict[str, Any]],
+    *,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    query_fn: Optional[QueryFn] = None,
+    api_client: Optional[Any] = None,
+) -> Optional[str]:
+    """Cross-Session Digest plan (010), U1: merges multiple pre-generated
+    per-session digest texts (already summarized by generate_digest, one
+    per active session across every online paired Mac - see this
+    function's own module docstring) into one short cross-session
+    overview. Same fail-closed-to-None contract, same api_client-then-
+    query_fn fallback shape as generate_digest - only the prompt and
+    system prompt differ, since the input here is already-condensed text
+    per session, not a raw transcript."""
+    prompt = f"Active sessions:\n{_format_session_summaries(session_summaries)}"
+
+    if api_client is not None:
+        api_result = await _via_api(
+            prompt,
+            api_client=api_client,
+            timeout_seconds=DEFAULT_API_TIMEOUT_SECONDS,
+            system_prompt=_COMPOSE_SYSTEM_PROMPT,
+        )
+        if api_result is not None:
+            return api_result
+
+    query_fn = query_fn or query
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            async for message in query_fn(
+                prompt=prompt,
+                options=ClaudeAgentOptions(system_prompt=_COMPOSE_SYSTEM_PROMPT, tools=[]),
+            ):
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            text = block.text.strip()
+                            return text or None
+    except Exception:
+        logger.exception("cross-session digest composition failed")
     return None

@@ -508,6 +508,10 @@ class CompanionDaemon:
             await self._handle_start_personal_account_setup(ws)
             return
 
+        if kind == "compose_digest":
+            await self._handle_compose_digest(ws, action.get("session_summaries"))
+            return
+
         session_id = action.get("session_id")
         if not session_id:
             logger.warning("action missing session_id: %r", action)
@@ -994,6 +998,31 @@ class CompanionDaemon:
         # already threads through _effective_cli_env().
         text = await digest.generate_digest(events, api_client=api_client, env=self._effective_cli_env())
         adapter.emit_custom(session_id, "session_digest", available=text is not None, text=text)
+
+    async def _handle_compose_digest(
+        self, ws: "websockets.WebSocketClientProtocol", session_summaries: Optional[list]
+    ) -> None:
+        """Cross-Session Digest plan (010), U1: the phone has already
+        collected one per-session digest per active session across every
+        online paired Mac (its own compose-then-collect orchestration,
+        reusing AFK Digest's get_session_digest action per session) and
+        sends the collected texts here for one final merge call. Not
+        scoped to a single session_id, so this responds the same way
+        _handle_get_account_settings does - a raw event on a sentinel
+        session_id, matching the existing "_account_settings"/
+        "_observe_settings" convention - rather than through an adapter's
+        emit_custom, which requires an already-connected real session."""
+        summaries = session_summaries or []
+        api_client = digest.get_api_client() if self.config.risk_judge_use_api else None
+        text = await digest.compose_cross_session_digest(summaries, api_client=api_client)
+        event = {
+            "session_id": "_cross_session_digest",
+            "event_id": 0,
+            "type": "cross_session_digest",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "data": {"available": text is not None, "text": text},
+        }
+        await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
 
     async def _persist_sdk_session_registry(
         self, session_id: str, *, model: Optional[str] = None, permission_mode: Optional[str] = None
