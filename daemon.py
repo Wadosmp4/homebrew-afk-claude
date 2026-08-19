@@ -53,7 +53,7 @@ from uuid import uuid4
 
 import websockets
 
-from . import git_status, history, projects
+from . import digest, git_status, history, projects
 from .adapters.events import Event
 from .adapters.observe_adapter import KNOWN_ENTRYPOINTS, ObserveAdapter
 from .adapters.sdk_adapter import SDKAdapter
@@ -537,6 +537,8 @@ class CompanionDaemon:
                 await self._handle_git_status(adapter, session_id)
             elif kind == "git_diff":
                 await self._handle_git_diff(adapter, session_id, action.get("path"))
+            elif kind == "get_session_digest":
+                await self._handle_session_digest(adapter, session_id)
             elif kind == "set_session_auto_approve":
                 adapter.set_session_auto_approve(
                     session_id, action.get("auto_approve"), action.get("llm_judge")
@@ -871,6 +873,25 @@ class CompanionDaemon:
             return
         diff = await asyncio.to_thread(git_status.get_diff, cwd, path)
         adapter.emit_custom(session_id, "git_diff", path=path, **diff.to_dict())
+
+    async def _handle_session_digest(self, adapter, session_id: str) -> None:
+        """AFK Digest plan (U2): on-demand "Catch me up" - same off-loop
+        I/O + emit_custom shape as _handle_git_status/_handle_git_diff
+        above. No cwd means no transcript to read (mirrors
+        _handle_git_status's own early return); a missing transcript or a
+        fail-closed digest.generate_digest (no ANTHROPIC_API_KEY, timeout,
+        any other failure) both report available=False - never an
+        exception out of the dispatch."""
+        cwd = adapter.get_cwd(session_id)
+        if cwd is None:
+            adapter.emit_custom(session_id, "session_digest", available=False, text=None)
+            return
+        events = await asyncio.to_thread(history.read_session_history, session_id, str(self.observe_adapter.projects_dir))
+        if not events:
+            adapter.emit_custom(session_id, "session_digest", available=False, text=None)
+            return
+        text = await digest.generate_digest(events)
+        adapter.emit_custom(session_id, "session_digest", available=text is not None, text=text)
 
     async def _persist_sdk_session_settings(
         self, session_id: str, auto_approve: Optional[bool], llm_judge: Optional[bool]

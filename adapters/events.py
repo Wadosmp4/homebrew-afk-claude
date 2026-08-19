@@ -32,6 +32,10 @@ EVENT_TYPES = frozenset(
         # _handle_action for how a request becomes one of these.
         "git_status",
         "git_diff",
+        # AFK Digest plan (U2): an on-demand "Catch me up" request's result
+        # rides the same per-session event stream, same shape as
+        # git_status/git_diff above - see daemon.py's _handle_session_digest.
+        "session_digest",
         # Sessions-screen picker (daemon.py's _handle_list_projects): not
         # per-session like the rest of this registry - sent on a fixed
         # sentinel session_id ("_projects") since it isn't scoped to one.

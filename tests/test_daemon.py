@@ -813,6 +813,134 @@ async def test_git_status_with_no_known_cwd_reports_not_a_repo_rather_than_crash
 
 
 @pytest.mark.asyncio
+async def test_get_session_digest_action_with_no_known_cwd_reports_unavailable(running_daemon, phone_token):
+    """U2 (AFK Digest plan): mirrors git_status's own no-cwd early-return -
+    no cwd means no transcript to read, so this reports unavailable
+    immediately rather than calling history.read_session_history or
+    digest.generate_digest at all."""
+    from companion import digest as digest_module
+    from companion import history as history_module
+
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": None})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        calls = {"read_session_history": 0, "generate_digest": 0}
+
+        async def _should_not_be_called_generate_digest(*args, **kwargs):
+            calls["generate_digest"] += 1
+            return "should never run"
+
+        def _should_not_be_called_read_history(*args, **kwargs):
+            calls["read_session_history"] += 1
+            return []
+
+        original_read = history_module.read_session_history
+        original_generate = digest_module.generate_digest
+        history_module.read_session_history = _should_not_be_called_read_history
+        digest_module.generate_digest = _should_not_be_called_generate_digest
+        try:
+            await phone.send_action({"kind": "get_session_digest", "session_id": session_id})
+            event = await phone.next_event()
+        finally:
+            history_module.read_session_history = original_read
+            digest_module.generate_digest = original_generate
+
+        assert event["type"] == "session_digest"
+        assert event["data"]["available"] is False
+        assert calls == {"read_session_history": 0, "generate_digest": 0}
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_get_session_digest_action_with_a_resolvable_cwd_returns_the_generated_text(
+    running_daemon, phone_token
+):
+    """Covers AE1: a resolvable cwd + a successful digest.generate_digest
+    call reports available=True with the generated text."""
+    from companion import digest as digest_module
+    from companion import history as history_module
+
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        def _fake_read_session_history(sid, projects_dir=None):
+            assert sid == session_id
+            return [{"type": "assistant_message", "timestamp": "t1", "data": {"text": "did a thing"}}]
+
+        async def _fake_generate_digest(transcript_events, **kwargs):
+            assert transcript_events == [
+                {"type": "assistant_message", "timestamp": "t1", "data": {"text": "did a thing"}}
+            ]
+            return "Added a feature and it's working."
+
+        original_read = history_module.read_session_history
+        original_generate = digest_module.generate_digest
+        history_module.read_session_history = _fake_read_session_history
+        digest_module.generate_digest = _fake_generate_digest
+        try:
+            await phone.send_action({"kind": "get_session_digest", "session_id": session_id})
+            event = await phone.next_event()
+        finally:
+            history_module.read_session_history = original_read
+            digest_module.generate_digest = original_generate
+
+        assert event["type"] == "session_digest"
+        assert event["data"]["available"] is True
+        assert event["data"]["text"] == "Added a feature and it's working."
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_get_session_digest_action_reports_unavailable_when_generation_fails(
+    running_daemon, phone_token
+):
+    """Covers AE2: digest.generate_digest's own fail-closed None (no
+    ANTHROPIC_API_KEY, timeout, or any other failure) surfaces as
+    available=False, never an exception out of the action dispatch."""
+    from companion import digest as digest_module
+    from companion import history as history_module
+
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        async def _fake_generate_digest_returns_none(*args, **kwargs):
+            return None
+
+        original_read = history_module.read_session_history
+        original_generate = digest_module.generate_digest
+        history_module.read_session_history = lambda sid, projects_dir=None: [
+            {"type": "assistant_message", "timestamp": "t1", "data": {"text": "did a thing"}}
+        ]
+        digest_module.generate_digest = _fake_generate_digest_returns_none
+        try:
+            await phone.send_action({"kind": "get_session_digest", "session_id": session_id})
+            event = await phone.next_event()
+        finally:
+            history_module.read_session_history = original_read
+            digest_module.generate_digest = original_generate
+
+        assert event["type"] == "session_digest"
+        assert event["data"]["available"] is False
+        assert event["data"]["text"] is None
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
 async def test_start_session_records_the_resolved_cwd_as_recent(running_daemon, phone_token, tmp_path):
     # Same tmp_path the running_daemon fixture used to build daemon.recents_path.
     recents_path = str(tmp_path / "recent_projects.json")
