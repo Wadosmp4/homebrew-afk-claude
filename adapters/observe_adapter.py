@@ -29,7 +29,6 @@ import re
 import stat
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -37,6 +36,7 @@ from uuid import uuid4
 
 from .. import auto_approve as approval_policy
 from .. import risk_judge
+from .base import UnsupportedOperation
 from .events import Event, EventSequencer, truncate_tool_result_content
 
 logger = logging.getLogger(__name__)
@@ -89,12 +89,6 @@ def _matches_required_entrypoints(path: Path, required_entrypoints: frozenset[st
 # both surface as `waiting_for_input` - the closest fit for "Claude isn't
 # actively doing anything and is waiting on something".
 _WAITING_HOOK_EVENTS = ("Stop", "Notification")
-
-
-@dataclass(frozen=True)
-class UnsupportedOperation:
-    operation: str
-    reason: str = "not supported for observed sessions"
 
 
 class ObserveAdapter:
@@ -232,24 +226,24 @@ class ObserveAdapter:
         return True
 
     async def send_message(self, session_id: str, text: str) -> UnsupportedOperation:
-        return UnsupportedOperation(operation="send_message")
+        return UnsupportedOperation(operation="send_message", reason="not supported for observed sessions")
 
     async def interrupt(self, session_id: str) -> UnsupportedOperation:
-        return UnsupportedOperation(operation="interrupt")
+        return UnsupportedOperation(operation="interrupt", reason="not supported for observed sessions")
 
     async def compact(self, session_id: str) -> UnsupportedOperation:
         """An observed session isn't driven by our own ClaudeSDKClient -
         there's no client here to send `/compact` through, and no
         context_usage was ever emitted for it to react to in the first
         place (see events.py's registration comment)."""
-        return UnsupportedOperation(operation="compact")
+        return UnsupportedOperation(operation="compact", reason="not supported for observed sessions")
 
     async def disconnect(self, session_id: str) -> UnsupportedOperation:
         """U5: ending a session (as opposed to interrupt()'s turn-only
         Cancel) isn't this phone's call to make for a session it's only
         observing - server-side backstop mirroring send_message/interrupt/
         compact above, alongside the mobile-side End Session gate."""
-        return UnsupportedOperation(operation="end_session")
+        return UnsupportedOperation(operation="end_session", reason="not supported for observed sessions")
 
     # --- permission round-trip ----------------------------------------------
 

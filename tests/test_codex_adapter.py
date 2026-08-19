@@ -20,9 +20,16 @@ from openai_codex.generated.v2_all import (
     McpToolCallStatus,
     McpToolCallThreadItem,
     ThreadItem,
+    Turn,
     TurnError,
+    TurnStatus,
 )
-from openai_codex.models import ErrorNotification, ItemCompletedNotification, ItemStartedNotification
+from openai_codex.models import (
+    ErrorNotification,
+    ItemCompletedNotification,
+    ItemStartedNotification,
+    TurnCompletedNotification,
+)
 
 from companion.adapters.base import AdapterProtocol
 from companion.adapters.codex_adapter import CodexAdapter, UnsupportedOperation
@@ -64,14 +71,20 @@ class FakeThread:
     def __init__(self):
         self.turns: list[FakeTurnHandle] = []
         self.compact_calls = 0
+        self.raise_on_turn: Exception | None = None
+        self.raise_on_compact: Exception | None = None
 
     async def turn(self, input, **kwargs):
+        if self.raise_on_turn is not None:
+            raise self.raise_on_turn
         handle = FakeTurnHandle()
         self.turns.append(handle)
         return handle
 
     async def compact(self):
         self.compact_calls += 1
+        if self.raise_on_compact is not None:
+            raise self.raise_on_compact
 
 
 class FakeCodexClient:
@@ -82,17 +95,25 @@ class FakeCodexClient:
         self.thread_start_kwargs: list[dict] = []
         self.logged_in_with: str | None = None
         self.closed = False
+        self.close_calls = 0
+        self.raise_on_thread_start: Exception | None = None
+        self.raise_on_close: Exception | None = None
 
     async def login_api_key(self, api_key: str) -> None:
         self.logged_in_with = api_key
 
     async def thread_start(self, **kwargs):
+        if self.raise_on_thread_start is not None:
+            raise self.raise_on_thread_start
         thread = FakeThread()
         self.threads.append(thread)
         self.thread_start_kwargs.append(kwargs)
         return thread
 
     async def close(self) -> None:
+        self.close_calls += 1
+        if self.raise_on_close is not None:
+            raise self.raise_on_close
         self.closed = True
 
 
@@ -313,13 +334,15 @@ async def test_respond_to_permission_is_unsupported(adapter):
 
 
 @pytest.mark.asyncio
-async def test_set_session_auto_approve_is_unsupported(adapter):
+async def test_set_session_auto_approve_returns_false_matching_the_protocols_bool_contract(adapter):
+    """Code-review fix: AdapterProtocol declares this -> bool (both real
+    conformers return a real bool); UnsupportedOperation violated that
+    contract - False is the correct "no-op" signal instead."""
     await adapter.connect("s1", cwd="/repo")
 
     result = adapter.set_session_auto_approve("s1", auto_approve=True)
 
-    assert isinstance(result, UnsupportedOperation)
-    assert result.operation == "set_session_auto_approve"
+    assert result is False
 
 
 @pytest.mark.asyncio
@@ -338,3 +361,146 @@ async def test_connect_skips_login_with_no_api_key_configured(adapter):
 
     client = adapter._test_clients["latest"]
     assert client.logged_in_with is None
+
+
+# --- Code-review fixes ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_normal_turn_completion_reports_waiting_for_input(adapter):
+    """Covers P0 fix: TurnCompletedNotification previously fell through
+    unhandled, so a phone never learned an ordinary Codex turn had
+    finished."""
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+    await adapter.send_message("s1", "hello")
+    await events.__anext__()  # user_message
+
+    turn_handle = adapter._test_clients["latest"].threads[0].turns[0]
+    turn = Turn(id="turn-1", items=[], status=TurnStatus.completed)
+    turn_handle.push(TurnCompletedNotification(threadId="t1", turn=turn))
+
+    event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert event.type == "waiting_for_input"
+
+
+@pytest.mark.asyncio
+async def test_interrupt_is_a_clean_noop_when_the_session_is_already_gone(adapter):
+    """Covers P2 fix: interrupt() must not reintroduce the raising-_get()
+    KeyError SDKAdapter's own equivalent regression test exists to pin -
+    a Cancel racing an already-completed End Session must be a silent
+    no-op, not an exception."""
+    await adapter.connect("s1", cwd="/repo")
+    await adapter.disconnect("s1")
+
+    await adapter.interrupt("s1")  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_disconnect_still_ends_the_session_when_client_close_raises(adapter):
+    """Covers P1 fix: a failing client.close() must not skip session.end(),
+    or nothing ever emits session_ended and subscribers hang."""
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    client = adapter._test_clients["latest"]
+    client.raise_on_close = RuntimeError("connection reset")
+
+    await adapter.disconnect("s1")
+
+    event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert event.type == "session_ended"
+
+
+@pytest.mark.asyncio
+async def test_send_message_reports_an_error_event_when_turn_start_fails(adapter):
+    """Covers P1 fix: a thread.turn() failure must not vanish silently
+    after the message already shows as sent."""
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    thread = adapter._test_clients["latest"].threads[0]
+    thread.raise_on_turn = RuntimeError("turn failed to start")
+
+    await adapter.send_message("s1", "hello")
+    await events.__anext__()  # user_message
+
+    event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert event.type == "error"
+    assert "turn failed to start" in event.data["message"]
+
+
+@pytest.mark.asyncio
+async def test_a_second_send_message_cancels_the_previous_turns_still_running_stream_task(adapter):
+    """Covers P1 fix: a still-streaming previous turn's background task
+    must not be silently orphaned when a new turn starts."""
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    await adapter.send_message("s1", "first")
+    await events.__anext__()  # user_message
+    session = adapter._sessions["s1"]
+    first_stream_task = session.stream_task
+
+    await adapter.send_message("s1", "second")
+    await events.__anext__()  # user_message
+
+    assert first_stream_task.cancelled() or first_stream_task.cancelling() > 0
+    assert session.stream_task is not first_stream_task
+
+
+@pytest.mark.asyncio
+async def test_compact_reports_an_error_event_on_failure_instead_of_raising(adapter):
+    """Covers P2 fix: compact() previously had zero error handling."""
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    thread = adapter._test_clients["latest"].threads[0]
+    thread.raise_on_compact = RuntimeError("compact failed")
+
+    await adapter.compact("s1")  # must not raise
+
+    event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert event.type == "error"
+    assert "compact failed" in event.data["message"]
+
+
+@pytest.mark.asyncio
+async def test_connect_closes_the_client_and_reraises_when_thread_start_fails(adapter):
+    """Covers P2 fix: a failed thread_start() previously leaked the
+    already-constructed client with nothing left to close it."""
+    clients: dict[str, FakeCodexClient] = {}
+
+    def factory():
+        client = FakeCodexClient()
+        client.raise_on_thread_start = RuntimeError("thread_start failed")
+        clients["latest"] = client
+        return client
+
+    failing_adapter = CodexAdapter(client_factory=factory)
+
+    with pytest.raises(RuntimeError, match="thread_start failed"):
+        await failing_adapter.connect("s1", cwd="/repo")
+
+    assert clients["latest"].close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_unsupported_operation_reasons_differ_between_adapters():
+    """Covers maintainability fix: UnsupportedOperation is now shared from
+    base.py (no duplicate class), with each adapter passing its own
+    explicit reason rather than relying on a class-level default."""
+    from companion.adapters.observe_adapter import ObserveAdapter
+
+    observe_result = await ObserveAdapter().send_message("s1", "hi")
+    codex_adapter = CodexAdapter(client_factory=lambda: FakeCodexClient())
+    await codex_adapter.connect("s1", cwd="/repo")
+    codex_result = await codex_adapter.respond_to_permission("s1", "req-1", "allow")
+
+    assert observe_result.reason == "not supported for observed sessions"
+    assert codex_result.reason == "not supported for Codex sessions"

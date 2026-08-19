@@ -20,9 +20,25 @@ extends naturally to any future adapter with its own partial support
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any, Optional, Protocol, runtime_checkable
 
 from .events import Event
+
+
+@dataclass(frozen=True)
+class UnsupportedOperation:
+    """A capability a given adapter genuinely doesn't have, reported rather
+    than raised, so a phone tapping an unavailable control gets a clear
+    "can't do that" instead of a generic error. Shared by every adapter with
+    partial support (code-review fix: previously ObserveAdapter and
+    CodexAdapter each redeclared an identically-shaped class under this same
+    name) - `reason` has no default so each call site states its own,
+    since "not supported for observed sessions" and "not supported for
+    Codex sessions" genuinely differ."""
+
+    operation: str
+    reason: str
 
 
 @runtime_checkable

@@ -5,3 +5,11 @@
 -r ../relay/requirements.txt
 pytest>=8.0,<9.0
 pytest-asyncio>=0.23,<1.0
+# Multi-Agent Adapter plan (009), U3: test_codex_adapter.py imports
+# openai_codex.generated/openai_codex.models at module level to construct
+# realistic notification/item dataclasses (not lazily, unlike
+# codex_adapter.py's own production import inside connect() - see that
+# module's docstring for why the shipped package keeps this optional).
+# Without this, that one test file fails to collect entirely on a machine
+# that hasn't manually installed it.
+openai-codex>=0.147.0,<0.148.0

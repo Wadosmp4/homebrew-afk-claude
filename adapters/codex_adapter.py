@@ -37,9 +37,9 @@ import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from .base import UnsupportedOperation
 from .events import Event, EventSequencer
 
 logger = logging.getLogger(__name__)
@@ -52,18 +52,6 @@ ClientFactory = Callable[[], Any]
 # R3 only requires "at minimum" tool-call/tool-result/permission-request-
 # equivalent coverage, not an exhaustive mapping of Codex's full item set.
 _TOOL_ITEM_TYPES = ("commandExecution", "mcpToolCall", "fileChange")
-_TERMINAL_STATUSES = ("completed", "failed", "declined")
-
-
-@dataclass(frozen=True)
-class UnsupportedOperation:
-    """Mirrors observe_adapter.py's own dataclass of the same name and
-    contract - a capability this adapter genuinely doesn't have, reported
-    rather than raised, so a phone tapping an unavailable control gets a
-    clear "can't do that" instead of a generic error."""
-
-    operation: str
-    reason: str = "not supported for Codex sessions"
 
 
 def _tool_name_for_item(item: Any) -> str:
@@ -123,11 +111,19 @@ class CodexAdapter:
         from openai_codex import ApprovalMode, AsyncCodex
 
         client = self._client_factory() if self._client_factory is not None else AsyncCodex()
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if api_key:
-            await client.login_api_key(api_key)
-        resolved_cwd = cwd or self._cwd
-        thread = await client.thread_start(approval_mode=ApprovalMode.auto_review, cwd=resolved_cwd, model=model)
+        # Code-review fix: a failure anywhere in this setup sequence must
+        # not leak the just-constructed client - nothing else can reach it
+        # to close it otherwise, since it's never stored until the
+        # _CodexSession below is actually created.
+        try:
+            api_key = os.environ.get("OPENAI_API_KEY")
+            if api_key:
+                await client.login_api_key(api_key)
+            resolved_cwd = cwd or self._cwd
+            thread = await client.thread_start(approval_mode=ApprovalMode.auto_review, cwd=resolved_cwd, model=model)
+        except Exception:
+            await client.close()
+            raise
 
         session = _CodexSession(session_id, client=client, thread=thread)
         session.cwd = resolved_cwd
@@ -143,18 +139,43 @@ class CodexAdapter:
 
         session = self._get(session_id)
         session.emit("user_message", text=text)
-        turn_handle = await session.thread.turn(TextInput(text=text))
+        # Code-review fix: a still-running previous turn's background task
+        # must not be silently overwritten/orphaned by this turn's own
+        # current_turn/stream_task assignment below - cancel it first so
+        # exactly one stream task is ever tracked per session.
+        if session.stream_task is not None and not session.stream_task.done():
+            session.stream_task.cancel()
+        try:
+            turn_handle = await session.thread.turn(TextInput(text=text))
+        except Exception as exc:
+            logger.warning("Codex turn failed to start for session %s: %s", session_id, exc)
+            session.emit("error", message=str(exc))
+            return
         session.current_turn = turn_handle
         session.stream_task = asyncio.create_task(self._drive_turn(session, turn_handle))
 
     async def interrupt(self, session_id: str) -> None:
-        session = self._get(session_id)
+        # Code-review fix: lenient lookup, matching SDKAdapter.interrupt()'s
+        # own deliberate leniency - daemon.py's unordered per-action
+        # asyncio.create_task dispatch can race a "Cancel" against an "End
+        # Session" tapped on the same session in close succession, and the
+        # session may already be gone from self._sessions by the time this
+        # runs. The raising _get() reintroduced the exact KeyError
+        # SDKAdapter's own test_interrupt_is_a_clean_noop_when_end_session_
+        # already_won_the_race exists to pin.
+        session = self._sessions.get(session_id)
+        if session is None:
+            return
         if session.current_turn is not None:
             await session.current_turn.interrupt()
 
     async def compact(self, session_id: str) -> None:
         session = self._get(session_id)
-        await session.thread.compact()
+        try:
+            await session.thread.compact()
+        except Exception as exc:
+            logger.warning("Codex compact failed for session %s: %s", session_id, exc)
+            session.emit("error", message=str(exc))
 
     async def disconnect(self, session_id: str) -> None:
         session = self._sessions.pop(session_id, None)
@@ -167,7 +188,14 @@ class CodexAdapter:
                 logger.exception("failed to interrupt Codex turn on disconnect for session_id=%r", session_id)
         if session.stream_task is not None:
             session.stream_task.cancel()
-        await session.client.close()
+        # Code-review fix: close() must not skip session.end() - the
+        # session is already popped from self._sessions above, so if close()
+        # raises here, nothing else will ever emit session_ended, stranding
+        # any forwarder/subscriber blocked on session.events.get().
+        try:
+            await session.client.close()
+        except Exception:
+            logger.exception("failed to close Codex client on disconnect for session_id=%r", session_id)
         session.end("disconnected")
 
     async def respond_to_permission(
@@ -175,12 +203,21 @@ class CodexAdapter:
     ) -> UnsupportedOperation:
         # See module docstring's spike-finding #2: no per-call interactive
         # approval exists in the SDK surface this adapter integrates with.
-        return UnsupportedOperation(operation="respond_to_permission")
+        return UnsupportedOperation(
+            operation="respond_to_permission", reason="not supported for Codex sessions"
+        )
 
     def set_session_auto_approve(
         self, session_id: str, auto_approve: Optional[bool] = None, llm_judge: Optional[bool] = None
-    ) -> UnsupportedOperation:
-        return UnsupportedOperation(operation="set_session_auto_approve")
+    ) -> bool:
+        # Code-review fix: AdapterProtocol declares this -> bool (both real
+        # conformers, SDKAdapter and ObserveAdapter, return a real bool) -
+        # returning UnsupportedOperation here violated that contract. False
+        # is the same "no-op, nothing to apply" signal ObserveAdapter's own
+        # set_session_auto_approve already uses for an unknown session_id;
+        # there's no per-session auto_approve/llm_judge concept for Codex
+        # to actually set (only the coarse, thread-level ApprovalMode).
+        return False
 
     def get_cwd(self, session_id: str) -> Optional[str]:
         session = self._sessions.get(session_id)
@@ -224,7 +261,23 @@ class CodexAdapter:
             session.emit("error", message=str(exc))
 
     async def _handle_notification(self, session: "_CodexSession", notification: Any, seen_item_ids: set[str]) -> None:
-        from openai_codex.models import ErrorNotification, ItemCompletedNotification, ItemStartedNotification
+        from openai_codex.models import (
+            ErrorNotification,
+            ItemCompletedNotification,
+            ItemStartedNotification,
+            TurnCompletedNotification,
+        )
+
+        if isinstance(notification, TurnCompletedNotification):
+            # Code-review fix (P0): the turn finishing was previously never
+            # signaled at all - mirrors SDKAdapter's own ResultMessage ->
+            # waiting_for_input emit (sdk_adapter.py), which is what tells
+            # the phone "the agent is done, your turn" and clears its own
+            # "thinking" indicator. Without this, every ordinary Codex turn
+            # that completes without a fresh tool call as its last item left
+            # the phone waiting forever with no signal the turn ever ended.
+            session.emit("waiting_for_input", subtype="codex_turn_completed")
+            return
 
         if isinstance(notification, ItemStartedNotification):
             item = notification.item.root if hasattr(notification.item, "root") else notification.item
