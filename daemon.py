@@ -54,6 +54,7 @@ from uuid import uuid4
 import websockets
 
 from . import digest, git_status, history, projects, session_registry
+from .adapters.base import AdapterProtocol
 from .adapters.events import Event
 from .adapters.observe_adapter import KNOWN_ENTRYPOINTS, ObserveAdapter
 from .adapters.sdk_adapter import SDKAdapter
@@ -250,6 +251,15 @@ class CompanionDaemon:
             auto_approve=config.observe_auto_approve,
             llm_judge=config.observe_llm_judge,
         )
+        # Multi-Agent Adapter plan (009), U2: dispatch/lookup/broadcast call
+        # sites iterate this registry instead of naming self.sdk_adapter/
+        # self.observe_adapter directly, so adding a third adapter (e.g.
+        # CodexAdapter) only means appending it here - the named attributes
+        # above stay too, for the call sites that intentionally mean "the
+        # Claude-Code-specific adapter" (persistence gated on `adapter is
+        # self.sdk_adapter`, observe-only settings actions, etc.), which
+        # this plan deliberately leaves untouched (KTD2).
+        self.adapters: list[AdapterProtocol] = [self.sdk_adapter, self.observe_adapter]
         # Injectable for the same reason as the adapters above: tests must
         # never write into the developer's real recent-projects file
         # (projects.DEFAULT_RECENTS_PATH) just by exercising start_session.
@@ -1040,11 +1050,14 @@ class CompanionDaemon:
                 path=self.session_registry_path,
             )
 
-    def _adapter_for(self, session_id: str):
-        if session_id in self.sdk_adapter.discover_sessions():
-            return self.sdk_adapter
-        if session_id in self.observe_adapter.discover_sessions():
-            return self.observe_adapter
+    def _adapter_for(self, session_id: str) -> Optional[AdapterProtocol]:
+        # U2 (KTD2): iterates the registry rather than naming sdk_adapter/
+        # observe_adapter - preserves today's short-circuit order (SDK-owned
+        # sessions resolve before observed ones) since self.adapters is
+        # constructed in that same order in __init__.
+        for adapter in self.adapters:
+            if session_id in adapter.discover_sessions():
+                return adapter
         return None
 
     async def _try_resume_sdk_session(self, session_id: str) -> Optional[SDKAdapter]:
@@ -1143,7 +1156,7 @@ class CompanionDaemon:
             await self._sleep_or_stop(self.config.observe_scan_interval)
             if self._stop_event.is_set():
                 return
-            for adapter in (self.sdk_adapter, self.observe_adapter):
+            for adapter in self.adapters:
                 for session_id in adapter.discover_sessions():
                     self._spawn_forwarder(ws, adapter, session_id)
 

@@ -2627,3 +2627,35 @@ async def test_read_session_history_redacts_secrets_from_the_replayed_transcript
         assert replayed_text == "leaked token: [redacted]"
     finally:
         await phone.close()
+
+
+# --- Multi-Agent Adapter plan (009), U2: registry-based dispatch -------
+
+
+def test_adapters_registry_holds_both_named_adapters_in_the_original_order(tmp_path):
+    daemon = _bare_daemon(tmp_path)
+
+    assert daemon.adapters == [daemon.sdk_adapter, daemon.observe_adapter]
+
+
+@pytest.mark.asyncio
+async def test_adapter_for_resolves_an_sdk_owned_session_via_the_registry(tmp_path):
+    daemon = _bare_daemon(tmp_path)
+    await daemon.sdk_adapter.connect("sdk-session")
+
+    assert daemon._adapter_for("sdk-session") is daemon.sdk_adapter
+
+
+def test_adapter_for_resolves_an_observed_session_via_the_registry(tmp_path):
+    from companion.adapters.observe_adapter import _ObserveSession
+
+    daemon = _bare_daemon(tmp_path)
+    daemon.observe_adapter._sessions["observed-session"] = _ObserveSession("observed-session")
+
+    assert daemon._adapter_for("observed-session") is daemon.observe_adapter
+
+
+def test_adapter_for_returns_none_for_an_unknown_session_id(tmp_path):
+    daemon = _bare_daemon(tmp_path)
+
+    assert daemon._adapter_for("no-such-session") is None
