@@ -1534,8 +1534,15 @@ async def test_list_active_sessions_action_returns_a_snapshot_of_both_adapters(r
         assert by_id[sdk_session_id]["mode"] == "sdk_owned"
         assert by_id[sdk_session_id]["cwd"] == os.path.realpath("/tmp/some-repo")
         assert by_id[sdk_session_id]["active"] is True
+        # Cross-Session Digest plan (010): the one field that snapshot path
+        # was missing (unlike the live session_started event, which already
+        # carries it per Multi-Agent Adapter plan KTD4) - needed so the
+        # phone's own cross-session orchestration can label each collected
+        # session by agent, per R2.
+        assert by_id[sdk_session_id]["agent"] == "claude_code"
         assert by_id["observed-session-1"]["mode"] == "observe_only"
         assert by_id["observed-session-1"]["active"] is True
+        assert by_id["observed-session-1"]["agent"] == "claude_code"
     finally:
         await phone.close()
 

@@ -667,6 +667,12 @@ class CompanionDaemon:
                 "cwd": self.sdk_adapter.get_cwd(sid),
                 "mode": "sdk_owned",
                 "active": bool(self.sdk_adapter.is_active(sid)),
+                # Cross-Session Digest plan (010): mirrors KTD4's "claude_code"
+                # default (also session_started's own default, per Multi-Agent
+                # Adapter plan KTD4) - this snapshot path was the one gap that
+                # plan's own review flagged (correctness residual risk) as
+                # never carrying agent, unlike the live session_started event.
+                "agent": "claude_code",
             }
             for sid in live_sdk_session_ids
         ] + [
@@ -675,6 +681,7 @@ class CompanionDaemon:
                 "cwd": self.observe_adapter.get_cwd(sid),
                 "mode": "observe_only",
                 "active": bool(self.observe_adapter.is_active(sid)),
+                "agent": "claude_code",
             }
             for sid in self.observe_adapter.discover_sessions()
         ]
