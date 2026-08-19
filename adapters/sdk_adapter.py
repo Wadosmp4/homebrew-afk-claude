@@ -39,6 +39,16 @@ from .events import Event, EventSequencer, truncate_tool_result_content
 
 logger = logging.getLogger(__name__)
 
+# Risk Explanation plan (008), code-review fix (finding #2): explain_risk
+# fires unconditionally on every human-facing permission request, unlike
+# judge_is_safe which is both opt-in (llm_judge) and per-session cached -
+# a burst of pending tool approvals (Claude requesting several calls in
+# quick succession) would otherwise fan out into unbounded concurrent CLI-
+# subprocess spawns / API calls with no cap. This bounds concurrency per
+# session rather than dropping/deduping requests: every explanation still
+# eventually fires, just serialized past this limit.
+MAX_CONCURRENT_EXPLANATIONS = 3
+
 ClientFactory = Callable[[ClaudeAgentOptions], Any]
 
 
@@ -334,6 +344,9 @@ class _Session:
         # same pattern this codebase already uses for its other detached-
         # task bookkeeping.
         self.explanation_tasks: set[asyncio.Task] = set()
+        # Code-review fix (finding #2): caps concurrent explain_risk calls
+        # per session - see MAX_CONCURRENT_EXPLANATIONS' own comment.
+        self.explanation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXPLANATIONS)
 
     def emit(self, type_: str, **data: Any) -> Event:
         event = self.sequencer.emit(type_, **data)
@@ -489,7 +502,13 @@ class _Session:
         permission wait it runs alongside."""
         try:
             api_client = risk_judge.get_api_client() if self.risk_judge_use_api else None
-            explanation = await risk_judge.explain_risk(tool_name, tool_input, self.cwd, api_client=api_client)
+            # Code-review fix (finding #2): bounds concurrent explain_risk
+            # calls per session - see explanation_semaphore's own comment.
+            # A burst of pending permissions still gets every explanation
+            # eventually, just serialized past MAX_CONCURRENT_EXPLANATIONS
+            # rather than all spawning subprocesses/API calls at once.
+            async with self.explanation_semaphore:
+                explanation = await risk_judge.explain_risk(tool_name, tool_input, self.cwd, api_client=api_client)
             self.emit("permission_risk_explanation", request_id=request_id, explanation=explanation)
         except Exception:
             logger.exception("risk explanation task failed for request_id=%r", request_id)

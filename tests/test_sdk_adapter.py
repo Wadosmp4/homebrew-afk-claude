@@ -1083,6 +1083,56 @@ async def test_disconnect_cancels_an_in_flight_risk_explanation_task(adapter, mo
 
 
 @pytest.mark.asyncio
+async def test_concurrent_explanation_calls_are_capped_per_session(adapter, monkeypatch):
+    """Code-review fix (finding #2): a burst of pending permission requests
+    (Claude requesting several tool calls in quick succession) must not
+    spawn unbounded concurrent explain_risk calls - at most
+    MAX_CONCURRENT_EXPLANATIONS run at once; the rest queue behind the
+    semaphore and still eventually run."""
+    from claude_agent_sdk import ToolPermissionContext
+
+    from companion.adapters.sdk_adapter import MAX_CONCURRENT_EXPLANATIONS
+
+    from companion import risk_judge
+
+    in_flight = 0
+    max_seen = 0
+    release_gate = asyncio.Event()
+
+    async def tracking_explain_risk(*args, **kwargs):
+        nonlocal in_flight, max_seen
+        in_flight += 1
+        max_seen = max(max_seen, in_flight)
+        await release_gate.wait()
+        in_flight -= 1
+        return "explanation"
+
+    monkeypatch.setattr(risk_judge, "explain_risk", tracking_explain_risk)
+
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    total_requests = MAX_CONCURRENT_EXPLANATIONS + 2
+    for i in range(total_requests):
+        asyncio.create_task(
+            client.options.can_use_tool("Bash", {"command": f"cmd-{i}"}, ToolPermissionContext(tool_use_id=f"tool-{i}"))
+        )
+        await asyncio.wait_for(events.__anext__(), timeout=1)  # permission_request
+
+    # Give every dispatched explanation task a chance to start (or block on
+    # the semaphore) before asserting the high-water mark.
+    await asyncio.sleep(0.05)
+
+    assert max_seen == MAX_CONCURRENT_EXPLANATIONS
+
+    release_gate.set()
+    for _ in range(total_requests):
+        await asyncio.wait_for(events.__anext__(), timeout=1)  # permission_risk_explanation
+
+
+@pytest.mark.asyncio
 async def test_permission_risk_explanation_carries_none_with_no_api_key_and_failed_cli(adapter, monkeypatch):
     """Covers AE3: no ANTHROPIC_API_KEY configured (so get_api_client()
     returns None) and a CLI path that also fails - the emitted event
