@@ -7,11 +7,17 @@ later units.
 
 ## Setup
 
-### Via Homebrew (recommended for a fresh Mac)
+### Via Homebrew (recommended for a fresh Mac or Linux machine)
 
 ```bash
-brew install <tap>/afk-claude-companion
+brew tap Wadosmp4/afk-claude
+brew install afk-claude-companion
 ```
+
+Works the same way on mainstream glibc-based Linux distributions (Ubuntu,
+Debian, Fedora, and similar) as on Mac - Homebrew resolves the platform
+differences itself. `brew services start afk-claude-companion` leaves it
+running in the background and auto-starting on login/reboot on both.
 
 ### From a checkout
 

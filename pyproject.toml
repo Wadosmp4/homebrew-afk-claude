@@ -1,15 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "remote-claude-companion"
 version = "0.2.0"
 description = "Mac companion daemon: connects to the relay and drives/observes Claude Code sessions."
 requires-python = ">=3.10"
+dependencies = [
+    "websockets>=12.0,<13.0",
+    "claude-agent-sdk>=0.2.0,<0.3.0",
+]
 
-# Packaging metadata (dependencies, [project.scripts], [build-system]) lives
-# in the repo-root pyproject.toml, not here - `companion`'s import root is
-# the repo root (relative imports like `from .. import auto_approve` assume
-# it), so setuptools needs to build from there too, not from inside this
-# directory. This file exists purely for pytest's local `[tool.pytest.ini_options]`
-# when running `pytest` from within companion/ during dev.
+[project.scripts]
+afk-claude-companion = "companion.cli:main"
+
+# fix(review): this file's own directory - `companion/` in the monorepo,
+# or the exported public repo's own root once `git subtree split
+# --prefix=companion` promotes this directory's contents to a repo root -
+# is what setuptools should treat as the `companion` package
+# (`package-dir` maps "the current directory" to that name), so
+# `companion.cli:main` above resolves the same way whether this file is
+# read from inside the monorepo or from the standalone exported repo. The
+# repo-root pyproject.toml still carries its own separate copy of this
+# same metadata for the monorepo's own `pip install .` (run from the
+# monorepo root, where `companion/` is a real subdirectory, not this
+# file's own directory) - the two are deliberately parallel, not one
+# reading the other, since `pip install` never recurses into a
+# subdirectory's pyproject.toml.
+[tool.setuptools]
+package-dir = { "companion" = "." }
+packages = ["companion", "companion.adapters"]
+
+# This file exists both for pytest's local config when running `pytest`
+# from within companion/ during dev, and (via the packaging metadata
+# above) as the sole pyproject.toml for the exported standalone repo -
+# see docs/notes/2026-08-19-homebrew-companion-release.md for why this
+# and companion/README.md are the two files a subtree-export sync needs
+# to already be correct, since nothing patches them post-export.
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
