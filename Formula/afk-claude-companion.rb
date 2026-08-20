@@ -1,9 +1,9 @@
-# Homebrew tap Formula for afk-claude-companion. This repo also serves as
-# the release source (companion/'s code, exported from the private
-# monorepo via `git subtree split --prefix=companion`) - see
-# https://github.com/Wadosmp4/afk-claude-app's
+# Canonical draft this repo's Formula copies from - the tap repo
+# (Wadosmp4/homebrew-afk-claude, which also serves as the release source
+# via git subtree split --prefix=companion) carries the real installable
+# copy at its own Formula/afk-claude-companion.rb. See
 # docs/notes/2026-08-19-homebrew-companion-release.md for the publish
-# runbook and repeatable-update flow.
+# runbook and companion/README.md for the resulting install command.
 class AfkClaudeCompanion < Formula
   include Language::Python::Virtualenv
 
@@ -14,6 +14,19 @@ class AfkClaudeCompanion < Formula
   license "MIT"
 
   depends_on "python@3.12"
+  # fix(review): the pinned `cryptography` resource below (a transitive
+  # dependency, pulled in via mcp/httpx's TLS stack) builds its Rust
+  # extension (cryptography-rust) from source under Homebrew's
+  # `virtualenv_install_with_resources` (which always builds every
+  # resource from source, never from a prebuilt wheel) - without a Rust
+  # compiler declared as a build dependency, that build fails with
+  # "Failed to build installable wheels for some pyproject.toml based
+  # projects ... maturin". Verified end-to-end: install failed identically
+  # even with `rust` already present globally via a separate `brew install
+  # rust`, since Homebrew's build sandbox for one formula only exposes
+  # PATH entries from that formula's own declared dependencies, not
+  # whatever else happens to be installed on the host.
+  depends_on "rust" => :build
 
   # Generated via `poet -r websockets --also claude-agent-sdk` (homebrew-pypi-poet)
   # against the exact versions pinned in companion/pyproject.toml's
