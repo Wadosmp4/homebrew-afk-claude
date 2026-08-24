@@ -99,12 +99,20 @@ async def generate_digest(
         # evidence there's nothing to summarize.
 
     query_fn = query_fn or query
+    # fix(review): discovered via real-device testing - a query that
+    # completes normally but never yields an AssistantMessage/TextBlock
+    # (as opposed to timing out or raising) fell through to `return None`
+    # completely silently, indistinguishable from every other
+    # fail-closed reason. Tracking what actually came back makes that
+    # case diagnosable without reverting to throwaway debug prints.
+    message_types_seen: list[str] = []
     try:
         async with asyncio.timeout(timeout_seconds):
             async for message in query_fn(
                 prompt=prompt,
                 options=ClaudeAgentOptions(system_prompt=_SYSTEM_PROMPT, tools=[]),
             ):
+                message_types_seen.append(type(message).__name__)
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
                         if isinstance(block, TextBlock):
@@ -112,4 +120,8 @@ async def generate_digest(
                             return text or None
     except Exception:
         logger.exception("digest generation failed")
+        return None
+    logger.warning(
+        "digest generation produced no usable text block - message types seen: %r", message_types_seen
+    )
     return None
