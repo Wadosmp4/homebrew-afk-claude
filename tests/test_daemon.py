@@ -1144,6 +1144,79 @@ async def test_list_active_sessions_action_returns_a_snapshot_of_both_adapters(r
 
 
 @pytest.mark.asyncio
+async def test_list_active_sessions_includes_a_registry_known_session_not_yet_reconnected(
+    running_daemon, phone_token
+):
+    """R4/KTD3: a session known from before a restart must still show up
+    in the list (visible), even though "stay lazy" means it hasn't been
+    reconnected to a live CLI process yet (not active) - proactive
+    visibility without proactive reconnection."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        # Simulate a restart: in-memory state gone, registry row survives.
+        del daemon.sdk_adapter._sessions[session_id]
+        old_forwarder = daemon._forwarding.pop(session_id, None)
+        if old_forwarder is not None:
+            old_forwarder.cancel()
+
+        await phone.send_action({"kind": "list_active_sessions"})
+        event = await phone.next_event()
+
+        by_id = {s["session_id"]: s for s in event["data"]["sessions"]}
+        assert by_id[session_id]["mode"] == "sdk_owned"
+        assert by_id[session_id]["active"] is False
+        assert by_id[session_id]["cwd"] == os.path.realpath("/tmp/some-repo")
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_list_active_sessions_does_not_duplicate_a_session_already_reconnected(
+    running_daemon, phone_token
+):
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action({"kind": "list_active_sessions"})
+        event = await phone.next_event()
+
+        matches = [s for s in event["data"]["sessions"] if s["session_id"] == session_id]
+        assert len(matches) == 1
+        assert matches[0]["active"] is True
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_list_active_sessions_excludes_an_ended_registry_row(running_daemon, phone_token):
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action({"kind": "end_session", "session_id": session_id})
+        await phone.next_event()  # session_ended
+
+        await phone.send_action({"kind": "list_active_sessions"})
+        event = await phone.next_event()
+
+        assert session_id not in {s["session_id"] for s in event["data"]["sessions"]}
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
 async def test_list_active_sessions_omits_a_session_ended_via_end_session(
     running_daemon, phone_token
 ):

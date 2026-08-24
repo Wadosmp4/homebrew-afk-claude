@@ -600,6 +600,7 @@ class CompanionDaemon:
         actually navigated back past) never gets to see. This snapshot
         fills that gap on mount, the same way _handle_list_projects fills
         it for the project picker."""
+        live_sdk_session_ids = set(self.sdk_adapter.discover_sessions())
         sessions = [
             {
                 "session_id": sid,
@@ -607,7 +608,7 @@ class CompanionDaemon:
                 "mode": "sdk_owned",
                 "active": bool(self.sdk_adapter.is_active(sid)),
             }
-            for sid in self.sdk_adapter.discover_sessions()
+            for sid in live_sdk_session_ids
         ] + [
             {
                 "session_id": sid,
@@ -617,6 +618,20 @@ class CompanionDaemon:
             }
             for sid in self.observe_adapter.discover_sessions()
         ]
+        # R4/KTD3: a session known from before a restart isn't in
+        # sdk_adapter.discover_sessions() at all yet (that's purely
+        # in-memory, wiped by the restart) - list it anyway, unreconnected
+        # (active=False), so it's visible without "stay lazy" requiring it
+        # to be proactively reconnected to a live CLI process first.
+        async with self._session_registry_lock:
+            known = await asyncio.to_thread(
+                session_registry.list_known_sessions, status="active", path=self.session_registry_path
+            )
+        sessions.extend(
+            {"session_id": record.session_id, "cwd": record.cwd, "mode": "sdk_owned", "active": False}
+            for record in known
+            if record.session_id not in live_sdk_session_ids
+        )
         event = {
             "session_id": "_active_sessions",
             "event_id": 0,
