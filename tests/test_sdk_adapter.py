@@ -138,6 +138,37 @@ async def test_connect_with_no_resume_leaves_claude_agent_options_default(adapte
 
 
 @pytest.mark.asyncio
+async def test_connect_with_no_resume_forces_the_daemons_session_id_on_the_cli(adapter):
+    """Root-cause fix: without this, the CLI subprocess spawned for a fresh
+    session invents its own internal session id and writes its transcript
+    under that different id, so every transcript-based lookup keyed on the
+    daemon's own session_id (companion/history.py) silently finds nothing -
+    confirmed via real-device testing (a session tracked as one uuid had its
+    real transcript filed under a completely different one)."""
+    await adapter.connect("s1")
+
+    client = adapter._test_clients["latest"]
+    assert client.options.session_id == "s1"
+
+
+@pytest.mark.asyncio
+async def test_connect_with_resume_leaves_claude_agent_options_session_id_unset(adapter):
+    """claude_agent_sdk's own ClaudeAgentOptions.session_id docstring: this
+    field "Cannot be used with continue_conversation or resume unless
+    fork_session is also set" - and fork_session forks the resumed
+    conversation onto a *new* id, which is exactly wrong here (this
+    adapter's own bookkeeping keys on the caller-supplied session_id staying
+    the same across a resume). Combining the two would either be rejected
+    by the CLI or silently fork - so session_id must stay unset whenever
+    resume is set; `resume` alone already resolves to the correct
+    transcript once a fresh session's id lines up per the test above."""
+    await adapter.connect("s1", resume="s1")
+
+    client = adapter._test_clients["latest"]
+    assert client.options.session_id is None
+
+
+@pytest.mark.asyncio
 async def test_connect_passes_the_configured_cli_path_to_claude_agent_options(adapter):
     """U4/KTD5: a Mac-level CLI binary/profile setting, threaded straight
     into ClaudeAgentOptions.cli_path."""

@@ -127,6 +127,18 @@ class SDKAdapter:
             model=model,
             can_use_tool=session.can_use_tool,
             resume=resume,
+            # Forces the CLI subprocess to file its transcript under this
+            # exact session_id (see subprocess_cli.py's --session-id flag) -
+            # without this, a fresh session's transcript is written under an
+            # id the CLI invented itself, and every transcript lookup keyed
+            # on this session_id (history.py) silently finds nothing.
+            # NOT combined with resume: ClaudeAgentOptions.session_id's own
+            # docstring forbids that unless fork_session is also set, and
+            # fork_session forks onto a *new* id - the opposite of what a
+            # resume needs. resume=resume alone already resolves correctly
+            # once a fresh session's id lines up with its transcript per
+            # this same fix.
+            session_id=session_id if resume is None else None,
             cli_path=cli_path,
             env=cli_env,
         )
