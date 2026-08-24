@@ -38,7 +38,7 @@ DEFAULT_SESSION_REGISTRY_PATH = os.path.expanduser("~/.config/remote-claude-comp
 # code-review finding: shared across the INSERT and both SELECT statements
 # below so adding/renaming a column can't drift between them and
 # _row_to_record's positional unpacking.
-_COLUMNS = "session_id, cwd, model, auto_approve, llm_judge, status, created_at, updated_at"
+_COLUMNS = "session_id, cwd, model, permission_mode, status, created_at, updated_at"
 
 
 @dataclass
@@ -46,8 +46,7 @@ class SessionRecord:
     session_id: str
     cwd: str
     model: Optional[str]
-    auto_approve: bool
-    llm_judge: bool
+    permission_mode: Optional[str]
     status: str  # "active" | "ended"
     created_at: str
     updated_at: str
@@ -62,25 +61,40 @@ def _connect(path: str) -> sqlite3.Connection:
             session_id TEXT PRIMARY KEY,
             cwd TEXT NOT NULL,
             model TEXT,
-            auto_approve INTEGER NOT NULL,
-            llm_judge INTEGER NOT NULL,
+            permission_mode TEXT,
             status TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
         """
     )
+    # Permission-mode-picker plan (U2), KTD4: CREATE TABLE IF NOT EXISTS
+    # above is a no-op against a `sessions` table this companion already
+    # created on some earlier run - real installations have one on disk
+    # under the OLD schema (auto_approve/llm_judge INTEGER NOT NULL
+    # columns, no permission_mode column at all). This ALTER TABLE is the
+    # only piece of this migration that actually reaches such a file; the
+    # CREATE TABLE statement above only ever fires for a genuinely fresh
+    # install with no `sessions` table yet. auto_approve/llm_judge
+    # themselves are deliberately left in place on an upgraded table,
+    # simply unused from here on - SQLite's ALTER TABLE DROP COLUMN
+    # support is version-dependent/fragile, and R7 explicitly does not
+    # require translating an old row's auto_approve/llm_judge into an
+    # equivalent permission_mode: a session resuming under the old system
+    # just loses that setting.
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+    if "permission_mode" not in existing_columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN permission_mode TEXT")
     return conn
 
 
 def _row_to_record(row: tuple) -> SessionRecord:
-    session_id, cwd, model, auto_approve, llm_judge, status, created_at, updated_at = row
+    session_id, cwd, model, permission_mode, status, created_at, updated_at = row
     return SessionRecord(
         session_id=session_id,
         cwd=cwd,
         model=model,
-        auto_approve=bool(auto_approve),
-        llm_judge=bool(llm_judge),
+        permission_mode=permission_mode,
         status=status,
         created_at=created_at,
         updated_at=updated_at,
@@ -92,8 +106,7 @@ def upsert_session(
     *,
     cwd: str,
     model: Optional[str],
-    auto_approve: bool,
-    llm_judge: bool,
+    permission_mode: Optional[str],
     path: Optional[str] = None,
 ) -> None:
     """Insert or update this session's row, always setting status='active'
@@ -112,19 +125,37 @@ def upsert_session(
     with contextlib.closing(_connect(path)) as conn, conn:
         existing = conn.execute("SELECT created_at FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
         created_at = existing[0] if existing is not None else now
+        # A table migrated from the pre-permission_mode schema (KTD4, see
+        # _connect()) still has its old auto_approve/llm_judge columns -
+        # deliberately left in place, not dropped - but they're NOT NULL
+        # with no default, unlike a freshly-created table, which never has
+        # them at all. SQLite enforces NOT NULL while constructing the
+        # candidate row for INSERT ... ON CONFLICT regardless of whether
+        # the conflict resolution ends up redirecting into DO UPDATE - so
+        # omitting them here would fail *every* upsert against a migrated
+        # table, including one that's really just updating an existing
+        # row's permission_mode. A fresh table must NOT reference columns
+        # it was never given, or this would fail the other way around
+        # ("no such column"). Detected per call (not cached) since this is
+        # already a short-lived, per-call connection with no long-lived
+        # state to stash it in - matching this module's own low-frequency
+        # access pattern.
+        table_columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+        legacy_columns = [name for name in ("auto_approve", "llm_judge") if name in table_columns]
+        extra_columns = "".join(f", {name}" for name in legacy_columns)
+        extra_values = ", 0" * len(legacy_columns)  # dummy - never read back, see SessionRecord/_COLUMNS
         conn.execute(
             f"""
-            INSERT INTO sessions ({_COLUMNS})
-            VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+            INSERT INTO sessions ({_COLUMNS}{extra_columns})
+            VALUES (?, ?, ?, ?, 'active', ?, ?{extra_values})
             ON CONFLICT(session_id) DO UPDATE SET
                 cwd = excluded.cwd,
                 model = excluded.model,
-                auto_approve = excluded.auto_approve,
-                llm_judge = excluded.llm_judge,
+                permission_mode = excluded.permission_mode,
                 status = 'active',
                 updated_at = excluded.updated_at
             """,
-            (session_id, cwd, model, int(auto_approve), int(llm_judge), created_at, now),
+            (session_id, cwd, model, permission_mode, created_at, now),
         )
 
 

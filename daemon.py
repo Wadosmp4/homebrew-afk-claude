@@ -401,19 +401,16 @@ class CompanionDaemon:
                     session_id,
                     cwd=action.get("cwd"),
                     model=action.get("model"),
-                    auto_approve=bool(action.get("auto_approve", False)),
-                    llm_judge=bool(action.get("llm_judge", False)),
-                    # Unlike model/auto_approve/llm_judge above, cli_path/
-                    # cli_env (KTD5) and risk_judge_use_api are Mac-level
-                    # settings with no phone-side per-request equivalent -
-                    # always sourced from this companion's own config,
-                    # never the action payload. cli_env goes through
-                    # _effective_cli_env (R2/KTD1/KTD3), not the raw
-                    # config field, so a "personal"-identity spawn gets
-                    # CLAUDE_CODE_OAUTH_TOKEN merged in.
+                    permission_mode=action.get("permission_mode"),
+                    # Unlike model/permission_mode above, cli_path/cli_env
+                    # (KTD5) are Mac-level settings with no phone-side
+                    # per-request equivalent - always sourced from this
+                    # companion's own config, never the action payload.
+                    # cli_env goes through _effective_cli_env (R2/KTD1/
+                    # KTD3), not the raw config field, so a "personal"-
+                    # identity spawn gets CLAUDE_CODE_OAUTH_TOKEN merged in.
                     cli_path=self.config.cli_path,
                     cli_env=self._effective_cli_env(),
-                    risk_judge_use_api=self.config.risk_judge_use_api,
                 )
             except Exception:
                 logger.exception("start_session failed for action %r", action)
@@ -429,8 +426,7 @@ class CompanionDaemon:
                         session_id,
                         cwd=resolved_cwd,
                         model=action.get("model"),
-                        auto_approve=bool(action.get("auto_approve", False)),
-                        llm_judge=bool(action.get("llm_judge", False)),
+                        permission_mode=action.get("permission_mode"),
                         path=self.session_registry_path,
                     )
             return
@@ -576,20 +572,23 @@ class CompanionDaemon:
             elif kind == "get_session_digest":
                 await self._handle_session_digest(adapter, session_id)
             elif kind == "set_session_auto_approve":
+                # Permission-mode-picker plan (U2): this action's
+                # session_registry persistence side effect for an
+                # SDK-owned session is retired along with auto_approve/
+                # llm_judge as registry concepts (R7) - the action payload
+                # never carried a permission_mode to persist instead, and
+                # session.set_session_auto_approve's own effect on this
+                # session is already inert for tool-call behavior (U1).
+                # Still called for an observed session (untouched, R11) -
+                # ObserveAdapter's own, separate auto_approve/llm_judge
+                # mechanism has no session_registry equivalent at all, so
+                # dropping the persistence call here changes nothing for
+                # that path. This whole dispatch kind, and
+                # SDKAdapter.set_session_auto_approve, are replaced by
+                # set_session_permission_mode in a later unit.
                 adapter.set_session_auto_approve(
                     session_id, action.get("auto_approve"), action.get("llm_judge")
                 )
-                if adapter is self.sdk_adapter:
-                    # Keep the saved record in sync with this live override,
-                    # so a later restart-triggered resume
-                    # (_try_resume_sdk_session) picks it up instead of
-                    # whatever was saved at start_session time. Observed
-                    # sessions have no equivalent - they're never resumed
-                    # this way, since ObserveAdapter has no client to
-                    # reconnect.
-                    await self._persist_sdk_session_registry(
-                        session_id, action.get("auto_approve"), action.get("llm_judge")
-                    )
             else:
                 logger.warning("unknown action kind: %r", kind)
         except Exception:
@@ -961,20 +960,28 @@ class CompanionDaemon:
         text = await digest.generate_digest(events, api_client=api_client, env=self._effective_cli_env())
         adapter.emit_custom(session_id, "session_digest", available=text is not None, text=text)
 
-    async def _persist_sdk_session_registry(
-        self, session_id: str, auto_approve: Optional[bool], llm_judge: Optional[bool]
-    ) -> None:
-        """None for either argument leaves that field as it was already
-        saved, same convention as set_session_auto_approve itself."""
+    async def _persist_sdk_session_registry(self, session_id: str, permission_mode: Optional[str]) -> None:
+        """None leaves permission_mode as it was already saved, same
+        convention set_session_auto_approve's own auto_approve/llm_judge
+        args used to follow.
+
+        Permission-mode-picker plan (U2): currently has no caller -
+        set_session_auto_approve's own persistence hook into this method
+        was retired above (that action no longer has a meaningful
+        session_registry effect for an SDK-owned session, R7). Kept, with
+        its auto_approve/llm_judge fields swapped for permission_mode, for
+        a later unit's set_session_permission_mode/set_session_model to
+        call once a live mid-session change needs the same "durable for a
+        later restart resume, not what applies it live" persistence this
+        already provides for start_session/_try_resume_sdk_session."""
         cwd = self.sdk_adapter.get_cwd(session_id)
         if cwd is None:
             return  # shouldn't happen for a live SDK session, but never crash persistence over it
         # The load and save below must be one atomic read-modify-write, not
-        # just the save - two concurrently-dispatched toggles for this
-        # session (e.g. auto_approve then llm_judge tapped in quick
-        # succession) each read the pre-toggle file, so locking only the
-        # write would still let the second save silently overwrite the
-        # first toggle's change with stale data.
+        # just the save - two concurrently-dispatched live changes for this
+        # session each read the pre-change file, so locking only the write
+        # would still let the second save silently overwrite the first
+        # change's data with stale data.
         async with self._session_registry_lock:
             saved = await asyncio.to_thread(session_registry.get_session, session_id, self.session_registry_path)
             await asyncio.to_thread(
@@ -982,8 +989,9 @@ class CompanionDaemon:
                 session_id,
                 cwd=cwd,
                 model=saved.model if saved is not None else None,
-                auto_approve=auto_approve if auto_approve is not None else (saved.auto_approve if saved is not None else False),
-                llm_judge=llm_judge if llm_judge is not None else (saved.llm_judge if saved is not None else False),
+                permission_mode=(
+                    permission_mode if permission_mode is not None else (saved.permission_mode if saved is not None else None)
+                ),
                 path=self.session_registry_path,
             )
 
@@ -1004,11 +1012,14 @@ class CompanionDaemon:
         dropping whatever action prompted this, so a message sent right
         after a restart is delivered rather than vanishing.
 
-        model/auto_approve/llm_judge come from session_registry.py's saved
-        record when there is one (written by start_session and
-        set_session_auto_approve) - falling back to the transcript's own
-        cwd plus opt-in-off defaults only for a session that predates this
-        being tracked at all. Returns None (falls through to the normal
+        model/permission_mode come from session_registry.py's saved record
+        when there is one (written by start_session) - falling back to the
+        transcript's own cwd plus permission_mode=None (SDK default) only
+        for a session that predates this being tracked at all, or that
+        predates permission_mode existing as a concept (R7/AE3: no mode is
+        retroactively assigned just because an old row still has its
+        now-unused auto_approve/llm_judge columns set). Returns None (falls
+        through to the normal
         "unknown session_id" warning) if no matching transcript exists, the
         registry already marks this session 'ended' (R5 - an ended session
         must not be silently resurrected just because its transcript still
@@ -1043,17 +1054,15 @@ class CompanionDaemon:
                 cwd=cwd,
                 resume=session_id,
                 model=saved.model if saved is not None else None,
-                auto_approve=saved.auto_approve if saved is not None else False,
-                llm_judge=saved.llm_judge if saved is not None else False,
+                permission_mode=saved.permission_mode if saved is not None else None,
                 # Same as the start_session call site above: cli_path/
-                # cli_env/risk_judge_use_api are Mac-level settings, always
-                # read from self.config directly - there's no saved
-                # session_registry.py equivalent for any of them. cli_env
-                # goes through _effective_cli_env, same reasoning as
+                # cli_env are Mac-level settings, always read from
+                # self.config directly - there's no saved
+                # session_registry.py equivalent for either. cli_env goes
+                # through _effective_cli_env, same reasoning as
                 # start_session.
                 cli_path=self.config.cli_path,
                 cli_env=self._effective_cli_env(),
-                risk_judge_use_api=self.config.risk_judge_use_api,
             )
         except Exception:
             logger.exception("failed to resume SDK-owned session %r", session_id)
@@ -1065,8 +1074,7 @@ class CompanionDaemon:
                 session_id,
                 cwd=resolved_cwd,
                 model=saved.model if saved is not None else None,
-                auto_approve=saved.auto_approve if saved is not None else False,
-                llm_judge=saved.llm_judge if saved is not None else False,
+                permission_mode=saved.permission_mode if saved is not None else None,
                 path=self.session_registry_path,
             )
         return self.sdk_adapter

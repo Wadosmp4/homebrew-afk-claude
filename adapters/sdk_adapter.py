@@ -64,12 +64,10 @@ class SDKAdapter:
         *,
         cwd: Optional[str] = None,
         model: Optional[str] = None,
-        auto_approve: bool = False,
-        llm_judge: bool = False,
+        permission_mode: Optional[str] = None,
         resume: Optional[str] = None,
         cli_path: Optional[str] = None,
         cli_env: dict[str, str] = {},
-        risk_judge_use_api: bool = False,
     ) -> None:
         if session_id in self._sessions:
             raise ValueError(f"session already connected: {session_id}")
@@ -86,23 +84,18 @@ class SDKAdapter:
         # mismatch, not any real absence of history.
         resolved_cwd = os.path.realpath(cwd) if cwd else self._default_cwd
         session.cwd = resolved_cwd  # U10 (R16): the git-status scope
-        # Opt-in per session (defaults off) - see companion/auto_approve.py
-        # for the policy this gates and why it's rule-based, not LLM-judged.
-        # `llm_judge` is a separate, also-opt-in-defaults-off layer on top
-        # (companion/risk_judge.py) - it costs real latency and API/
-        # subscription usage per undecided call, unlike the free, instant
-        # rule-based policy, so it's never bundled into the base toggle.
-        session.auto_approve = auto_approve
-        session.llm_judge = llm_judge
-        # Mac-level opt-in (CompanionConfig.risk_judge_use_api), not a
-        # per-session/phone-side field - same "always sourced from this
-        # companion's own config, never the action payload" treatment as
-        # cli_path/cli_env above.
-        session.risk_judge_use_api = risk_judge_use_api
         self._sessions[session_id] = session
-        # `model=None` leaves ClaudeAgentOptions' own default (whatever the
-        # bundled CLI resolves on its own) untouched - the phone's model
-        # picker only overrides it when the user actually picked one.
+        # `model=None`/`permission_mode=None` both leave ClaudeAgentOptions'
+        # own default (whatever the bundled CLI resolves on its own)
+        # untouched - the phone's model/permission-mode pickers only
+        # override either when the user actually picked one. Permission-
+        # mode-picker plan (R2/R3): this used to also be where
+        # auto_approve/llm_judge/risk_judge_use_api were snapshotted onto
+        # the session (a rule-based denylist plus an opt-in LLM judge,
+        # both consulted from can_use_tool) - can_use_tool no longer
+        # checks any app-side policy at all (U1), so a session's chosen
+        # native permission_mode is the sole governor of tool-call
+        # approval now, with nothing left here to snapshot.
         # `resume` (a session_id, not a bool) reconnects to that session's
         # own existing transcript instead of starting a fresh one - used by
         # daemon.py's _try_resume_sdk_session after a companion restart
@@ -121,6 +114,7 @@ class SDKAdapter:
         options = ClaudeAgentOptions(
             cwd=session.cwd,
             model=model,
+            permission_mode=permission_mode,
             can_use_tool=session.can_use_tool,
             resume=resume,
             # Forces the CLI subprocess to file its transcript under this
@@ -150,8 +144,7 @@ class SDKAdapter:
             mode="sdk_owned",
             cwd=session.cwd,
             model=model,
-            auto_approve=session.auto_approve,
-            llm_judge=session.llm_judge,
+            permission_mode=permission_mode,
         )
         session.reader_task = asyncio.create_task(session.read_loop())
 
@@ -211,7 +204,15 @@ class SDKAdapter:
         already in progress, independent of whatever it was started with.
         `None` for either argument leaves that one field untouched, same
         convention as daemon.py's set_auto_approve_settings. Returns False
-        (no-op) for an unknown session_id."""
+        (no-op) for an unknown session_id.
+
+        Permission-mode-picker plan (U2): can_use_tool no longer reads
+        auto_approve/llm_judge at all (U1), and connect() no longer
+        snapshots either onto the session (replaced by permission_mode) -
+        this override is inert for tool-call behavior now, kept only so a
+        still-current phone build's existing overflow-menu toggle gets a
+        confirmation event back instead of a dropped action. Slated for
+        replacement by set_session_permission_mode in a later unit."""
         session = self._sessions.get(session_id)
         if session is None:
             return False
@@ -219,7 +220,17 @@ class SDKAdapter:
             session.auto_approve = auto_approve
         if llm_judge is not None:
             session.llm_judge = llm_judge
-        session.emit("session_auto_approve", auto_approve=session.auto_approve, llm_judge=session.llm_judge)
+        # getattr, not session.auto_approve/session.llm_judge directly:
+        # connect() no longer initializes either field (see above), so a
+        # session where only one of the two has ever been set here (the
+        # other still None, "leave untouched") would otherwise have no
+        # attribute at all to read - this must not raise AttributeError
+        # just because a real phone toggled only one of its two switches.
+        session.emit(
+            "session_auto_approve",
+            auto_approve=getattr(session, "auto_approve", False),
+            llm_judge=getattr(session, "llm_judge", False),
+        )
         return True
 
     async def respond_to_permission(

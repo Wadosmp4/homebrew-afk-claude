@@ -231,21 +231,43 @@ async def test_connect_resolves_a_symlinked_cwd(adapter, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_connect_snapshots_auto_approve_and_llm_judge_into_session_started(adapter):
-    """A phone-started session's auto_approve/llm_judge are fixed at
-    connect() time (opt-in kwargs, defaults off) and echoed back in
-    session_started so the phone knows the state without a round-trip -
-    see set_session_auto_approve for how it can change later."""
-    await adapter.connect("s1", auto_approve=True, llm_judge=True)
+async def test_connect_passes_the_requested_permission_mode_to_claude_agent_options(adapter):
+    """R2/R3: the phone's chosen permission mode reaches ClaudeAgentOptions
+    directly (and is echoed back in session_started so the phone knows the
+    state without a round-trip) - native SDK behavior alone now governs
+    tool-call approval, mirroring how `model` already threads through."""
+    await adapter.connect("s1", permission_mode="bypassPermissions")
+
+    client = adapter._test_clients["latest"]
+    assert client.options.permission_mode == "bypassPermissions"
 
     event, _gen = await _next_event(adapter, "s1")
-    assert event.data["auto_approve"] is True
-    assert event.data["llm_judge"] is True
+    assert event.data["permission_mode"] == "bypassPermissions"
+
+
+@pytest.mark.asyncio
+async def test_connect_with_no_permission_mode_leaves_claude_agent_options_default(adapter):
+    """R7: a session that never chose a mode (every session before this
+    feature existed, or simply omitting the picker) leaves
+    ClaudeAgentOptions.permission_mode as None - the SDK's own default
+    governs, not a residual app-side policy underneath it."""
+    await adapter.connect("s1")
+
+    client = adapter._test_clients["latest"]
+    assert client.options.permission_mode is None
+
+    event, _gen = await _next_event(adapter, "s1")
+    assert event.data["permission_mode"] is None
 
 
 @pytest.mark.asyncio
 async def test_set_session_auto_approve_overrides_a_connected_sessions_state(adapter):
-    await adapter.connect("s1", auto_approve=False, llm_judge=False)
+    """set_session_auto_approve itself is untouched by U2 (slated for
+    replacement by set_session_permission_mode in a later unit) - connect()
+    no longer accepts auto_approve/llm_judge at all (replaced by
+    permission_mode), so this now establishes state via the override
+    method itself rather than seeding it at connect() time."""
+    await adapter.connect("s1")
     event, gen = await _next_event(adapter, "s1")
     assert event.type == "session_started"
 
@@ -254,14 +276,17 @@ async def test_set_session_auto_approve_overrides_a_connected_sessions_state(ada
     confirm = await gen.__anext__()
     assert confirm.type == "session_auto_approve"
     assert confirm.data["auto_approve"] is True
-    assert confirm.data["llm_judge"] is False  # untouched - only auto_approve was passed
+    assert confirm.data["llm_judge"] is False  # never set - defaults False, not an AttributeError
 
 
 @pytest.mark.asyncio
 async def test_set_session_auto_approve_none_leaves_that_field_untouched(adapter):
-    await adapter.connect("s1", auto_approve=True, llm_judge=True)
+    await adapter.connect("s1")
     event, gen = await _next_event(adapter, "s1")
     assert event.type == "session_started"
+
+    adapter.set_session_auto_approve("s1", auto_approve=True, llm_judge=True)
+    await gen.__anext__()  # first session_auto_approve confirmation, establishing state
 
     adapter.set_session_auto_approve("s1", auto_approve=None, llm_judge=False)
 
@@ -642,9 +667,12 @@ def test_sdk_adapter_no_longer_uses_the_removed_approval_stack():
     direct, still-needed `is_structured_question` import survives, for the
     untouched structured-question handling below in can_use_tool).
     `auto_approve` as a bare word still appears elsewhere in this module
-    (connect()'s own opt-in kwarg, session_started's echo of it,
-    set_session_auto_approve) - none of that is in this unit's scope; only
-    the approval-stack calls actually reachable from can_use_tool are gone.
+    (set_session_auto_approve, unused for tool-call behavior since this
+    unit and slated for replacement by set_session_permission_mode in a
+    later one - connect()'s own former auto_approve/llm_judge kwargs and
+    session_started's echo of them are gone as of the permission-mode-
+    picker plan's U2) - none of that is in this unit's scope; only the
+    approval-stack calls actually reachable from can_use_tool are gone.
     observe_adapter.py's own, separate use of auto_approve.py/judge_is_safe
     (R11) is untouched - see test_observe_adapter.py's own unmodified suite
     for that coverage."""

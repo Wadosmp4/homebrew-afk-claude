@@ -384,105 +384,42 @@ async def test_start_session_action_passes_the_requested_model_through(running_d
 
 
 @pytest.mark.asyncio
-async def test_start_session_action_with_auto_approve_skips_the_prompt_for_a_read(
-    running_daemon, phone_token
-):
-    """End-to-end: the phone's start_session action turns on policy
-    auto-approval for the session, and a Read call resolves without the
-    phone ever having to send respond_to_permission."""
-    from claude_agent_sdk import ToolPermissionContext
-
+async def test_start_session_action_passes_the_requested_permission_mode_through(running_daemon, phone_token):
+    """R2/R3: the phone's chosen permission mode reaches
+    ClaudeAgentOptions directly, mirroring how `model` already threads
+    through - native SDK behavior alone now governs tool-call approval,
+    replacing the removed auto_approve/llm_judge start_session fields."""
     daemon, port, fake_clients = running_daemon
     phone = await _FakePhone.connect(port, phone_token)
     try:
-        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo", "auto_approve": True})
-        await phone.next_event()  # session_started
-        client = fake_clients[0]
-
-        result = await asyncio.wait_for(
-            client.options.can_use_tool("Read", {"file_path": "a.py"}, ToolPermissionContext(tool_use_id="tool-1")),
-            timeout=1,
+        await phone.send_action(
+            {"kind": "start_session", "cwd": "/tmp/some-repo", "permission_mode": "bypassPermissions"}
         )
-        assert result.behavior == "allow"
 
         event = await phone.next_event()
-        assert event["type"] == "permission_request"
-        assert event["data"]["auto_approved"] is True
+        assert event["type"] == "session_started"
+        assert event["data"]["permission_mode"] == "bypassPermissions"
+        assert fake_clients[0].options.permission_mode == "bypassPermissions"
     finally:
         await phone.close()
 
 
 @pytest.mark.asyncio
-async def test_start_session_action_with_llm_judge_skips_the_prompt_on_a_safe_verdict(
-    running_daemon, phone_token, monkeypatch
-):
-    """End-to-end: the phone's start_session action turns on both
-    auto_approve and llm_judge for the session, and a Bash command the
-    rule-based policy doesn't cover on its own resolves without the phone
-    ever having to send respond_to_permission, once the (faked) LLM judge
-    answers SAFE."""
-    from claude_agent_sdk import AssistantMessage, TextBlock, ToolPermissionContext
-
-    from companion import risk_judge
-
-    async def fake_query(*, prompt, options):
-        yield AssistantMessage(content=[TextBlock(text="SAFE: ordinary command")], model="claude")
-
-    monkeypatch.setattr(risk_judge, "query", fake_query)
-
+async def test_start_session_action_with_no_permission_mode_leaves_it_unset(running_daemon, phone_token):
+    """R7: a start_session action that doesn't choose a mode (every
+    session before this feature existed, or any client that hasn't
+    adopted the picker) leaves ClaudeAgentOptions.permission_mode as None
+    - the SDK's own default governs, not a residual app-side policy
+    underneath it."""
     daemon, port, fake_clients = running_daemon
     phone = await _FakePhone.connect(port, phone_token)
     try:
-        await phone.send_action(
-            {"kind": "start_session", "cwd": "/tmp/some-repo", "auto_approve": True, "llm_judge": True}
-        )
-        await phone.next_event()  # session_started
-        client = fake_clients[0]
-
-        result = await asyncio.wait_for(
-            client.options.can_use_tool(
-                "Bash", {"command": "some-custom-script.sh"}, ToolPermissionContext(tool_use_id="tool-1")
-            ),
-            timeout=1,
-        )
-        assert result.behavior == "allow"
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
 
         event = await phone.next_event()
-        assert event["type"] == "permission_request"
-        assert event["data"]["auto_approved"] is True
-        assert event["data"]["judged_by"] == "llm"
-    finally:
-        await phone.close()
-
-
-@pytest.mark.asyncio
-async def test_start_session_action_with_llm_judge_off_by_default_still_prompts(running_daemon, phone_token):
-    """llm_judge is opt-in, separate from auto_approve - omitting it from
-    the start_session action must not consult the judge, same as before
-    this feature existed."""
-    from claude_agent_sdk import ToolPermissionContext
-
-    daemon, port, fake_clients = running_daemon
-    phone = await _FakePhone.connect(port, phone_token)
-    try:
-        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo", "auto_approve": True})
-        await phone.next_event()  # session_started
-        client = fake_clients[0]
-
-        call_task = asyncio.create_task(
-            client.options.can_use_tool(
-                "Bash", {"command": "some-custom-script.sh"}, ToolPermissionContext(tool_use_id="tool-1")
-            )
-        )
-        event = await phone.next_event()
-        assert event["type"] == "permission_request"
-        assert "auto_approved" not in event["data"]
-
-        await phone.send_action(
-            {"kind": "respond_to_permission", "session_id": event["session_id"], "request_id": "tool-1", "decision": "allow"}
-        )
-        result = await asyncio.wait_for(call_task, timeout=1)
-        assert result.behavior == "allow"
+        assert event["type"] == "session_started"
+        assert event["data"]["permission_mode"] is None
+        assert fake_clients[0].options.permission_mode is None
     finally:
         await phone.close()
 
@@ -547,8 +484,7 @@ async def test_start_session_persists_its_settings_for_a_later_resume(running_da
                 "kind": "start_session",
                 "cwd": "/tmp/some-repo",
                 "model": "claude-opus-5",
-                "auto_approve": True,
-                "llm_judge": True,
+                "permission_mode": "bypassPermissions",
             }
         )
         started = await phone.next_event()
@@ -558,30 +494,7 @@ async def test_start_session_persists_its_settings_for_a_later_resume(running_da
         assert saved is not None
         assert saved.cwd == os.path.realpath("/tmp/some-repo")
         assert saved.model == "claude-opus-5"
-        assert saved.auto_approve is True
-        assert saved.llm_judge is True
-    finally:
-        await phone.close()
-
-
-@pytest.mark.asyncio
-async def test_set_session_auto_approve_updates_the_persisted_record(running_daemon, phone_token):
-    daemon, port, _fake_clients = running_daemon
-    phone = await _FakePhone.connect(port, phone_token)
-    try:
-        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
-        started = await phone.next_event()
-        session_id = started["session_id"]
-        assert session_registry.get_session(session_id, daemon.session_registry_path).auto_approve is False
-
-        await phone.send_action(
-            {"kind": "set_session_auto_approve", "session_id": session_id, "auto_approve": True}
-        )
-        await phone.next_event()  # session_auto_approve confirmation
-
-        saved = session_registry.get_session(session_id, daemon.session_registry_path)
-        assert saved.auto_approve is True
-        assert saved.llm_judge is False  # untouched - only auto_approve was passed
+        assert saved.permission_mode == "bypassPermissions"
     finally:
         await phone.close()
 
@@ -657,11 +570,10 @@ async def test_a_crashed_session_leaves_the_registry_row_active(running_daemon, 
 async def test_resuming_a_stale_session_restores_its_previously_saved_settings(
     running_daemon, phone_token
 ):
-    """session_registry.py's saved record (written by start_session and
-    kept in sync by set_session_auto_approve) is what lets a restart-
-    triggered resume come back with the same auto_approve/llm_judge/model
-    the phone had actually chosen, instead of always falling back to
-    opt-in-off defaults."""
+    """session_registry.py's saved record (written by start_session) is
+    what lets a restart-triggered resume come back with the same
+    permission_mode/model the phone had actually chosen, instead of
+    always falling back to the SDK's own default."""
     daemon, port, _fake_clients = running_daemon
     phone = await _FakePhone.connect(port, phone_token)
     try:
@@ -670,8 +582,7 @@ async def test_resuming_a_stale_session_restores_its_previously_saved_settings(
                 "kind": "start_session",
                 "cwd": "/tmp/some-repo",
                 "model": "claude-opus-5",
-                "auto_approve": True,
-                "llm_judge": True,
+                "permission_mode": "acceptEdits",
             }
         )
         started = await phone.next_event()
@@ -700,13 +611,47 @@ async def test_resuming_a_stale_session_restores_its_previously_saved_settings(
 
         resumed_started = await phone.next_event()
         assert resumed_started["type"] == "session_started"
-        assert resumed_started["data"]["auto_approve"] is True
-        assert resumed_started["data"]["llm_judge"] is True
+        assert resumed_started["data"]["permission_mode"] == "acceptEdits"
         assert resumed_started["data"]["model"] == "claude-opus-5"
 
         message_event = await phone.next_event()
         assert message_event["type"] == "user_message"
         assert message_event["data"]["text"] == "still there?"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_resuming_a_session_with_no_saved_permission_mode_reconnects_with_the_sdk_default(
+    running_daemon, phone_token
+):
+    """R7/AE3: a session started before this feature shipped (or simply
+    started with no mode chosen) has no permission_mode saved at all -
+    resuming it must not error, and must not retroactively assign it a
+    mode; it reconnects exactly like any other None (SDK default)."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+        real_cwd = daemon.sdk_adapter.get_cwd(session_id)
+
+        project_dir = daemon.observe_adapter.projects_dir / "my-repo"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / f"{session_id}.jsonl").write_text(
+            json.dumps({"type": "user", "cwd": real_cwd, "message": {"role": "user", "content": "hi"}}) + "\n"
+        )
+        del daemon.sdk_adapter._sessions[session_id]
+        old_forwarder = daemon._forwarding.pop(session_id, None)
+        if old_forwarder is not None:
+            old_forwarder.cancel()
+
+        await phone.send_action({"kind": "send_message", "session_id": session_id, "text": "still there?"})
+
+        resumed_started = await phone.next_event()
+        assert resumed_started["type"] == "session_started"
+        assert resumed_started["data"]["permission_mode"] is None
     finally:
         await phone.close()
 
@@ -1999,9 +1944,9 @@ async def test_switching_active_account_does_not_retroactively_affect_an_already
 async def test_start_session_action_threads_the_configured_cli_settings_into_the_sdk_adapter(
     running_daemon, phone_token
 ):
-    """Unlike model/auto_approve/llm_judge, cli_path/cli_env have no
-    phone-side per-request equivalent (KTD5) - start_session must read
-    them straight from self.config, not from the action payload."""
+    """Unlike model/permission_mode, cli_path/cli_env have no phone-side
+    per-request equivalent (KTD5) - start_session must read them straight
+    from self.config, not from the action payload."""
     daemon, port, fake_clients = running_daemon
     daemon.config.cli_path = "/usr/local/bin/claude-custom"
     daemon.config.cli_env = {"ANTHROPIC_API_KEY": "sk-test"}
