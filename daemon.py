@@ -515,6 +515,23 @@ class CompanionDaemon:
             adapter = await self._try_resume_sdk_session(session_id)
         if adapter is None:
             logger.warning("action for unknown session_id=%r: %r", session_id, action)
+            # fix(review): discovered via real-device testing - previously
+            # this just logged and dropped the action, leaving the phone
+            # with zero signal (a real user hitting this after e.g. a Mac
+            # reboot mid-session would see "End Session"/"Catch me up" just
+            # silently do nothing forever, with no way to tell what
+            # happened). No adapter exists for this session_id (that's the
+            # whole reason we're here), so this can't go through
+            # adapter.emit_custom - sent directly on ws, same shape every
+            # other one-off/sentinel event in this file already uses.
+            event = {
+                "session_id": session_id,
+                "event_id": 0,
+                "type": "session_unavailable",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "data": {},
+            }
+            await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
             return
 
         try:

@@ -693,16 +693,20 @@ async def test_send_message_for_a_session_id_with_no_matching_transcript_still_w
     running_daemon, phone_token
 ):
     """No transcript anywhere means this was never a real session on this
-    machine - resume must not be attempted, and the action is dropped the
-    same way it always was (logged, no crash, no event to the phone)."""
+    machine - resume must not be attempted, and the underlying action
+    (send_message here) is dropped the same way it always was (logged, no
+    crash). fix(review): the phone now gets an explicit session_unavailable
+    event instead of pure silence - discovered via real-device testing
+    that silence left a real user stuck with no signal at all."""
     daemon, port, _fake_clients = running_daemon
     phone = await _FakePhone.connect(port, phone_token)
     try:
         await phone.send_action(
             {"kind": "send_message", "session_id": "never-existed", "text": "hello?"}
         )
-        with pytest.raises(asyncio.TimeoutError):
-            await phone.next_event(timeout=0.5)
+        event = await phone.next_event()
+        assert event["type"] == "session_unavailable"
+        assert event["session_id"] == "never-existed"
     finally:
         await phone.close()
 
@@ -1749,11 +1753,33 @@ async def test_action_for_unknown_session_is_ignored_without_crashing(running_da
     phone = await _FakePhone.connect(port, phone_token)
     try:
         await phone.send_action({"kind": "send_message", "session_id": "no-such-session", "text": "hi"})
-        # No crash, no event - just confirm the daemon connection survives
-        # (still answers a subsequent heartbeat-triggered ack cycle) rather
-        # than asserting a negative on timing.
+        # No crash - just confirm the daemon connection survives (still
+        # answers a subsequent heartbeat-triggered ack cycle) rather than
+        # asserting a negative on timing.
         await asyncio.sleep(0.1)
         assert daemon.state == "connected"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_action_for_unresumable_session_emits_session_unavailable(running_daemon, phone_token):
+    """fix(review): discovered via real-device testing - a session_id the
+    phone still references that neither adapter knows about AND
+    _try_resume_sdk_session can't resume (no matching on-disk transcript,
+    e.g. the companion restarted before the session ever wrote one)
+    previously left the phone with zero signal - "End Session"/"Catch me
+    up" both just silently did nothing forever. The daemon must now emit
+    an explicit session_unavailable event on this session's own stream so
+    the phone can tell the user plainly rather than leave them stuck."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "end_session", "session_id": "orphaned-session"})
+
+        event = await phone.next_event()
+        assert event["type"] == "session_unavailable"
+        assert event["session_id"] == "orphaned-session"
     finally:
         await phone.close()
 
