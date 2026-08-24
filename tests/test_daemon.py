@@ -631,6 +631,29 @@ async def test_a_session_that_completes_naturally_also_marks_the_registry_row_en
 
 
 @pytest.mark.asyncio
+async def test_a_crashed_session_leaves_the_registry_row_active(running_daemon, phone_token):
+    """A crash (read_loop's own except-branch) never calls SDKAdapter.end()
+    and so never emits session_ended - deliberately left 'active' in the
+    registry, since the session genuinely still exists, just wasn't cleanly
+    closed (R4's job is keeping that visible, not R5's ended-durability
+    guarantee)."""
+    daemon, port, fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        fake_clients[0].push(RuntimeError("subprocess died"))
+        error_event = await phone.next_event()
+        assert error_event["type"] == "error"
+
+        assert session_registry.get_session(session_id, daemon.session_registry_path).status == "active"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
 async def test_resuming_a_stale_session_restores_its_previously_saved_settings(
     running_daemon, phone_token
 ):
@@ -722,6 +745,68 @@ async def test_an_ended_session_is_not_resurrected_by_a_later_resume_attempt(
 
         event = await phone.next_event()
         assert event["type"] == "session_unavailable"
+        assert session_registry.get_session(session_id, daemon.session_registry_path).status == "ended"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_a_second_action_dispatched_right_after_end_session_cannot_resurrect_it(
+    running_daemon, phone_token
+):
+    """code-review finding (adversarial, P0): _receive_loop dispatches every
+    inbound action as its own unordered asyncio.create_task, so a second
+    action for the same session_id sent immediately after end_session -
+    without waiting for the resulting session_ended event - used to be able
+    to race SDKAdapter.disconnect()'s synchronous pop-from-_sessions
+    against the registry's *reactive* 'ended' write (which only happened
+    later, once _forward_events observed the session_ended event). The
+    fix makes the end_session dispatch mark the registry 'ended'
+    synchronously, before disconnect() ever runs - closing that window
+    entirely, not just narrowing it. Both actions are sent back-to-back
+    here, deliberately not synchronized, to exercise exactly that race."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+        real_cwd = daemon.sdk_adapter.get_cwd(session_id)
+
+        # A transcript must exist for a resurrection to even be possible -
+        # _try_resume_sdk_session bails out before the status check if it
+        # can't find one at all.
+        project_dir = daemon.observe_adapter.projects_dir / "my-repo"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / f"{session_id}.jsonl").write_text(
+            json.dumps({"type": "user", "cwd": real_cwd, "message": {"role": "user", "content": "hi"}}) + "\n"
+        )
+
+        # Deliberately not synchronized - both actions are in flight before
+        # either is awaited to completion.
+        await phone.send_action({"kind": "end_session", "session_id": session_id})
+        await phone.send_action({"kind": "send_message", "session_id": session_id, "text": "still there?"})
+
+        # Collect events for a bounded window rather than an exact count -
+        # the hand-written transcript above also sits in the directory
+        # observe_adapter independently scans, so it can (harmlessly)
+        # notice it as a *new observed session* and emit its own unrelated
+        # session_started (mode=observe_only) in this same window. That's a
+        # side effect of this test's own setup, not a resurrection - the
+        # actual signal under test is a *resumed SDK-owned* session_started
+        # for this session_id, which would mean send_message won the race.
+        seen = []
+        try:
+            while True:
+                seen.append(await phone.next_event(timeout=0.3))
+        except asyncio.TimeoutError:
+            pass
+
+        resurrected = [
+            e for e in seen
+            if e["type"] == "session_started" and e["session_id"] == session_id and e["data"]["mode"] == "sdk_owned"
+        ]
+        assert resurrected == []
         assert session_registry.get_session(session_id, daemon.session_registry_path).status == "ended"
     finally:
         await phone.close()

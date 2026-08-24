@@ -118,6 +118,12 @@ def test_list_known_sessions_with_no_filter_returns_both_statuses(tmp_path):
     assert {r.session_id for r in list_known_sessions(path=path)} == {"s1", "s2"}
 
 
+def test_list_known_sessions_from_a_missing_database_returns_empty_list(tmp_path):
+    path = str(tmp_path / "does-not-exist.db")
+
+    assert list_known_sessions(path=path) == []
+
+
 def test_list_known_sessions_returns_newest_first(tmp_path):
     path = str(tmp_path / "session_registry.db")
     upsert_session("s1", cwd="/tmp/a", model=None, auto_approve=False, llm_judge=False, path=path)

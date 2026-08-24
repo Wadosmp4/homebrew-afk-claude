@@ -26,6 +26,7 @@ follow-up, not added here.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -33,6 +34,11 @@ from datetime import datetime, timezone
 from typing import Optional
 
 DEFAULT_SESSION_REGISTRY_PATH = os.path.expanduser("~/.config/remote-claude-companion/session_registry.db")
+
+# code-review finding: shared across the INSERT and both SELECT statements
+# below so adding/renaming a column can't drift between them and
+# _row_to_record's positional unpacking.
+_COLUMNS = "session_id, cwd, model, auto_approve, llm_judge, status, created_at, updated_at"
 
 
 @dataclass
@@ -98,12 +104,17 @@ def upsert_session(
     always bumps to now."""
     path = path if path is not None else DEFAULT_SESSION_REGISTRY_PATH
     now = datetime.now(timezone.utc).isoformat()
-    with _connect(path) as conn:
+    # code-review finding: `with conn:` only commits/rolls back the
+    # transaction on exit - sqlite3.Connection's context-manager protocol
+    # does not close() the connection. contextlib.closing is what actually
+    # releases it, matching this module's own "short-lived, closed"
+    # documented behavior above.
+    with contextlib.closing(_connect(path)) as conn, conn:
         existing = conn.execute("SELECT created_at FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
         created_at = existing[0] if existing is not None else now
         conn.execute(
-            """
-            INSERT INTO sessions (session_id, cwd, model, auto_approve, llm_judge, status, created_at, updated_at)
+            f"""
+            INSERT INTO sessions ({_COLUMNS})
             VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
                 cwd = excluded.cwd,
@@ -121,10 +132,9 @@ def get_session(session_id: str, path: Optional[str] = None) -> Optional[Session
     path = path if path is not None else DEFAULT_SESSION_REGISTRY_PATH
     if not os.path.exists(path):
         return None
-    with _connect(path) as conn:
+    with contextlib.closing(_connect(path)) as conn, conn:
         row = conn.execute(
-            "SELECT session_id, cwd, model, auto_approve, llm_judge, status, created_at, updated_at "
-            "FROM sessions WHERE session_id = ?",
+            f"SELECT {_COLUMNS} FROM sessions WHERE session_id = ?",
             (session_id,),
         ).fetchone()
     return _row_to_record(row) if row is not None else None
@@ -136,7 +146,7 @@ def mark_session_ended(session_id: str, path: Optional[str] = None) -> None:
     no-op" convention elsewhere in this codebase."""
     path = path if path is not None else DEFAULT_SESSION_REGISTRY_PATH
     now = datetime.now(timezone.utc).isoformat()
-    with _connect(path) as conn:
+    with contextlib.closing(_connect(path)) as conn, conn:
         conn.execute(
             "UPDATE sessions SET status = 'ended', updated_at = ? WHERE session_id = ?",
             (now, session_id),
@@ -149,16 +159,12 @@ def list_known_sessions(*, status: Optional[str] = None, path: Optional[str] = N
     path = path if path is not None else DEFAULT_SESSION_REGISTRY_PATH
     if not os.path.exists(path):
         return []
-    with _connect(path) as conn:
+    with contextlib.closing(_connect(path)) as conn, conn:
         if status is None:
-            rows = conn.execute(
-                "SELECT session_id, cwd, model, auto_approve, llm_judge, status, created_at, updated_at "
-                "FROM sessions ORDER BY created_at DESC"
-            ).fetchall()
+            rows = conn.execute(f"SELECT {_COLUMNS} FROM sessions ORDER BY created_at DESC").fetchall()
         else:
             rows = conn.execute(
-                "SELECT session_id, cwd, model, auto_approve, llm_judge, status, created_at, updated_at "
-                "FROM sessions WHERE status = ? ORDER BY created_at DESC",
+                f"SELECT {_COLUMNS} FROM sessions WHERE status = ? ORDER BY created_at DESC",
                 (status,),
             ).fetchall()
     return [_row_to_record(row) for row in rows]

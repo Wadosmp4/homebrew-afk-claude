@@ -539,6 +539,28 @@ class CompanionDaemon:
             elif kind == "compact":
                 await adapter.compact(session_id)
             elif kind == "end_session":
+                # code-review finding: marking the registry 'ended' had
+                # previously only happened reactively, inside
+                # _forward_events, once it observed the session_ended event
+                # disconnect() below eventually emits. That left a real
+                # window open between adapter.disconnect() popping this
+                # session out of _sessions (synchronous, the adapter's very
+                # first statement) and the registry write actually landing
+                # (several awaits later) - any other action for this same
+                # session_id dispatched by _receive_loop's own unordered
+                # asyncio.create_task in that window would find no adapter,
+                # fall into _try_resume_sdk_session, see the registry still
+                # 'active', and silently resurrect the session the user
+                # just explicitly ended. Doing the write here, synchronously
+                # and before the pop, closes that window for the primary
+                # trigger - _forward_events' own reactive mark stays in
+                # place as the only mechanism for a session that ends on
+                # its own (no end_session action to hook into).
+                if adapter is self.sdk_adapter:
+                    async with self._session_registry_lock:
+                        await asyncio.to_thread(
+                            session_registry.mark_session_ended, session_id, self.session_registry_path
+                        )
                 await adapter.disconnect(session_id)
             elif kind == "respond_to_permission":
                 await adapter.respond_to_permission(
@@ -623,10 +645,19 @@ class CompanionDaemon:
         # in-memory, wiped by the restart) - list it anyway, unreconnected
         # (active=False), so it's visible without "stay lazy" requiring it
         # to be proactively reconnected to a live CLI process first.
-        async with self._session_registry_lock:
-            known = await asyncio.to_thread(
-                session_registry.list_known_sessions, status="active", path=self.session_registry_path
-            )
+        try:
+            async with self._session_registry_lock:
+                known = await asyncio.to_thread(
+                    session_registry.list_known_sessions, status="active", path=self.session_registry_path
+                )
+        except Exception:
+            # code-review finding: unlike the resume-safety read above, a
+            # failure here only affects *visibility* of restart-recovered
+            # sessions, not R5's resume-safety guarantee - degrade to just
+            # the live in-memory sessions already gathered above rather
+            # than dropping this whole response.
+            logger.exception("session_registry read failed while listing active sessions")
+            known = []
         sessions.extend(
             {"session_id": record.session_id, "cwd": record.cwd, "mode": "sdk_owned", "active": False}
             for record in known
@@ -985,8 +1016,21 @@ class CompanionDaemon:
         )
         if cwd is None:
             return None
-        async with self._session_registry_lock:
-            saved = await asyncio.to_thread(session_registry.get_session, session_id, self.session_registry_path)
+        try:
+            async with self._session_registry_lock:
+                saved = await asyncio.to_thread(
+                    session_registry.get_session, session_id, self.session_registry_path
+                )
+        except Exception:
+            # code-review finding: a registry I/O failure here must fail
+            # closed (refuse to resume), not fail open by falling through
+            # as if this were simply a never-tracked session - the whole
+            # point of this read is R5's "don't resume something that was
+            # explicitly ended" check, and permitting a resume we couldn't
+            # actually verify defeats that guarantee rather than degrading
+            # gracefully.
+            logger.exception("session_registry read failed while resuming %r - refusing to resume", session_id)
+            return None
         if saved is not None and saved.status == "ended":
             return None
         try:
