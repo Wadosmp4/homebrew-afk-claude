@@ -169,6 +169,47 @@ async def test_without_an_api_client_argument_the_cli_subprocess_path_runs_as_be
     assert result == "A plain CLI-path summary."
 
 
+@pytest.mark.asyncio
+async def test_the_configured_cli_env_is_threaded_into_the_cli_subprocess_call(monkeypatch):
+    """fix(review): discovered via real-device testing - generate_digest's
+    ClaudeAgentOptions never carried an `env` at all, so its one-shot CLI
+    subprocess got none of _effective_cli_env()'s personal-account
+    CLAUDE_CODE_OAUTH_TOKEN override - it fell back to the CLI's own
+    default keychain session instead, which can be (and, live, was)
+    expired even though the same account's token works fine for a real
+    session's own connect(). "Catch me up" specifically failed with an
+    auth error while regular messaging worked, because only send_message's
+    path (SDKAdapter.connect) ever passed cli_env through."""
+    captured_env = {}
+
+    async def _capturing_query(*, prompt, options):
+        captured_env.update(options.env)
+        yield AssistantMessage(content=[TextBlock(text="summary")], model="claude")
+
+    result = await digest.generate_digest(
+        _SAMPLE_EVENTS, query_fn=_capturing_query, env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-test"}
+    )
+
+    assert result == "summary"
+    assert captured_env == {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-test"}
+
+
+@pytest.mark.asyncio
+async def test_with_no_env_argument_the_cli_subprocess_gets_an_empty_dict_never_none():
+    """Mirrors sdk_adapter.py's own CRITICAL regression coverage - the real
+    subprocess transport unconditionally dict-unpacks ClaudeAgentOptions.env
+    (**self._options.env); passing env=None would raise a TypeError."""
+    captured_env = {}
+
+    async def _capturing_query(*, prompt, options):
+        captured_env["value"] = options.env
+        yield AssistantMessage(content=[TextBlock(text="summary")], model="claude")
+
+    await digest.generate_digest(_SAMPLE_EVENTS, query_fn=_capturing_query)
+
+    assert captured_env["value"] == {}
+
+
 def test_generate_digest_reuses_risk_judges_get_api_client():
     """digest.py must not redefine get_api_client - it imports risk_judge's
     (KTD1's own reasoning: no duplicated ANTHROPIC_API_KEY-gating logic)."""

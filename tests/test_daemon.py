@@ -1089,6 +1089,53 @@ async def test_get_session_digest_action_with_no_known_cwd_reports_unavailable(r
 
 
 @pytest.mark.asyncio
+async def test_get_session_digest_action_threads_the_effective_cli_env_through(
+    running_daemon, phone_token
+):
+    """fix(review): discovered via real-device testing - digest generation's
+    one-shot CLI subprocess previously carried no env override at all, so a
+    personal-account companion's CLAUDE_CODE_OAUTH_TOKEN never reached it -
+    "Catch me up" failed with an auth error even though a real session's
+    own connect() (which does pass _effective_cli_env()) worked fine with
+    the same account."""
+    from companion import digest as digest_module
+    from companion import history as history_module
+
+    daemon, port, _fake_clients = running_daemon
+    daemon.config.active_account = "personal"
+    daemon.config.personal_oauth_token = "sk-ant-oat01-test"
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        captured = {}
+
+        def _fake_read_session_history(sid, projects_dir=None):
+            return [{"type": "assistant_message", "timestamp": "t1", "data": {"text": "hi"}}]
+
+        async def _fake_generate_digest(transcript_events, **kwargs):
+            captured.update(kwargs)
+            return "summary"
+
+        original_read = history_module.read_session_history
+        original_generate = digest_module.generate_digest
+        history_module.read_session_history = _fake_read_session_history
+        digest_module.generate_digest = _fake_generate_digest
+        try:
+            await phone.send_action({"kind": "get_session_digest", "session_id": session_id})
+            await phone.next_event()
+        finally:
+            history_module.read_session_history = original_read
+            digest_module.generate_digest = original_generate
+
+        assert captured["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-test"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
 async def test_get_session_digest_action_with_a_resolvable_cwd_returns_the_generated_text(
     running_daemon, phone_token
 ):

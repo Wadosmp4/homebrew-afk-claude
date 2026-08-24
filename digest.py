@@ -80,6 +80,7 @@ async def generate_digest(
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     query_fn: Optional[QueryFn] = None,
     api_client: Optional[Any] = None,
+    env: Optional[dict[str, str]] = None,
 ) -> Optional[str]:
     """Returns a short natural-language summary of transcript_events, or
     None on any failure/timeout/empty response (fail closed - the caller
@@ -110,7 +111,18 @@ async def generate_digest(
         async with asyncio.timeout(timeout_seconds):
             async for message in query_fn(
                 prompt=prompt,
-                options=ClaudeAgentOptions(system_prompt=_SYSTEM_PROMPT, tools=[]),
+                # fix(review): discovered via real-device testing - this
+                # one-shot query previously carried no env at all, so its
+                # CLI subprocess never got _effective_cli_env()'s
+                # personal-account CLAUDE_CODE_OAUTH_TOKEN override and
+                # fell back to the CLI's own default (keychain) session
+                # instead - "Catch me up" failed with an auth error even
+                # though a real session's own connect() (which does pass
+                # cli_env) worked fine with the same account. `env or {}`,
+                # never None - ClaudeAgentOptions.env is dict-typed
+                # (default_factory=dict) on the SDK side and the real
+                # subprocess transport unconditionally dict-unpacks it.
+                options=ClaudeAgentOptions(system_prompt=_SYSTEM_PROMPT, tools=[], env=env or {}),
             ):
                 message_types_seen.append(type(message).__name__)
                 if isinstance(message, AssistantMessage):

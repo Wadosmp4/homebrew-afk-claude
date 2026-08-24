@@ -954,7 +954,11 @@ class CompanionDaemon:
         # (code-review finding: this was previously never wired, leaving
         # digest.py's direct-API fast path unreachable in production).
         api_client = digest.get_api_client() if self.config.risk_judge_use_api else None
-        text = await digest.generate_digest(events, api_client=api_client)
+        # fix(review): discovered via real-device testing - without this,
+        # digest generation's own one-shot CLI subprocess never got the
+        # personal-account OAuth override a real session's connect() call
+        # already threads through _effective_cli_env().
+        text = await digest.generate_digest(events, api_client=api_client, env=self._effective_cli_env())
         adapter.emit_custom(session_id, "session_digest", available=text is not None, text=text)
 
     async def _persist_sdk_session_registry(
