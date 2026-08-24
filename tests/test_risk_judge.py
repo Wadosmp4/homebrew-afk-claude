@@ -15,7 +15,7 @@ import pytest
 from claude_agent_sdk import AssistantMessage, TextBlock
 
 from companion import risk_judge
-from companion.risk_judge import explain_risk, judge_is_safe
+from companion.risk_judge import judge_is_safe
 
 
 @pytest.fixture(autouse=True)
@@ -338,72 +338,3 @@ def test_get_api_client_returns_the_cached_client_without_re_checking_the_enviro
     result = risk_judge.get_api_client()
 
     assert result is sentinel
-
-
-# --- Risk Explanation plan (008), U1: explain_risk ---------------------
-
-
-@pytest.mark.asyncio
-async def test_explain_risk_returns_the_query_fns_response_text():
-    result = await explain_risk(
-        "Bash", {"command": "rm -rf node_modules"}, "/repo",
-        query_fn=_fake_query("Deletes your local node_modules folder - reversible via a fresh install."),
-    )
-
-    assert result == "Deletes your local node_modules folder - reversible via a fresh install."
-
-
-@pytest.mark.asyncio
-async def test_explain_risk_fails_closed_to_none_when_query_fn_raises():
-    async def _raising_query_fn(*, prompt, options):
-        raise RuntimeError("subprocess crashed")
-        yield  # pragma: no cover - makes this an async generator
-
-    result = await explain_risk("Bash", {"command": "ls"}, "/repo", query_fn=_raising_query_fn)
-
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_explain_risk_uses_the_api_client_without_calling_query_fn_when_it_succeeds():
-    api_client = _FakeApiClient(response_text="Touches your production deploy config at path X.")
-    query_fn_calls: list[Any] = []
-
-    async def _tracking_query_fn(*, prompt, options):
-        query_fn_calls.append(prompt)
-        yield AssistantMessage(content=[TextBlock(text="should not be used")], model="claude")
-
-    result = await explain_risk(
-        "Edit", {"file_path": "prod/deploy.yaml"}, "/repo", query_fn=_tracking_query_fn, api_client=api_client
-    )
-
-    assert result == "Touches your production deploy config at path X."
-    assert query_fn_calls == []
-
-
-@pytest.mark.asyncio
-async def test_explain_risk_falls_back_to_query_fn_when_the_api_client_fails():
-    api_client = _FakeApiClient(raises=RuntimeError("connection reset"))
-
-    result = await explain_risk(
-        "Edit", {"file_path": "a.py"}, "/repo",
-        query_fn=_fake_query("A small, ordinary code edit."),
-        api_client=api_client,
-    )
-
-    assert result == "A small, ordinary code edit."
-
-
-@pytest.mark.asyncio
-async def test_explain_risk_returns_none_with_no_api_client_and_no_ambient_key(monkeypatch):
-    """Covers AE3: no ANTHROPIC_API_KEY configured and a CLI path that also
-    fails degrades to None, not an exception."""
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-
-    async def _raising_query_fn(*, prompt, options):
-        raise RuntimeError("no claude CLI available")
-        yield  # pragma: no cover
-
-    result = await explain_risk("Bash", {"command": "ls"}, "/repo", query_fn=_raising_query_fn, api_client=None)
-
-    assert result is None

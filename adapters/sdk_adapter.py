@@ -33,26 +33,12 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from .. import auto_approve as approval_policy
-from .. import risk_judge
+from ..auto_approve import is_structured_question as _is_structured_question
 from .events import Event, EventSequencer, truncate_tool_result_content
 
 logger = logging.getLogger(__name__)
 
-# Risk Explanation plan (008), code-review fix (finding #2): explain_risk
-# fires unconditionally on every human-facing permission request, unlike
-# judge_is_safe which is both opt-in (llm_judge) and per-session cached -
-# a burst of pending tool approvals (Claude requesting several calls in
-# quick succession) would otherwise fan out into unbounded concurrent CLI-
-# subprocess spawns / API calls with no cap. This bounds concurrency per
-# session rather than dropping/deduping requests: every explanation still
-# eventually fires, just serialized past this limit.
-MAX_CONCURRENT_EXPLANATIONS = 3
-
 ClientFactory = Callable[[ClaudeAgentOptions], Any]
-
-
-_is_structured_question = approval_policy.is_structured_question
 
 
 class SDKAdapter:
@@ -255,12 +241,6 @@ class SDKAdapter:
             session.resolve_permission(request_id, "deny", "Session ended before this was answered")
         if session.reader_task is not None:
             session.reader_task.cancel()
-        # Code-review fix: any still-in-flight explanation task (see
-        # explanation_tasks' own comment) must not keep running - and,
-        # more importantly, must not emit() into this session's queue -
-        # after the session it was generating an explanation for is gone.
-        for explanation_task in list(session.explanation_tasks):
-            explanation_task.cancel()
         await session.client.disconnect()
         session.end("disconnected")
 
@@ -319,34 +299,11 @@ class _Session:
         self.outbound: asyncio.Queue[str] = asyncio.Queue()
         self.pending: dict[str, asyncio.Future] = {}
         self.auto_allowed_tools: set[str] = set()
-        self.auto_approve: bool = False  # opt-in per session - set in SDKAdapter.connect
-        self.llm_judge: bool = False  # opt-in per session, separate from auto_approve - see connect()
-        self.risk_judge_use_api: bool = False  # Mac-level opt-in - see connect()
-        # Mobile UX follow-up #3b: an identical (tool_name, tool_input) pair
-        # judged once this session is never re-judged (e.g. the same lint/
-        # test command run twice) - see risk_judge.judge_is_safe's own
-        # `cache` param. Scoped to this one session, same lifetime as
-        # auto_allowed_tools above; never persisted or shared across
-        # sessions, since a judgment's safety can depend on session-local
-        # context an identical call in a *different* session might not share.
-        self.judgment_cache: dict[tuple[str, str], bool] = {}
         self.tool_started_at: dict[str, float] = {}
         self.client: Any = None
         self.reader_task: Optional[asyncio.Task] = None
         self.cwd: Optional[str] = None
         self._ended = False
-        # Risk Explanation plan (008), code-review fix: every _emit_risk_
-        # explanation task dispatched by can_use_tool is tracked here so
-        # disconnect() can cancel any still in flight - otherwise a session
-        # torn down mid-explanation left its CLI-subprocess fallback (up to
-        # 15s) running against a now-orphaned _Session whose emit() nobody
-        # would ever read again. Self-discarding via add_done_callback, the
-        # same pattern this codebase already uses for its other detached-
-        # task bookkeeping.
-        self.explanation_tasks: set[asyncio.Task] = set()
-        # Code-review fix (finding #2): caps concurrent explain_risk calls
-        # per session - see MAX_CONCURRENT_EXPLANATIONS' own comment.
-        self.explanation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXPLANATIONS)
 
     def emit(self, type_: str, **data: Any) -> Event:
         event = self.sequencer.emit(type_, **data)
@@ -387,59 +344,18 @@ class _Session:
         different content, so "allowed" never applies to it as a category
         the way it does for Bash/Edit/etc.
 
-        When the phone opted this session into policy auto-approval
-        (`self.auto_approve`), a narrow rule-based policy
-        (companion/auto_approve.py) can also skip the prompt - checked
-        first, ahead of auto_allowed_tools, since it's the stricter gate
-        and its own denylist must not be bypassable by anything else,
-        including the LLM judge below. A policy-approved call still emits
-        a permission_request (tagged `auto_approved`) so the phone can
-        show it happened, rather than it silently never appearing -
-        transparency over invisibility.
-
-        A denylisted call never reaches the judge either - the judge only
-        ever sees the gray area (not denylisted, not already rule-
-        approved), and a REVIEW/ambiguous/failed verdict falls straight
-        through to the normal human prompt below (fail closed)."""
-        if not _is_structured_question(tool_input) and self.auto_approve:
-            denylisted = approval_policy.is_denylisted(tool_name, tool_input, self.cwd)
-            if not denylisted and approval_policy.is_auto_approvable(tool_name, tool_input, cwd=self.cwd):
-                self.emit(
-                    "permission_request",
-                    request_id=str(uuid4()),
-                    tool=tool_name,
-                    input=tool_input,
-                    auto_approved=True,
-                    judged_by="policy",
-                )
-                return PermissionResultAllow()
-            if not denylisted and self.llm_judge:
-                # get_api_client() only ever does real work (constructs a
-                # client) when risk_judge_use_api is explicitly on - see
-                # its own docstring for why this indirection matters (a
-                # bare `pytest` run inheriting ANTHROPIC_API_KEY from the
-                # invoking shell must never trigger a real network call).
-                api_client = risk_judge.get_api_client() if self.risk_judge_use_api else None
-                judge_reason: dict[str, Optional[str]] = {}
-                if await risk_judge.judge_is_safe(
-                    tool_name,
-                    tool_input,
-                    self.cwd,
-                    cache=self.judgment_cache,
-                    api_client=api_client,
-                    reason_out=judge_reason,
-                ):
-                    self.emit(
-                        "permission_request",
-                        request_id=str(uuid4()),
-                        tool=tool_name,
-                        input=tool_input,
-                        auto_approved=True,
-                        judged_by="llm",
-                        judge_reason=judge_reason.get("reason"),
-                    )
-                    return PermissionResultAllow()
-
+        Permission-mode-picker plan (U1): this callback used to also check
+        a rule-based denylist/allowlist policy (companion/auto_approve.py)
+        and an opt-in LLM judge (companion/risk_judge.judge_is_safe)
+        before falling through to the human prompt below, plus fire a
+        fire-and-forget Risk Explanation call alongside it. All three are
+        removed from this path - a session's own chosen native permission
+        mode is now the sole governor of tool-call approval for an
+        SDK-owned session, with nothing underneath it, including under a
+        fully permissive mode. Neither `auto_approve.py` nor
+        `risk_judge.judge_is_safe` is deleted from the codebase:
+        observe_adapter.py's own, entirely separate mechanism for observed
+        (non-SDK-owned) sessions still calls both directly."""
         if tool_name in self.auto_allowed_tools and not _is_structured_question(tool_input):
             return PermissionResultAllow()
 
@@ -447,14 +363,6 @@ class _Session:
         future: asyncio.Future = asyncio.get_event_loop().create_future()
         self.pending[request_id] = future
         self.emit("permission_request", request_id=request_id, tool=tool_name, input=tool_input)
-        # Risk Explanation plan (U1): fired concurrently with the human's
-        # own Allow/Deny wait below, never awaited here - a slow or failed
-        # explanation call must never delay `future = await future`. Tracked
-        # in explanation_tasks (see its own comment) so disconnect() can
-        # cancel it if the session ends first.
-        explanation_task = asyncio.create_task(self._emit_risk_explanation(request_id, tool_name, tool_input))
-        self.explanation_tasks.add(explanation_task)
-        explanation_task.add_done_callback(self.explanation_tasks.discard)
 
         decision, message = await future
         if decision == "allow" and _is_structured_question(tool_input) and message:
@@ -486,32 +394,6 @@ class _Session:
         # for free, symmetric with permission_request's own auto_approved
         # self-documenting shape.
         self.emit("permission_resolved", request_id=request_id, decision=decision, message=message)
-
-    async def _emit_risk_explanation(self, request_id: str, tool_name: str, tool_input: dict) -> None:
-        """Risk Explanation plan (U1): generates and emits a plain-English
-        explanation for a permission request that reached the human,
-        correlated back by request_id the same way permission_resolved
-        already correlates to its permission_request. Gated only on
-        risk_judge_use_api (the Mac-level API-key opt-in), not on
-        self.llm_judge - that flag controls auto-approval judgment, a
-        different, unrelated opt-in. Wrapped in a broad try/except: this
-        runs as a detached asyncio.create_task with nothing awaiting it, so
-        an unhandled exception here would otherwise vanish into the event
-        loop's default exception handler rather than being caught by any
-        caller - it must never crash the session's read loop or the
-        permission wait it runs alongside."""
-        try:
-            api_client = risk_judge.get_api_client() if self.risk_judge_use_api else None
-            # Code-review fix (finding #2): bounds concurrent explain_risk
-            # calls per session - see explanation_semaphore's own comment.
-            # A burst of pending permissions still gets every explanation
-            # eventually, just serialized past MAX_CONCURRENT_EXPLANATIONS
-            # rather than all spawning subprocesses/API calls at once.
-            async with self.explanation_semaphore:
-                explanation = await risk_judge.explain_risk(tool_name, tool_input, self.cwd, api_client=api_client)
-            self.emit("permission_risk_explanation", request_id=request_id, explanation=explanation)
-        except Exception:
-            logger.exception("risk explanation task failed for request_id=%r", request_id)
 
     async def read_loop(self) -> None:
         try:

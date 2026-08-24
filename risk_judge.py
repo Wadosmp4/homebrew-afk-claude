@@ -71,17 +71,6 @@ _SYSTEM_PROMPT = (
     "could cause real harm. You cannot use any tools yourself; only answer."
 )
 
-_EXPLAIN_SYSTEM_PROMPT = (
-    "You are explaining one tool call a coding agent wants to make to the "
-    "human who has to approve or deny it. You are given the tool name, its "
-    "input, and the working directory. Respond with EXACTLY one short "
-    "sentence naming the specific, concrete risk or blast radius of this "
-    "particular call (what it touches, whether it's reversible) - not a "
-    "generic risk-level label. Do not say SAFE or REVIEW or give a "
-    "verdict; the human is already deciding that themselves. You cannot "
-    "use any tools yourself; only answer."
-)
-
 QueryFn = Callable[..., Any]
 
 _api_client: Optional[Any] = None
@@ -262,69 +251,3 @@ async def _judge_uncached(
     except Exception:
         logger.exception("risk judge failed for tool=%r - falling back to prompting the user", tool_name)
     return False, None
-
-
-async def _explain_via_api(prompt: str, *, api_client: Any, timeout_seconds: float) -> Optional[str]:
-    """The fast path for explain_risk, mirroring _judge_via_api's shape but
-    returning the raw explanation text (or None on any failure) rather than
-    a SAFE/REVIEW bool - there's no verdict to parse here, the response
-    text itself IS the explanation."""
-    try:
-        async with asyncio.timeout(timeout_seconds):
-            response = await api_client.messages.create(
-                model=DEFAULT_API_MODEL,
-                max_tokens=100,
-                system=_EXPLAIN_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": prompt}],
-            )
-        for block in response.content:
-            if getattr(block, "type", None) == "text":
-                text = block.text.strip()
-                return text or None
-        return None
-    except Exception:
-        logger.exception("direct API risk explanation failed - falling back to the CLI subprocess path")
-        return None
-
-
-async def explain_risk(
-    tool_name: str,
-    tool_input: Optional[dict[str, Any]],
-    cwd: Optional[str],
-    *,
-    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
-    query_fn: Optional[QueryFn] = None,
-    api_client: Optional[Any] = None,
-) -> Optional[str]:
-    """Generates a plain-English, specific explanation of a pending tool
-    call's risk/blast-radius for a permission request that already reached
-    the human - a sibling to judge_is_safe sharing its exact prompt-
-    construction and fallback shape, but asking for an explanation rather
-    than a SAFE/REVIEW verdict. Fails closed to None on any error, timeout,
-    or empty response - "no explanation shown" is always safe, since this
-    is purely additive to the existing Allow/Deny decision."""
-    prompt = f"Tool: {tool_name}\nInput: {tool_input!r}\nWorking directory: {cwd or 'unknown'}"
-
-    if api_client is not None:
-        api_explanation = await _explain_via_api(prompt, api_client=api_client, timeout_seconds=DEFAULT_API_TIMEOUT_SECONDS)
-        if api_explanation is not None:
-            return api_explanation
-        # Falls through to the CLI-subprocess path below, same as
-        # judge_is_safe - an API-layer failure isn't evidence there's no
-        # explanation to give.
-
-    query_fn = query_fn or query
-    try:
-        async with asyncio.timeout(timeout_seconds):
-            async for message in query_fn(
-                prompt=prompt,
-                options=ClaudeAgentOptions(system_prompt=_EXPLAIN_SYSTEM_PROMPT, tools=[]),
-            ):
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            text = block.text.strip()
-                            return text or None
-    except Exception:
-        logger.exception("risk explanation failed for tool=%r", tool_name)
-    return None
