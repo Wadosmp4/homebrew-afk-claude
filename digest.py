@@ -40,7 +40,12 @@ _SYSTEM_PROMPT = (
     "tool calls, tool results) in order. Respond with a short summary - 2 to 4 "
     "sentences - covering what changed, what the agent is currently doing or "
     "waiting on, and any errors hit. Be concrete (name files/commands when "
-    "useful), not generic. You cannot use any tools yourself; only answer."
+    "useful), not generic. You cannot use any tools yourself; only answer.\n\n"
+    "Format the response in markdown, rendered on a phone screen: wrap "
+    "file/command/variable names in backticks, use **bold** sparingly for the "
+    "one or two things that matter most, and use a short bullet list instead "
+    "of a run-on sentence when covering more than one distinct change or "
+    "error. Keep it scannable at a glance, not a wall of text."
 )
 
 QueryFn = Callable[..., Any]
