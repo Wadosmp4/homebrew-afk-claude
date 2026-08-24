@@ -53,12 +53,11 @@ from uuid import uuid4
 
 import websockets
 
-from . import digest, git_status, history, projects
+from . import digest, git_status, history, projects, session_registry
 from .adapters.events import Event
 from .adapters.observe_adapter import KNOWN_ENTRYPOINTS, ObserveAdapter
 from .adapters.sdk_adapter import SDKAdapter
 from .config import DEFAULT_CONFIG_PATH, CompanionConfig, load_config, save_config
-from .session_settings import SessionSettings, load_session_settings, save_session_settings
 
 logger = logging.getLogger(__name__)
 
@@ -241,7 +240,7 @@ class CompanionDaemon:
         observe_adapter: Optional[ObserveAdapter] = None,
         recents_path: Optional[str] = None,
         config_path: Optional[str] = None,
-        session_settings_path: Optional[str] = None,
+        session_registry_path: Optional[str] = None,
     ):
         self.config = config
         self.config_path = config_path or DEFAULT_CONFIG_PATH
@@ -255,9 +254,9 @@ class CompanionDaemon:
         # never write into the developer's real recent-projects file
         # (projects.DEFAULT_RECENTS_PATH) just by exercising start_session.
         self.recents_path = recents_path
-        # Same injectability reason, for session_settings.py's own default
+        # Same injectability reason, for session_registry.py's own default
         # path - see _try_resume_sdk_session for why this exists at all.
-        self.session_settings_path = session_settings_path
+        self.session_registry_path = session_registry_path
         self.state = "connecting"
         self.connect_attempts = 0
         self.heartbeats_sent = 0
@@ -270,13 +269,13 @@ class CompanionDaemon:
         self._forwarding: dict[str, asyncio.Task] = {}
         # _receive_loop dispatches every inbound action as its own
         # asyncio.create_task, unordered - so two actions that each read-
-        # modify-write the same on-disk JSON file (session_settings.py's
-        # save_session_settings, projects.py's record_recent) can interleave
-        # and silently drop one write. Each lock serializes one file's
+        # modify-write the same on-disk file (session_registry.py's
+        # upsert_session, projects.py's record_recent) can interleave and
+        # silently drop one write. Each lock serializes one file's
         # read-modify-write sequence across concurrently-dispatched actions
         # on this daemon instance; separate locks since the two files are
         # unrelated and there's no reason to block one on the other.
-        self._session_settings_lock = asyncio.Lock()
+        self._session_registry_lock = asyncio.Lock()
         self._recents_lock = asyncio.Lock()
 
     def stop(self) -> None:
@@ -424,17 +423,15 @@ class CompanionDaemon:
             if resolved_cwd:
                 async with self._recents_lock:
                     await asyncio.to_thread(projects.record_recent, resolved_cwd, self.recents_path)
-                async with self._session_settings_lock:
+                async with self._session_registry_lock:
                     await asyncio.to_thread(
-                        save_session_settings,
+                        session_registry.upsert_session,
                         session_id,
-                        SessionSettings(
-                            cwd=resolved_cwd,
-                            model=action.get("model"),
-                            auto_approve=bool(action.get("auto_approve", False)),
-                            llm_judge=bool(action.get("llm_judge", False)),
-                        ),
-                        self.session_settings_path,
+                        cwd=resolved_cwd,
+                        model=action.get("model"),
+                        auto_approve=bool(action.get("auto_approve", False)),
+                        llm_judge=bool(action.get("llm_judge", False)),
+                        path=self.session_registry_path,
                     )
             return
 
@@ -568,7 +565,7 @@ class CompanionDaemon:
                     # sessions have no equivalent - they're never resumed
                     # this way, since ObserveAdapter has no client to
                     # reconnect.
-                    await self._persist_sdk_session_settings(
+                    await self._persist_sdk_session_registry(
                         session_id, action.get("auto_approve"), action.get("llm_judge")
                     )
             else:
@@ -914,7 +911,7 @@ class CompanionDaemon:
         text = await digest.generate_digest(events, api_client=api_client)
         adapter.emit_custom(session_id, "session_digest", available=text is not None, text=text)
 
-    async def _persist_sdk_session_settings(
+    async def _persist_sdk_session_registry(
         self, session_id: str, auto_approve: Optional[bool], llm_judge: Optional[bool]
     ) -> None:
         """None for either argument leaves that field as it was already
@@ -928,18 +925,16 @@ class CompanionDaemon:
         # succession) each read the pre-toggle file, so locking only the
         # write would still let the second save silently overwrite the
         # first toggle's change with stale data.
-        async with self._session_settings_lock:
-            saved = await asyncio.to_thread(load_session_settings, session_id, self.session_settings_path)
+        async with self._session_registry_lock:
+            saved = await asyncio.to_thread(session_registry.get_session, session_id, self.session_registry_path)
             await asyncio.to_thread(
-                save_session_settings,
+                session_registry.upsert_session,
                 session_id,
-                SessionSettings(
-                    cwd=cwd,
-                    model=saved.model if saved is not None else None,
-                    auto_approve=auto_approve if auto_approve is not None else (saved.auto_approve if saved is not None else False),
-                    llm_judge=llm_judge if llm_judge is not None else (saved.llm_judge if saved is not None else False),
-                ),
-                self.session_settings_path,
+                cwd=cwd,
+                model=saved.model if saved is not None else None,
+                auto_approve=auto_approve if auto_approve is not None else (saved.auto_approve if saved is not None else False),
+                llm_judge=llm_judge if llm_judge is not None else (saved.llm_judge if saved is not None else False),
+                path=self.session_registry_path,
             )
 
     def _adapter_for(self, session_id: str):
@@ -959,12 +954,15 @@ class CompanionDaemon:
         dropping whatever action prompted this, so a message sent right
         after a restart is delivered rather than vanishing.
 
-        model/auto_approve/llm_judge come from session_settings.py's saved
+        model/auto_approve/llm_judge come from session_registry.py's saved
         record when there is one (written by start_session and
         set_session_auto_approve) - falling back to the transcript's own
         cwd plus opt-in-off defaults only for a session that predates this
         being tracked at all. Returns None (falls through to the normal
-        "unknown session_id" warning) if no matching transcript exists, or
+        "unknown session_id" warning) if no matching transcript exists, the
+        registry already marks this session 'ended' (R5 - an ended session
+        must not be silently resurrected just because its transcript still
+        exists on disk; the explicit end action needs to stay durable), or
         the resume attempt itself fails - e.g. a session id that was never
         real, or one already too old for the CLI to load."""
         cwd = await asyncio.to_thread(
@@ -972,8 +970,10 @@ class CompanionDaemon:
         )
         if cwd is None:
             return None
-        async with self._session_settings_lock:
-            saved = await asyncio.to_thread(load_session_settings, session_id, self.session_settings_path)
+        async with self._session_registry_lock:
+            saved = await asyncio.to_thread(session_registry.get_session, session_id, self.session_registry_path)
+        if saved is not None and saved.status == "ended":
+            return None
         try:
             await self.sdk_adapter.connect(
                 session_id,
@@ -985,8 +985,9 @@ class CompanionDaemon:
                 # Same as the start_session call site above: cli_path/
                 # cli_env/risk_judge_use_api are Mac-level settings, always
                 # read from self.config directly - there's no saved
-                # SessionSettings equivalent for any of them. cli_env goes
-                # through _effective_cli_env, same reasoning as start_session.
+                # session_registry.py equivalent for any of them. cli_env
+                # goes through _effective_cli_env, same reasoning as
+                # start_session.
                 cli_path=self.config.cli_path,
                 cli_env=self._effective_cli_env(),
                 risk_judge_use_api=self.config.risk_judge_use_api,
@@ -995,17 +996,15 @@ class CompanionDaemon:
             logger.exception("failed to resume SDK-owned session %r", session_id)
             return None
         resolved_cwd = self.sdk_adapter.get_cwd(session_id) or cwd
-        async with self._session_settings_lock:
+        async with self._session_registry_lock:
             await asyncio.to_thread(
-                save_session_settings,
+                session_registry.upsert_session,
                 session_id,
-                SessionSettings(
-                    cwd=resolved_cwd,
-                    model=saved.model if saved is not None else None,
-                    auto_approve=saved.auto_approve if saved is not None else False,
-                    llm_judge=saved.llm_judge if saved is not None else False,
-                ),
-                self.session_settings_path,
+                cwd=resolved_cwd,
+                model=saved.model if saved is not None else None,
+                auto_approve=saved.auto_approve if saved is not None else False,
+                llm_judge=saved.llm_judge if saved is not None else False,
+                path=self.session_registry_path,
             )
         return self.sdk_adapter
 
@@ -1046,6 +1045,23 @@ class CompanionDaemon:
         try:
             async for event in adapter.subscribe(session_id):
                 await self._send_event(ws, event)
+                # R5: `session_ended` (SDKAdapter.end()'s own docstring:
+                # "interrupt(), disconnect(), and a natural end-of-stream in
+                # read_loop can all reach here") is the one funnel point for
+                # every way an SDK-owned session actually stops - hooking
+                # here durably marks the registry 'ended' whichever path
+                # got here, not just an explicit end_session action. A
+                # crash (read_loop's except-branch) never reaches end() and
+                # so never emits this event - deliberately left 'active' in
+                # the registry, since the session genuinely still exists,
+                # just wasn't cleanly closed (R4's job is keeping that
+                # visible, not KTD4's). Observed sessions have no registry
+                # row at all (KTD4).
+                if adapter is self.sdk_adapter and event.type == "session_ended":
+                    async with self._session_registry_lock:
+                        await asyncio.to_thread(
+                            session_registry.mark_session_ended, session_id, self.session_registry_path
+                        )
         except asyncio.CancelledError:
             raise
         except Exception:

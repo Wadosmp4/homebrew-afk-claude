@@ -29,8 +29,8 @@ from companion.adapters.observe_adapter import KNOWN_ENTRYPOINTS, ObserveAdapter
 from companion.adapters.sdk_adapter import SDKAdapter
 from companion.config import CompanionConfig, load_config
 from companion.daemon import CompanionDaemon
-from companion.session_settings import load_session_settings
-from companion.tests.test_sdk_adapter import FakeSDKClient
+from companion import session_registry
+from companion.tests.test_sdk_adapter import _STOP, FakeSDKClient
 from relay import auth
 from relay.app import create_app
 
@@ -149,7 +149,7 @@ async def test_daemon_connects_authenticates_and_sends_heartbeats(relay, compani
         observe_adapter=_test_observe_adapter(tmp_path),
         recents_path=str(tmp_path / "recent_projects.json"),
         config_path=str(tmp_path / "companion_config.json"),
-        session_settings_path=str(tmp_path / "session_settings.json"),
+        session_registry_path=str(tmp_path / "session_registry.db"),
     )
     task = asyncio.create_task(daemon.run())
 
@@ -169,7 +169,7 @@ async def test_daemon_retries_with_backoff_when_relay_unreachable(tmp_path):
         observe_adapter=_test_observe_adapter(tmp_path),
         recents_path=str(tmp_path / "recent_projects.json"),
         config_path=str(tmp_path / "companion_config.json"),
-        session_settings_path=str(tmp_path / "session_settings.json"),
+        session_registry_path=str(tmp_path / "session_registry.db"),
     )
     task = asyncio.create_task(daemon.run())
 
@@ -195,7 +195,7 @@ async def test_daemon_reconnects_after_relay_restart_without_losing_identity(tmp
         observe_adapter=_test_observe_adapter(tmp_path),
         recents_path=str(tmp_path / "recent_projects.json"),
         config_path=str(tmp_path / "companion_config.json"),
-        session_settings_path=str(tmp_path / "session_settings.json"),
+        session_registry_path=str(tmp_path / "session_registry.db"),
     )
     task = asyncio.create_task(daemon.run())
 
@@ -241,7 +241,7 @@ async def test_sdk_session_forwarding_resumes_after_relay_reconnect(tmp_path, pg
         observe_adapter=_test_observe_adapter(tmp_path),
         recents_path=str(tmp_path / "recent_projects.json"),
         config_path=str(tmp_path / "companion_config.json"),
-        session_settings_path=str(tmp_path / "session_settings.json"),
+        session_registry_path=str(tmp_path / "session_registry.db"),
     )
     task = asyncio.create_task(daemon.run())
     await _wait_until(lambda: daemon.state == "connected")
@@ -344,7 +344,7 @@ async def running_daemon(relay, companion_token, tmp_path):
         observe_adapter=_test_observe_adapter(tmp_path),
         recents_path=str(tmp_path / "recent_projects.json"),
         config_path=str(tmp_path / "companion_config.json"),
-        session_settings_path=str(tmp_path / "session_settings.json"),
+        session_registry_path=str(tmp_path / "session_registry.db"),
     )
     task = asyncio.create_task(daemon.run())
     await _wait_until(lambda: daemon.state == "connected")
@@ -554,7 +554,7 @@ async def test_start_session_persists_its_settings_for_a_later_resume(running_da
         started = await phone.next_event()
         session_id = started["session_id"]
 
-        saved = load_session_settings(session_id, daemon.session_settings_path)
+        saved = session_registry.get_session(session_id, daemon.session_registry_path)
         assert saved is not None
         assert saved.cwd == os.path.realpath("/tmp/some-repo")
         assert saved.model == "claude-opus-5"
@@ -572,16 +572,60 @@ async def test_set_session_auto_approve_updates_the_persisted_record(running_dae
         await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
         started = await phone.next_event()
         session_id = started["session_id"]
-        assert load_session_settings(session_id, daemon.session_settings_path).auto_approve is False
+        assert session_registry.get_session(session_id, daemon.session_registry_path).auto_approve is False
 
         await phone.send_action(
             {"kind": "set_session_auto_approve", "session_id": session_id, "auto_approve": True}
         )
         await phone.next_event()  # session_auto_approve confirmation
 
-        saved = load_session_settings(session_id, daemon.session_settings_path)
+        saved = session_registry.get_session(session_id, daemon.session_registry_path)
         assert saved.auto_approve is True
         assert saved.llm_judge is False  # untouched - only auto_approve was passed
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_end_session_marks_the_registry_row_ended(running_daemon, phone_token):
+    """R5: an explicitly-ended session must not be silently resurrected by
+    a later resume attempt - see the ended-session resume test below for
+    the other half of this."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action({"kind": "end_session", "session_id": session_id})
+        await phone.next_event()  # session_ended
+
+        assert session_registry.get_session(session_id, daemon.session_registry_path).status == "ended"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_a_session_that_completes_naturally_also_marks_the_registry_row_ended(
+    running_daemon, phone_token
+):
+    """R5's other trigger: SDKAdapter.end() (reached by read_loop's own
+    end-of-stream, not just an explicit end_session action) is the actual
+    unified funnel for every way a session stops - this proves the registry
+    gets marked even when the phone never taps End Session at all."""
+    daemon, port, fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        fake_clients[0].push(_STOP)  # ends receive_messages() -> read_loop's self.end("completed")
+        ended = await phone.next_event()
+        assert ended["type"] == "session_ended"
+
+        assert session_registry.get_session(session_id, daemon.session_registry_path).status == "ended"
     finally:
         await phone.close()
 
@@ -590,7 +634,7 @@ async def test_set_session_auto_approve_updates_the_persisted_record(running_dae
 async def test_resuming_a_stale_session_restores_its_previously_saved_settings(
     running_daemon, phone_token
 ):
-    """session_settings.py's saved record (written by start_session and
+    """session_registry.py's saved record (written by start_session and
     kept in sync by set_session_auto_approve) is what lets a restart-
     triggered resume come back with the same auto_approve/llm_judge/model
     the phone had actually chosen, instead of always falling back to
@@ -640,6 +684,105 @@ async def test_resuming_a_stale_session_restores_its_previously_saved_settings(
         message_event = await phone.next_event()
         assert message_event["type"] == "user_message"
         assert message_event["data"]["text"] == "still there?"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_an_ended_session_is_not_resurrected_by_a_later_resume_attempt(
+    running_daemon, phone_token
+):
+    """R5: ending a session doesn't delete its CLI transcript, so a stale
+    phone-side reference to an already-ended session must not resume it
+    just because the transcript still exists on disk - _try_resume_sdk_session
+    checks the registry's status before ever attempting sdk_adapter.connect."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+        real_cwd = daemon.sdk_adapter.get_cwd(session_id)
+
+        await phone.send_action({"kind": "end_session", "session_id": session_id})
+        await phone.next_event()  # session_ended
+        assert session_registry.get_session(session_id, daemon.session_registry_path).status == "ended"
+
+        # The transcript still exists on disk (ending a session doesn't
+        # delete it) and the daemon has no in-memory adapter for it anymore
+        # (disconnect() already popped it) - exactly the state a stale
+        # phone-side reference to an ended session would find.
+        project_dir = daemon.observe_adapter.projects_dir / "my-repo"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / f"{session_id}.jsonl").write_text(
+            json.dumps({"type": "user", "cwd": real_cwd, "message": {"role": "user", "content": "hi"}}) + "\n"
+        )
+
+        await phone.send_action({"kind": "send_message", "session_id": session_id, "text": "still there?"})
+
+        event = await phone.next_event()
+        assert event["type"] == "session_unavailable"
+        assert session_registry.get_session(session_id, daemon.session_registry_path).status == "ended"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_catch_me_up_succeeds_for_a_fresh_session_after_a_restart(running_daemon, phone_token):
+    """End-to-end regression test for the bug this plan exists to fix: a
+    freshly-started (never-before-resumed) session's digest must succeed
+    after a restart, using the registry (not the old JSON file) for its
+    settings and the transcript filed under this session's own id (U1)."""
+    from companion import digest as digest_module
+
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+        real_cwd = daemon.sdk_adapter.get_cwd(session_id)
+
+        # Simulate a restart, then write the transcript exactly where U1's
+        # fix makes the real CLI file it: under this session's own id.
+        project_dir = daemon.observe_adapter.projects_dir / "my-repo"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / f"{session_id}.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "cwd": real_cwd,
+                    "message": {"role": "assistant", "content": [{"type": "text", "text": "did a thing"}]},
+                }
+            )
+            + "\n"
+        )
+        del daemon.sdk_adapter._sessions[session_id]
+        old_forwarder = daemon._forwarding.pop(session_id, None)
+        if old_forwarder is not None:
+            old_forwarder.cancel()
+
+        async def _fake_generate_digest(transcript_events, **kwargs):
+            return "Made progress on the thing."
+
+        original_generate = digest_module.generate_digest
+        digest_module.generate_digest = _fake_generate_digest
+        try:
+            await phone.send_action({"kind": "get_session_digest", "session_id": session_id})
+            # The resume's own session_started (forwarding restarts via
+            # _watch_active_sessions's own poll, a background task
+            # independent of this dispatch) can land before or after the
+            # digest event - same pre-existing timing race documented on
+            # test_resuming_a_stale_session_restores_its_previously_saved_settings.
+            # Not this plan's regression to fix; tolerate either order.
+            first = await phone.next_event()
+            event = first if first["type"] == "session_digest" else await phone.next_event()
+        finally:
+            digest_module.generate_digest = original_generate
+
+        assert event["type"] == "session_digest"
+        assert event["data"]["available"] is True
+        assert event["data"]["text"] == "Made progress on the thing."
     finally:
         await phone.close()
 
@@ -1570,7 +1713,7 @@ def _bare_daemon(tmp_path, **config_kwargs) -> CompanionDaemon:
         observe_adapter=_test_observe_adapter(tmp_path),
         recents_path=str(tmp_path / "recent_projects.json"),
         config_path=str(tmp_path / "companion_config.json"),
-        session_settings_path=str(tmp_path / "session_settings.json"),
+        session_registry_path=str(tmp_path / "session_registry.db"),
     )
 
 
