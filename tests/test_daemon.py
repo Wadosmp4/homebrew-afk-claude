@@ -758,6 +758,199 @@ async def test_a_second_action_dispatched_right_after_end_session_cannot_resurre
 
 
 @pytest.mark.asyncio
+async def test_set_session_permission_mode_action_applies_live_and_persists_for_a_later_resume(
+    running_daemon, phone_token
+):
+    """R8/R9: dispatched live via SDKAdapter.set_session_permission_mode
+    (session.client.set_permission_mode - no reconnect), and, on success,
+    persisted into session_registry purely so a later companion-restart
+    resume picks up the change (_persist_sdk_session_registry) - not what
+    applies it live."""
+    daemon, port, fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action(
+            {"kind": "start_session", "cwd": "/tmp/some-repo", "permission_mode": "default"}
+        )
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action(
+            {"kind": "set_session_permission_mode", "session_id": session_id, "permission_mode": "plan"}
+        )
+        confirm = await phone.next_event()
+        assert confirm["type"] == "session_permission_mode"
+        assert confirm["data"]["permission_mode"] == "plan"
+
+        assert fake_clients[0].permission_mode == "plan"
+        assert fake_clients[0].disconnected is False  # applied live, no reconnect
+
+        saved = session_registry.get_session(session_id, daemon.session_registry_path)
+        assert saved.permission_mode == "plan"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_set_session_model_action_applies_live_and_persists_for_a_later_resume(
+    running_daemon, phone_token
+):
+    """R10: model's counterpart to the permission-mode test above - same
+    live control-request path (session.client.set_model), same
+    persist-on-success shape."""
+    daemon, port, fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action(
+            {"kind": "start_session", "cwd": "/tmp/some-repo", "model": "claude-sonnet-5"}
+        )
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action(
+            {"kind": "set_session_model", "session_id": session_id, "model": "claude-opus-5"}
+        )
+        confirm = await phone.next_event()
+        assert confirm["type"] == "session_model"
+        assert confirm["data"]["model"] == "claude-opus-5"
+
+        assert fake_clients[0].model == "claude-opus-5"
+        assert fake_clients[0].disconnected is False  # applied live, no reconnect
+
+        saved = session_registry.get_session(session_id, daemon.session_registry_path)
+        assert saved.model == "claude-opus-5"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_set_session_permission_mode_and_set_session_model_are_a_noop_for_an_observed_session(
+    running_daemon, phone_token
+):
+    """R8: ObserveAdapter has no `client` of ours to send a live control
+    request to at all (permission_mode/model are native-SDK concepts,
+    unlike the shared-name set_session_auto_approve action which both
+    adapters happen to implement) - the dispatch branches for both new
+    actions guard on `adapter is self.sdk_adapter`, so an observed
+    session's dispatch must be a clean no-op rather than an
+    AttributeError caught by the generic per-action exception logger."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        project_dir = daemon.observe_adapter.projects_dir / "my-repo"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "session-live.jsonl").touch()
+
+        started = await phone.next_event(timeout=3.0)
+        assert started["type"] == "session_started"
+        assert started["data"]["mode"] == "observe_only"
+
+        await phone.send_action({"kind": "open_session", "session_id": "session-live"})
+
+        await phone.send_action(
+            {"kind": "set_session_permission_mode", "session_id": "session-live", "permission_mode": "plan"}
+        )
+        await phone.send_action(
+            {"kind": "set_session_model", "session_id": "session-live", "model": "claude-opus-5"}
+        )
+
+        # No confirmation for either - and no registry row at all, since
+        # session_registry is an SDK-owned-session concept an observed
+        # session was never written into in the first place.
+        seen = []
+        try:
+            while True:
+                seen.append(await phone.next_event(timeout=0.3))
+        except asyncio.TimeoutError:
+            pass
+        assert not any(e["type"] in ("session_permission_mode", "session_model") for e in seen)
+        assert session_registry.get_session("session-live", daemon.session_registry_path) is None
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_a_set_session_permission_mode_dispatched_right_after_end_session_cannot_resurrect_it(
+    running_daemon, phone_token
+):
+    """Mirrors test_a_second_action_dispatched_right_after_end_session_cannot_resurrect_it
+    above for the new live-control-request actions (U3): a
+    concurrently-dispatched end_session must not let
+    set_session_permission_mode's own persistence side effect flip an
+    already-ended registry row back to 'active'.
+
+    Which side actually wins this race is not deterministic (and not the
+    thing under test here) - SDKAdapter.set_session_permission_mode's own
+    CLIConnectionError catch (test_sdk_adapter.py's own dedicated race
+    test covers that directly) only guards the case where end_session's
+    disconnect() reaches the client first; it can't do anything about
+    set_session_permission_mode's own `session_id in _sessions` lookup
+    winning ahead of end_session's pop, in which case the live change
+    itself genuinely succeeds (a session that's about to end anyway
+    briefly changing mode first is harmless on its own). What must hold
+    regardless of which side wins is the one thing actually asserted
+    below: _persist_sdk_session_registry's own status=='ended' guard
+    (code-review finding, added alongside this test) stops that
+    successful change's persistence write - upsert_session sets
+    status='active' unconditionally by design, for the ordinary resume
+    path - from undoing end_session's own synchronous 'ended' write.
+    Both actions are sent back-to-back here, deliberately not
+    synchronized, to exercise whichever interleaving actually occurs."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action({"kind": "end_session", "session_id": session_id})
+        await phone.send_action(
+            {"kind": "set_session_permission_mode", "session_id": session_id, "permission_mode": "plan"}
+        )
+
+        try:
+            while True:
+                await phone.next_event(timeout=0.3)
+        except asyncio.TimeoutError:
+            pass
+
+        assert session_registry.get_session(session_id, daemon.session_registry_path).status == "ended"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_a_set_session_model_dispatched_right_after_end_session_cannot_resurrect_it(
+    running_daemon, phone_token
+):
+    """Model's counterpart to the permission-mode race test directly
+    above - see that test's docstring for the full race explanation,
+    including why only the final registry status (not which side won the
+    live-apply race) is asserted."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action({"kind": "end_session", "session_id": session_id})
+        await phone.send_action(
+            {"kind": "set_session_model", "session_id": session_id, "model": "claude-opus-5"}
+        )
+
+        try:
+            while True:
+                await phone.next_event(timeout=0.3)
+        except asyncio.TimeoutError:
+            pass
+
+        assert session_registry.get_session(session_id, daemon.session_registry_path).status == "ended"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
 async def test_catch_me_up_succeeds_for_a_fresh_session_after_a_restart(running_daemon, phone_token):
     """End-to-end regression test for the bug this plan exists to fix: a
     freshly-started (never-before-resumed) session's digest must succeed

@@ -12,10 +12,12 @@ real contract.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 from claude_agent_sdk import (
     AssistantMessage,
+    CLIConnectionError,
     RateLimitEvent,
     RateLimitInfo,
     ResultMessage,
@@ -60,6 +62,22 @@ class FakeSDKClient:
 
     async def disconnect(self) -> None:
         self.disconnected = True
+
+    async def set_permission_mode(self, mode: str) -> None:
+        # Mirrors the real ClaudeSDKClient: a control request against an
+        # already-disconnected client raises CLIConnectionError rather
+        # than silently no-op'ing - this is what lets
+        # test_set_session_permission_mode_returns_false_when_a_racing_end_session_already_disconnected_the_client
+        # below simulate that race deterministically, just by calling
+        # disconnect() directly instead of going through adapter.disconnect().
+        if self.disconnected:
+            raise CLIConnectionError("client is disconnected")
+        self.permission_mode = mode
+
+    async def set_model(self, model: str) -> None:
+        if self.disconnected:
+            raise CLIConnectionError("client is disconnected")
+        self.model = model
 
 
 _STOP = object()
@@ -261,44 +279,115 @@ async def test_connect_with_no_permission_mode_leaves_claude_agent_options_defau
 
 
 @pytest.mark.asyncio
-async def test_set_session_auto_approve_overrides_a_connected_sessions_state(adapter):
-    """set_session_auto_approve itself is untouched by U2 (slated for
-    replacement by set_session_permission_mode in a later unit) - connect()
-    no longer accepts auto_approve/llm_judge at all (replaced by
-    permission_mode), so this now establishes state via the override
-    method itself rather than seeding it at connect() time."""
+async def test_set_session_permission_mode_applies_live_and_emits_confirmation(adapter):
+    """R8/R9: applies via the SDK's own control-request mechanism
+    (session.client.set_permission_mode) - no reconnect, no fresh
+    session_started. Replaces set_session_auto_approve, which U1/U2 had
+    already made inert for tool-call behavior."""
     await adapter.connect("s1")
     event, gen = await _next_event(adapter, "s1")
     assert event.type == "session_started"
 
-    assert adapter.set_session_auto_approve("s1", auto_approve=True) is True
+    assert await adapter.set_session_permission_mode("s1", "plan") is True
+
+    client = adapter._test_clients["latest"]
+    assert client.permission_mode == "plan"
+    assert client.disconnected is False  # no reconnect
 
     confirm = await gen.__anext__()
-    assert confirm.type == "session_auto_approve"
-    assert confirm.data["auto_approve"] is True
-    assert confirm.data["llm_judge"] is False  # never set - defaults False, not an AttributeError
+    assert confirm.type == "session_permission_mode"
+    assert confirm.data["permission_mode"] == "plan"
 
 
 @pytest.mark.asyncio
-async def test_set_session_auto_approve_none_leaves_that_field_untouched(adapter):
+async def test_set_session_permission_mode_for_unknown_session_returns_false_without_raising(adapter):
+    assert await adapter.set_session_permission_mode("no-such-session", "plan") is False
+
+
+@pytest.mark.asyncio
+async def test_set_session_permission_mode_returns_false_when_a_racing_end_session_already_disconnected_the_client(
+    adapter, caplog
+):
+    """R9's own edge case: daemon.py dispatches every phone action as its
+    own unordered asyncio.create_task (see
+    test_a_second_action_dispatched_right_after_end_session_cannot_resurrect_it
+    in test_daemon.py for the analogous resurrection race) - a
+    concurrently-dispatched End Session can disconnect this session's
+    client before this control request reaches it. The real SDK surfaces
+    that as CLIConnectionError (our own `session_id in _sessions` lookup
+    above already succeeded, so it's not a KeyError) - this must be caught
+    and turned into a clean False with its own distinct log line, not left
+    to propagate into daemon.py's generic per-action exception logger,
+    which would log an indistinguishable crash.
+
+    Forcing the exact two-task interleaving that produces this race
+    non-deterministically would be flaky, so it's simulated directly here:
+    disconnect the underlying client without going through
+    adapter.disconnect() (which would also pop the session_id out of
+    _sessions and mask this specific code path behind the plain
+    unknown-session return above)."""
+    await adapter.connect("s1")
+    await _next_event(adapter, "s1")  # session_started
+
+    client = adapter._test_clients["latest"]
+    await client.disconnect()  # simulates a racing end_session's effect on the client only
+
+    with caplog.at_level(logging.INFO):
+        result = await adapter.set_session_permission_mode("s1", "plan")
+
+    assert result is False
+    assert "set_session_permission_mode" in caplog.text
+    assert "s1" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_set_session_model_applies_live_and_emits_confirmation(adapter):
+    """R10: model's counterpart to set_session_permission_mode above - no
+    disconnect, no session_started re-emit, just the live control request
+    plus a confirmation event."""
     await adapter.connect("s1")
     event, gen = await _next_event(adapter, "s1")
     assert event.type == "session_started"
 
-    adapter.set_session_auto_approve("s1", auto_approve=True, llm_judge=True)
-    await gen.__anext__()  # first session_auto_approve confirmation, establishing state
+    assert await adapter.set_session_model("s1", "claude-opus-5") is True
 
-    adapter.set_session_auto_approve("s1", auto_approve=None, llm_judge=False)
+    client = adapter._test_clients["latest"]
+    assert client.model == "claude-opus-5"
+    assert client.disconnected is False  # no reconnect
 
     confirm = await gen.__anext__()
-    assert confirm.type == "session_auto_approve"
-    assert confirm.data["auto_approve"] is True  # untouched
-    assert confirm.data["llm_judge"] is False
+    assert confirm.type == "session_model"
+    assert confirm.data["model"] == "claude-opus-5"
+
+    # No second session_started - nothing else should have been emitted
+    # in between session_started and this confirmation.
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(gen.__anext__(), timeout=0.05)
 
 
 @pytest.mark.asyncio
-async def test_set_session_auto_approve_for_unknown_session_returns_false_without_raising(adapter):
-    assert adapter.set_session_auto_approve("no-such-session", auto_approve=True) is False
+async def test_set_session_model_for_unknown_session_returns_false_without_raising(adapter):
+    assert await adapter.set_session_model("no-such-session", "claude-opus-5") is False
+
+
+@pytest.mark.asyncio
+async def test_set_session_model_returns_false_when_a_racing_end_session_already_disconnected_the_client(
+    adapter, caplog
+):
+    """Model's counterpart to the permission-mode race test above - see
+    that test's docstring for the full race explanation."""
+    await adapter.connect("s1")
+    await _next_event(adapter, "s1")  # session_started
+
+    client = adapter._test_clients["latest"]
+    await client.disconnect()
+
+    with caplog.at_level(logging.INFO):
+        result = await adapter.set_session_model("s1", "claude-opus-5")
+
+    assert result is False
+    assert "set_session_model" in caplog.text
+    assert "s1" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -666,14 +755,12 @@ def test_sdk_adapter_no_longer_uses_the_removed_approval_stack():
     and no more `from .. import auto_approve as approval_policy` (only a
     direct, still-needed `is_structured_question` import survives, for the
     untouched structured-question handling below in can_use_tool).
-    `auto_approve` as a bare word still appears elsewhere in this module
-    (set_session_auto_approve, unused for tool-call behavior since this
-    unit and slated for replacement by set_session_permission_mode in a
-    later one - connect()'s own former auto_approve/llm_judge kwargs and
-    session_started's echo of them are gone as of the permission-mode-
-    picker plan's U2) - none of that is in this unit's scope; only the
-    approval-stack calls actually reachable from can_use_tool are gone.
-    observe_adapter.py's own, separate use of auto_approve.py/judge_is_safe
+    `set_session_auto_approve` itself (unused for tool-call behavior since
+    this unit) is gone as of U3, replaced by set_session_permission_mode/
+    set_session_model - connect()'s own former auto_approve/llm_judge
+    kwargs and session_started's echo of them were already gone as of the
+    permission-mode-picker plan's U2. observe_adapter.py's own, separate
+    use of auto_approve.py/judge_is_safe
     (R11) is untouched - see test_observe_adapter.py's own unmodified suite
     for that coverage."""
     from companion.adapters import sdk_adapter

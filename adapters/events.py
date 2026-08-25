@@ -51,11 +51,24 @@ EVENT_TYPES = frozenset(
         # ("_observe_settings").
         "observe_settings",
         # Per-session auto_approve/llm_judge override confirmation
-        # (ObserveAdapter/SDKAdapter.set_session_auto_approve) - a real,
-        # scoped session_id, emitted whenever a phone-issued override
-        # changes a running session's own state independent of the
-        # adapter-wide default.
+        # (ObserveAdapter.set_session_auto_approve) - a real, scoped
+        # session_id, emitted whenever a phone-issued override changes a
+        # running session's own state independent of the adapter-wide
+        # default. Observed sessions only as of the permission-mode-picker
+        # plan's U3 - SDKAdapter's own set_session_auto_approve was
+        # replaced there by set_session_permission_mode/set_session_model
+        # below, since permission_mode/model are native-SDK concepts with
+        # no auto_approve/llm_judge equivalent left to override.
         "session_auto_approve",
+        # SDK-owned only (permission-mode-picker plan U3,
+        # SDKAdapter.set_session_permission_mode/set_session_model): a
+        # phone-issued live, no-reconnect change to a running session's
+        # permission mode or model, applied via the SDK's own
+        # control-request mechanism (session.client.set_permission_mode/
+        # set_model) - these confirm it took effect, mirroring
+        # session_auto_approve's shape for the SDK-owned equivalents.
+        "session_permission_mode",
+        "session_model",
         # SDK-owned only (SDKAdapter._Session._emit_context_usage): a
         # ClaudeSDKClient.get_context_usage() snapshot polled once per
         # completed turn - matches what the CLI's own /context command

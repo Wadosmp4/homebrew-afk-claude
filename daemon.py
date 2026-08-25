@@ -589,6 +589,32 @@ class CompanionDaemon:
                 adapter.set_session_auto_approve(
                     session_id, action.get("auto_approve"), action.get("llm_judge")
                 )
+            elif kind == "set_session_permission_mode":
+                # R8/R9: live, no-reconnect mode change - SDK-owned
+                # sessions only. Unlike set_session_auto_approve above,
+                # this has no ObserveAdapter equivalent to fall back to
+                # (permission_mode is a native-SDK concept; an observed
+                # session has no `client` of ours to send a control
+                # request to at all) - so it needs its own explicit guard
+                # rather than relying on both adapters sharing a method
+                # name. Persisted only on success (adapter.
+                # set_session_permission_mode already returned False, with
+                # its own distinct log, for an unknown session_id or a
+                # racing end_session) - this write is purely so a later
+                # companion-restart resume picks up the live change; it is
+                # not what applies it live.
+                if adapter is self.sdk_adapter:
+                    mode = action.get("permission_mode")
+                    if await adapter.set_session_permission_mode(session_id, mode):
+                        await self._persist_sdk_session_registry(session_id, permission_mode=mode)
+            elif kind == "set_session_model":
+                # R10: model's counterpart to set_session_permission_mode
+                # directly above - same guard, same persist-on-success-only
+                # shape.
+                if adapter is self.sdk_adapter:
+                    model = action.get("model")
+                    if await adapter.set_session_model(session_id, model):
+                        await self._persist_sdk_session_registry(session_id, model=model)
             else:
                 logger.warning("unknown action kind: %r", kind)
         except Exception:
@@ -960,20 +986,38 @@ class CompanionDaemon:
         text = await digest.generate_digest(events, api_client=api_client, env=self._effective_cli_env())
         adapter.emit_custom(session_id, "session_digest", available=text is not None, text=text)
 
-    async def _persist_sdk_session_registry(self, session_id: str, permission_mode: Optional[str]) -> None:
-        """None leaves permission_mode as it was already saved, same
-        convention set_session_auto_approve's own auto_approve/llm_judge
-        args used to follow.
+    async def _persist_sdk_session_registry(
+        self, session_id: str, *, model: Optional[str] = None, permission_mode: Optional[str] = None
+    ) -> None:
+        """None (the default) for either argument leaves that one field as
+        it was already saved, same convention set_session_auto_approve's
+        own auto_approve/llm_judge args used to follow - a mode-only change
+        must not clobber a model already on file (and vice versa), since
+        session_registry.upsert_session takes a full row, not a partial
+        update.
 
-        Permission-mode-picker plan (U2): currently has no caller -
-        set_session_auto_approve's own persistence hook into this method
-        was retired above (that action no longer has a meaningful
-        session_registry effect for an SDK-owned session, R7). Kept, with
-        its auto_approve/llm_judge fields swapped for permission_mode, for
-        a later unit's set_session_permission_mode/set_session_model to
-        call once a live mid-session change needs the same "durable for a
-        later restart resume, not what applies it live" persistence this
-        already provides for start_session/_try_resume_sdk_session."""
+        Permission-mode-picker plan (U3): called by the
+        set_session_permission_mode/set_session_model dispatch branches
+        above, on success only, purely so a later companion-restart resume
+        picks up the live change - this is not what applies either change
+        live (that's the direct session.client.set_permission_mode/
+        set_model call inside SDKAdapter itself).
+
+        R5/code-review finding: SDKAdapter.set_session_permission_mode/
+        set_session_model can still win their own race against a
+        concurrently-dispatched end_session (their CLIConnectionError
+        catch only covers the client already having been disconnected -
+        it says nothing about which of the two _sessions-lookups ran
+        first), successfully applying the change and returning True just
+        before end_session's disconnect() actually pops the session.
+        upsert_session always sets status='active' unconditionally (by
+        design, for the ordinary resume path), so without the status check
+        below, that legitimately-successful live change's own persistence
+        write could silently flip an end_session that raced ahead of it
+        (registry already marked 'ended', synchronously, before disconnect
+        - see end_session's own dispatch above) back to 'active' - the
+        exact silent resurrection R5 exists to prevent, just via a
+        different door than _try_resume_sdk_session's own status check."""
         cwd = self.sdk_adapter.get_cwd(session_id)
         if cwd is None:
             return  # shouldn't happen for a live SDK session, but never crash persistence over it
@@ -984,11 +1028,13 @@ class CompanionDaemon:
         # change's data with stale data.
         async with self._session_registry_lock:
             saved = await asyncio.to_thread(session_registry.get_session, session_id, self.session_registry_path)
+            if saved is not None and saved.status == "ended":
+                return
             await asyncio.to_thread(
                 session_registry.upsert_session,
                 session_id,
                 cwd=cwd,
-                model=saved.model if saved is not None else None,
+                model=model if model is not None else (saved.model if saved is not None else None),
                 permission_mode=(
                     permission_mode if permission_mode is not None else (saved.permission_mode if saved is not None else None)
                 ),

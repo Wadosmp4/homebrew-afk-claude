@@ -24,6 +24,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    CLIConnectionError,
     PermissionResultAllow,
     PermissionResultDeny,
     RateLimitEvent,
@@ -196,41 +197,57 @@ class SDKAdapter:
         session = self._get(session_id)
         await session.outbound.put("/compact")
 
-    def set_session_auto_approve(
-        self, session_id: str, auto_approve: Optional[bool] = None, llm_judge: Optional[bool] = None
-    ) -> bool:
-        """Override this one session's own auto_approve/llm_judge directly
-        - lets the phone turn auto-approval off (or on) for a session
-        already in progress, independent of whatever it was started with.
-        `None` for either argument leaves that one field untouched, same
-        convention as daemon.py's set_auto_approve_settings. Returns False
-        (no-op) for an unknown session_id.
+    async def set_session_permission_mode(self, session_id: str, mode: str) -> bool:
+        """R8/R9 (permission-mode-picker plan, U3): change this one
+        session's native permission mode live, mid-session, via the SDK's
+        own control-request mechanism - no reconnect, no fresh
+        ClaudeAgentOptions. Replaces the old set_session_auto_approve,
+        which this plan's U1/U2 had already made inert for tool-call
+        behavior (can_use_tool stopped reading auto_approve/llm_judge
+        entirely, and connect() stopped snapshotting either onto the
+        session). Returns False (no-op) for an unknown session_id, same
+        convention as every other method here.
 
-        Permission-mode-picker plan (U2): can_use_tool no longer reads
-        auto_approve/llm_judge at all (U1), and connect() no longer
-        snapshots either onto the session (replaced by permission_mode) -
-        this override is inert for tool-call behavior now, kept only so a
-        still-current phone build's existing overflow-menu toggle gets a
-        confirmation event back instead of a dropped action. Slated for
-        replacement by set_session_permission_mode in a later unit."""
+        A concurrently-dispatched end_session (daemon.py dispatches every
+        phone action as its own unordered asyncio.create_task) can
+        disconnect this session's client between our own `session_id in
+        _sessions` lookup and this control request actually reaching the
+        subprocess - the SDK surfaces that as CLIConnectionError, not a
+        KeyError, since the session_id lookup above already succeeded.
+        Caught here (not left to propagate into daemon.py's generic
+        per-action exception logger, which would log an indistinguishable
+        crash) and logged identifiably so a real crash still stands out."""
         session = self._sessions.get(session_id)
         if session is None:
             return False
-        if auto_approve is not None:
-            session.auto_approve = auto_approve
-        if llm_judge is not None:
-            session.llm_judge = llm_judge
-        # getattr, not session.auto_approve/session.llm_judge directly:
-        # connect() no longer initializes either field (see above), so a
-        # session where only one of the two has ever been set here (the
-        # other still None, "leave untouched") would otherwise have no
-        # attribute at all to read - this must not raise AttributeError
-        # just because a real phone toggled only one of its two switches.
-        session.emit(
-            "session_auto_approve",
-            auto_approve=getattr(session, "auto_approve", False),
-            llm_judge=getattr(session, "llm_judge", False),
-        )
+        try:
+            await session.client.set_permission_mode(mode)
+        except CLIConnectionError:
+            logger.info(
+                "set_session_permission_mode for %s raced a concurrent end_session and lost - client already disconnected",
+                session_id,
+            )
+            return False
+        session.emit("session_permission_mode", permission_mode=mode)
+        return True
+
+    async def set_session_model(self, session_id: str, model: str) -> bool:
+        """R10: model's counterpart to set_session_permission_mode above -
+        same live control-request mechanism (no reconnect), same
+        unknown-session/racing-end_session handling. See that method's
+        docstring for both."""
+        session = self._sessions.get(session_id)
+        if session is None:
+            return False
+        try:
+            await session.client.set_model(model)
+        except CLIConnectionError:
+            logger.info(
+                "set_session_model for %s raced a concurrent end_session and lost - client already disconnected",
+                session_id,
+            )
+            return False
+        session.emit("session_model", model=model)
         return True
 
     async def respond_to_permission(
