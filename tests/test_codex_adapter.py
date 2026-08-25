@@ -334,10 +334,13 @@ async def test_respond_to_permission_is_unsupported(adapter):
 
 
 @pytest.mark.asyncio
-async def test_set_session_auto_approve_returns_false_matching_the_protocols_bool_contract(adapter):
-    """Code-review fix: AdapterProtocol declares this -> bool (both real
-    conformers return a real bool); UnsupportedOperation violated that
-    contract - False is the correct "no-op" signal instead."""
+async def test_set_session_auto_approve_returns_false_not_unsupported_operation(adapter):
+    """Not part of AdapterProtocol (see base.py's own comment) - kept for
+    parity with ObserveAdapter's own method of this name. False is its
+    "no-op, nothing to apply" signal, matching ObserveAdapter's own
+    convention for an unknown session_id, rather than UnsupportedOperation
+    (there's no per-session auto_approve/llm_judge concept for Codex to
+    actually set, only the coarse, thread-level ApprovalMode)."""
     await adapter.connect("s1", cwd="/repo")
 
     result = adapter.set_session_auto_approve("s1", auto_approve=True)

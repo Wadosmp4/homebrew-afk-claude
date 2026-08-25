@@ -16,7 +16,18 @@ Methods `ObserveAdapter` implements as `UnsupportedOperation` (e.g.
 protocol rather than being split into a smaller required subset - that
 already-established "this adapter can't do that, and says so" precedent
 extends naturally to any future adapter with its own partial support
-(this plan's own `CodexAdapter` uses it too, for `respond_to_permission`)."""
+(this plan's own `CodexAdapter` uses it too, for `respond_to_permission`).
+
+`set_session_auto_approve` deliberately is NOT part of this protocol
+(permission-mode-picker plan, later than this one): `SDKAdapter` no
+longer implements it at all, since permission behavior for an SDK-owned
+session is now `set_session_permission_mode`/`set_session_model` instead
+(see daemon.py's own explicit `if adapter is self.observe_adapter:`
+guard around it, rather than dispatching through this protocol) - it's
+`ObserveAdapter`'s own separate, untouched auto-approve/AI-judge
+mechanism now, not a shared adapter capability. `ObserveAdapter` and
+`CodexAdapter` may still implement it themselves; the protocol just
+doesn't require it."""
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
@@ -56,10 +67,6 @@ class AdapterProtocol(Protocol):
     async def respond_to_permission(
         self, session_id: str, request_id: str, decision: str, *, message: str = ""
     ) -> Any: ...
-
-    def set_session_auto_approve(
-        self, session_id: str, auto_approve: Optional[bool] = None, llm_judge: Optional[bool] = None
-    ) -> bool: ...
 
     def get_cwd(self, session_id: str) -> Optional[str]: ...
 

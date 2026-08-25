@@ -210,10 +210,11 @@ class CodexAdapter:
     def set_session_auto_approve(
         self, session_id: str, auto_approve: Optional[bool] = None, llm_judge: Optional[bool] = None
     ) -> bool:
-        # Code-review fix: AdapterProtocol declares this -> bool (both real
-        # conformers, SDKAdapter and ObserveAdapter, return a real bool) -
-        # returning UnsupportedOperation here violated that contract. False
-        # is the same "no-op, nothing to apply" signal ObserveAdapter's own
+        # Not part of AdapterProtocol (see base.py's own comment - permission-
+        # mode-picker plan removed it from the shared interface once
+        # SDKAdapter stopped implementing it), kept here anyway for parity
+        # with ObserveAdapter's own method of this name. False is the same
+        # "no-op, nothing to apply" signal ObserveAdapter's own
         # set_session_auto_approve already uses for an unknown session_id;
         # there's no per-session auto_approve/llm_judge concept for Codex
         # to actually set (only the coarse, thread-level ApprovalMode).
