@@ -97,9 +97,18 @@ async def companion_token(relay):
 
 
 @pytest_asyncio.fixture
-async def phone_token(relay):
+async def phone_token(relay, companion_token):
     app, _port, _db_path = relay
-    _, token = auth.create_device(app.state.db, "phone")
+    # Relay Multi-Tenancy plan (011): broadcast_to_phones_for_account only
+    # reaches phones sharing the originating companion's own account_id -
+    # every test in this file predates multi-tenancy and assumes one
+    # companion/phone pair share a single "universe", so this phone must be
+    # minted into the SAME account as the companion_token fixture above
+    # (auth.create_device's own account_id param, per its docstring: "pass
+    # the vouching device's own account_id to inherit an existing pairing
+    # lineage"), not a fresh, unrelated one of its own.
+    companion_device = auth.authenticate(app.state.db, companion_token, expected_kind="companion")
+    _, token = auth.create_device(app.state.db, "phone", account_id=companion_device.account_id)
     return token
 
 
@@ -230,7 +239,11 @@ async def test_sdk_session_forwarding_resumes_after_relay_reconnect(tmp_path, pg
     db_path = pg_url
     app = create_app(db_path)
     companion_device_id, companion_token = auth.bootstrap_companion_device(app.state.db)
-    _, phone_token = auth.create_device(app.state.db, "phone")
+    # Relay Multi-Tenancy plan (011): see phone_token fixture's own comment
+    # above - this phone must share the companion's own account_id or it
+    # never receives that companion's broadcasts at all.
+    companion_device = auth.authenticate(app.state.db, companion_token, expected_kind="companion")
+    _, phone_token = auth.create_device(app.state.db, "phone", account_id=companion_device.account_id)
     port = _free_port()
 
     sdk_adapter, _fake_clients = _fake_sdk_adapter()
