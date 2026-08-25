@@ -60,7 +60,11 @@ _COMPOSE_SYSTEM_PROMPT = (
     "directory, and which agent it belongs to. Respond with a short bulleted "
     "overview, one bullet per session, each starting with the device and agent "
     "label, briefly stating what that session is doing or waiting on. Be "
-    "concrete, not generic. You cannot use any tools yourself; only answer."
+    "concrete, not generic. You cannot use any tools yourself; only answer.\n\n"
+    "Format the response in markdown, rendered on a phone screen: use an "
+    "actual markdown bullet list (one `- ` per session, not a run-on "
+    "sentence), wrap file/command/variable names in backticks, and use "
+    "**bold** sparingly for the one or two things that matter most."
 )
 
 QueryFn = Callable[..., Any]
