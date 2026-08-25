@@ -824,6 +824,41 @@ async def test_set_session_model_action_applies_live_and_persists_for_a_later_re
 
 
 @pytest.mark.asyncio
+async def test_set_session_auto_approve_is_a_noop_for_an_sdk_owned_session(running_daemon, phone_token):
+    """code-review finding: SDKAdapter no longer defines
+    set_session_auto_approve at all (replaced by set_session_permission_mode/
+    set_session_model above) - only ObserveAdapter still has it, for its own
+    separate, untouched mechanism (R11). Dispatching the legacy action
+    against an SDK-owned session must be a clean no-op (no confirmation
+    event, no crash) rather than an AttributeError caught by the generic
+    per-action exception logger - the connection must stay healthy for a
+    subsequent action afterward."""
+    daemon, port, fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action(
+            {"kind": "set_session_auto_approve", "session_id": session_id, "auto_approve": True}
+        )
+
+        # No confirmation event for the no-op dispatch - prove the
+        # connection is still healthy by sending a real action afterward
+        # and getting its own confirmation.
+        await phone.send_action(
+            {"kind": "set_session_model", "session_id": session_id, "model": "claude-opus-5"}
+        )
+        confirm = await phone.next_event()
+        assert confirm["type"] == "session_model"
+        assert confirm["data"]["model"] == "claude-opus-5"
+        assert fake_clients[0].disconnected is False
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
 async def test_set_session_permission_mode_and_set_session_model_are_a_noop_for_an_observed_session(
     running_daemon, phone_token
 ):

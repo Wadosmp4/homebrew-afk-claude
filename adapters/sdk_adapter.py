@@ -41,6 +41,15 @@ logger = logging.getLogger(__name__)
 
 ClientFactory = Callable[[ClaudeAgentOptions], Any]
 
+# code-review finding: set_session_permission_mode/set_session_model's own
+# control-request awaits had no bound - an unresponsive CLI subprocess would
+# hang the dispatching task forever, with no confirmation event and no
+# registry write, leaving the phone's own client-side optimistic-UI timeout
+# as the only thing that ever notices. Bounded the same way daemon.py's own
+# comparable awaits already are (e.g. _handle_session_start's setup-token
+# wait).
+_LIVE_CONTROL_REQUEST_TIMEOUT_SECONDS = 10.0
+
 
 class SDKAdapter:
     """Manages the SDK-owned sessions this companion process started.
@@ -221,12 +230,17 @@ class SDKAdapter:
         if session is None:
             return False
         try:
-            await session.client.set_permission_mode(mode)
+            await asyncio.wait_for(
+                session.client.set_permission_mode(mode), timeout=_LIVE_CONTROL_REQUEST_TIMEOUT_SECONDS
+            )
         except CLIConnectionError:
             logger.info(
                 "set_session_permission_mode for %s raced a concurrent end_session and lost - client already disconnected",
                 session_id,
             )
+            return False
+        except asyncio.TimeoutError:
+            logger.warning("set_session_permission_mode for %s timed out waiting on the CLI subprocess", session_id)
             return False
         session.emit("session_permission_mode", permission_mode=mode)
         return True
@@ -240,12 +254,15 @@ class SDKAdapter:
         if session is None:
             return False
         try:
-            await session.client.set_model(model)
+            await asyncio.wait_for(session.client.set_model(model), timeout=_LIVE_CONTROL_REQUEST_TIMEOUT_SECONDS)
         except CLIConnectionError:
             logger.info(
                 "set_session_model for %s raced a concurrent end_session and lost - client already disconnected",
                 session_id,
             )
+            return False
+        except asyncio.TimeoutError:
+            logger.warning("set_session_model for %s timed out waiting on the CLI subprocess", session_id)
             return False
         session.emit("session_model", model=model)
         return True

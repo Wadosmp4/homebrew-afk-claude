@@ -576,19 +576,18 @@ class CompanionDaemon:
                 # session_registry persistence side effect for an
                 # SDK-owned session is retired along with auto_approve/
                 # llm_judge as registry concepts (R7) - the action payload
-                # never carried a permission_mode to persist instead, and
-                # session.set_session_auto_approve's own effect on this
-                # session is already inert for tool-call behavior (U1).
-                # Still called for an observed session (untouched, R11) -
-                # ObserveAdapter's own, separate auto_approve/llm_judge
-                # mechanism has no session_registry equivalent at all, so
-                # dropping the persistence call here changes nothing for
-                # that path. This whole dispatch kind, and
-                # SDKAdapter.set_session_auto_approve, are replaced by
-                # set_session_permission_mode in a later unit.
-                adapter.set_session_auto_approve(
-                    session_id, action.get("auto_approve"), action.get("llm_judge")
-                )
+                # never carried a permission_mode to persist instead.
+                # code-review finding: SDKAdapter no longer defines
+                # set_session_auto_approve at all (U1/U3 replaced it with
+                # set_session_permission_mode/set_session_model) - only
+                # ObserveAdapter still has it, for its own separate,
+                # untouched auto_approve/llm_judge mechanism (R11). Guard
+                # explicitly rather than relying on both adapters sharing a
+                # method name, matching the two new sibling branches below.
+                if adapter is self.observe_adapter:
+                    adapter.set_session_auto_approve(
+                        session_id, action.get("auto_approve"), action.get("llm_judge")
+                    )
             elif kind == "set_session_permission_mode":
                 # R8/R9: live, no-reconnect mode change - SDK-owned
                 # sessions only. Unlike set_session_auto_approve above,
