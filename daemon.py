@@ -109,6 +109,11 @@ def _redact_secrets(value: Any, secrets: tuple[str, ...]) -> Any:
 # near-instant SDK-connect case elsewhere in this module.
 _SETUP_TOKEN_TIMEOUT_SECONDS = 90.0
 _VALID_ACCOUNTS = frozenset({"vscode", "personal"})
+# Codex Agent Integration plan (002), U2 (R10): Codex's own independent
+# account-mode allowlist. Deliberately a distinct frozenset from
+# _VALID_ACCOUNTS above, not a shared alias - the two agents' reject paths
+# must stay independent even though the values happen to read the same.
+_VALID_CODEX_ACCOUNTS = frozenset({"vscode", "personal"})
 # Multi-Agent Adapter plan (009), U1 (R2): which adapter start_session
 # routes a new session to. "claude_code" is the default so every existing
 # caller that doesn't send `agent` at all keeps landing on sdk_adapter,
@@ -441,10 +446,24 @@ class CompanionDaemon:
                     # per-tool-call approval concept (see codex_adapter.py's
                     # module docstring, spike-finding #2) - it runs under
                     # its own ApprovalMode.auto_review instead.
+                    #
+                    # U2 (PKTD3): api_key mirrors _effective_cli_env's own
+                    # active_account branch above, one level simpler - Codex
+                    # has no ambient-env-precedence-stripping concern to
+                    # replicate (KTD3), just "pass the configured personal
+                    # key under 'personal', pass nothing under 'vscode'".
+                    # Only ever reads codex_active_account/
+                    # codex_personal_api_key, never Claude's own
+                    # active_account/personal_oauth_token (R10).
                     await self.codex_adapter.connect(
                         session_id,
                         cwd=action.get("cwd"),
                         model=action.get("model"),
+                        api_key=(
+                            self.config.codex_personal_api_key
+                            if self.config.codex_active_account == "personal"
+                            else None
+                        ),
                     )
                 else:
                     await self.sdk_adapter.connect(
@@ -546,6 +565,14 @@ class CompanionDaemon:
 
         if kind == "start_personal_account_setup":
             await self._handle_start_personal_account_setup(ws)
+            return
+
+        if kind == "set_active_codex_account":
+            await self._handle_set_active_codex_account(ws, action.get("codex_active_account"))
+            return
+
+        if kind == "set_personal_codex_account_token":
+            await self._handle_set_personal_codex_account_token(ws, action.get("token"))
             return
 
         if kind == "compose_digest":
@@ -917,7 +944,16 @@ class CompanionDaemon:
         sessions launch under. Never reports personal_oauth_token's raw
         value (KTD4) - only whether it's configured, so the phone can show
         the "Custom auth token" option as available/unavailable without the
-        secret ever riding this response."""
+        secret ever riding this response.
+
+        Codex Agent Integration plan (002), U2 (R8): the same event now
+        also carries Codex's own, independent codex_active_account/
+        codex_personal_configured fields alongside Claude's - one wider
+        payload rather than a second event, since both describe the same
+        "what does this companion report as its account settings" moment
+        and the phone already re-fetches/re-renders this whole event on any
+        one change (R10: reads self.config.codex_* only, never
+        active_account/personal_oauth_token)."""
         event = {
             "session_id": "_account_settings",
             "event_id": 0,
@@ -926,6 +962,8 @@ class CompanionDaemon:
             "data": {
                 "active_account": self.config.active_account,
                 "personal_configured": self.config.personal_oauth_token is not None,
+                "codex_active_account": self.config.codex_active_account,
+                "codex_personal_configured": self.config.codex_personal_api_key is not None,
             },
         }
         await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
@@ -995,6 +1033,62 @@ class CompanionDaemon:
             "data": {"available": False},
         }
         await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
+
+    async def _handle_set_active_codex_account(
+        self, ws: "websockets.WebSocketClientProtocol", codex_active_account: Optional[str]
+    ) -> None:
+        """Codex Agent Integration plan (002), U2 (R9/R10): mirrors
+        _handle_set_active_account exactly, one level over - rejects an
+        unknown value, and rejects switching to "personal" before a
+        codex_personal_api_key exists, same reject-outright-but-still-
+        confirm-back convention. Only ever reads/writes
+        self.config.codex_active_account - never Claude's own
+        active_account (R10)."""
+        if codex_active_account is None:
+            logger.warning("set_active_codex_account action missing codex_active_account")
+            await self._handle_get_account_settings(ws)
+            return
+        if codex_active_account not in _VALID_CODEX_ACCOUNTS:
+            logger.warning(
+                "rejected set_active_codex_account %r: must be one of %r",
+                codex_active_account,
+                sorted(_VALID_CODEX_ACCOUNTS),
+            )
+            await self._handle_get_account_settings(ws)
+            return
+        if codex_active_account == "personal" and self.config.codex_personal_api_key is None:
+            logger.warning(
+                "rejected set_active_codex_account 'personal': no codex_personal_api_key configured yet"
+            )
+            await self._handle_get_account_settings(ws)
+            return
+        self.config.codex_active_account = codex_active_account
+        await asyncio.to_thread(save_config, self.config_path, self.config)
+        await self._handle_get_account_settings(ws)
+
+    async def _store_personal_codex_account_token(self, token: str) -> None:
+        """Codex's own persistence path, mirroring
+        _store_personal_account_token - only ever writes
+        self.config.codex_personal_api_key, never Claude's own
+        personal_oauth_token (R10). Unlike Claude's pair of callers, there
+        is no automated pty-capture flow to share this with: Codex has no
+        `claude setup-token`-equivalent CLI command to shell out to (see
+        _handle_start_personal_account_setup's own docstring) - a manual
+        paste is the only entry point."""
+        self.config.codex_personal_api_key = token
+        await asyncio.to_thread(save_config, self.config_path, self.config)
+
+    async def _handle_set_personal_codex_account_token(
+        self, ws: "websockets.WebSocketClientProtocol", token: Optional[str]
+    ) -> None:
+        """Codex's own manual-entry point, mirroring
+        _handle_set_personal_account_token."""
+        if token is None or not token.strip():
+            logger.warning("rejected set_personal_codex_account_token: empty or missing token")
+            await self._handle_get_account_settings(ws)
+            return
+        await self._store_personal_codex_account_token(token.strip())
+        await self._handle_get_account_settings(ws)
 
     async def _handle_git_status(self, adapter, session_id: str) -> None:
         """U10 (R16): computes git status for the session's cwd off the
@@ -1309,8 +1403,19 @@ class CompanionDaemon:
     def _secret_values(self) -> tuple[str, ...]:
         """KTD8: current secret values to redact from forwarded content -
         filters out personal_oauth_token when unset (None) rather than
-        passing an empty-string redaction target."""
-        return tuple(value for value in (self.config.device_token, self.config.personal_oauth_token) if value)
+        passing an empty-string redaction target. codex_personal_api_key
+        (U2) gets the same treatment - a Codex session's own forwarded
+        tool output is just as capable of echoing a configured secret back
+        verbatim as an SDK-owned Claude session is."""
+        return tuple(
+            value
+            for value in (
+                self.config.device_token,
+                self.config.personal_oauth_token,
+                self.config.codex_personal_api_key,
+            )
+            if value
+        )
 
     async def _send_event(self, ws: "websockets.WebSocketClientProtocol", event: Event) -> None:
         wire = event.to_dict()

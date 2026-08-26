@@ -2358,6 +2358,207 @@ async def test_run_setup_token_under_pty_times_out_on_a_hanging_process(tmp_path
     assert result is None
 
 
+# --- Codex Agent Integration plan (002), U2: Codex account settings -------
+
+
+@pytest.mark.asyncio
+async def test_get_account_settings_action_reports_codex_defaults_too(running_daemon, phone_token):
+    """R8: the same account_settings event now also carries Codex's own,
+    independent fields, alongside Claude's own (still present, unchanged)."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "get_account_settings"})
+
+        event = await phone.next_event()
+        assert event["type"] == "account_settings"
+        assert event["data"]["active_account"] == "vscode"
+        assert event["data"]["personal_configured"] is False
+        assert event["data"]["codex_active_account"] == "vscode"
+        assert event["data"]["codex_personal_configured"] is False
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_set_personal_codex_account_token_persists_and_reports_configured(running_daemon, phone_token):
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action(
+            {"kind": "set_personal_codex_account_token", "token": "sk-codex-test-token"}
+        )
+
+        confirm = await phone.next_event()
+        assert confirm["type"] == "account_settings"
+        assert confirm["data"]["codex_personal_configured"] is True
+        # The raw token value never rides this confirmation.
+        assert "token" not in confirm["data"]
+        assert daemon.config.codex_personal_api_key == "sk-codex-test-token"
+
+        persisted = load_config(daemon.config_path)
+        assert persisted.codex_personal_api_key == "sk-codex-test-token"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_set_personal_codex_account_token_rejects_empty_or_whitespace(running_daemon, phone_token):
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "set_personal_codex_account_token", "token": "   "})
+
+        confirm = await phone.next_event()
+        assert confirm["data"]["codex_personal_configured"] is False
+        assert daemon.config.codex_personal_api_key is None
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_set_active_codex_account_switches_once_a_token_is_configured(running_daemon, phone_token):
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action(
+            {"kind": "set_personal_codex_account_token", "token": "sk-codex-test-token"}
+        )
+        await phone.next_event()
+
+        await phone.send_action(
+            {"kind": "set_active_codex_account", "codex_active_account": "personal"}
+        )
+
+        confirm = await phone.next_event()
+        assert confirm["data"]["codex_active_account"] == "personal"
+        assert daemon.config.codex_active_account == "personal"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_set_active_codex_account_rejects_an_unknown_value(running_daemon, phone_token):
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "set_active_codex_account", "codex_active_account": "bogus"})
+
+        confirm = await phone.next_event()
+        assert confirm["data"]["codex_active_account"] == "vscode"
+        assert daemon.config.codex_active_account == "vscode"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_set_active_codex_account_rejects_personal_before_any_token_is_configured(
+    running_daemon, phone_token
+):
+    """Test scenario 1: mirrors
+    test_set_active_account_rejects_personal_before_any_token_is_configured
+    exactly, one level over."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "set_active_codex_account", "codex_active_account": "personal"})
+
+        confirm = await phone.next_event()
+        assert confirm["data"]["codex_active_account"] == "vscode"
+        assert daemon.config.codex_active_account == "vscode"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_setting_codexs_personal_token_and_active_account_leaves_claudes_own_account_untouched(
+    running_daemon, phone_token
+):
+    """Test scenario 2 (AE4/R10), half A: configuring and switching Codex's
+    account must never write to Claude's own active_account/
+    personal_oauth_token fields."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action(
+            {"kind": "set_personal_codex_account_token", "token": "sk-codex-test-token"}
+        )
+        await phone.next_event()
+        await phone.send_action(
+            {"kind": "set_active_codex_account", "codex_active_account": "personal"}
+        )
+        await phone.next_event()
+
+        assert daemon.config.codex_active_account == "personal"
+        assert daemon.config.codex_personal_api_key == "sk-codex-test-token"
+        assert daemon.config.active_account == "vscode"
+        assert daemon.config.personal_oauth_token is None
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_setting_claudes_personal_token_and_active_account_leaves_codexs_own_account_untouched(
+    running_daemon, phone_token
+):
+    """Test scenario 2 (AE4/R10), half B: the reverse direction - Claude's
+    own existing account-switch actions must never write to Codex's
+    codex_active_account/codex_personal_api_key fields."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "set_personal_account_token", "token": "sk-ant-oat-test-token"})
+        await phone.next_event()
+        await phone.send_action({"kind": "set_active_account", "active_account": "personal"})
+        await phone.next_event()
+
+        assert daemon.config.active_account == "personal"
+        assert daemon.config.personal_oauth_token == "sk-ant-oat-test-token"
+        assert daemon.config.codex_active_account == "vscode"
+        assert daemon.config.codex_personal_api_key is None
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_start_session_codex_branch_passes_the_configured_personal_api_key(
+    running_daemon_with_codex, phone_token
+):
+    """PKTD3: when codex_active_account is "personal", start_session's
+    codex_adapter.connect call must pass the configured
+    codex_personal_api_key through."""
+    daemon, port, _fake_sdk_clients, fake_codex_clients = running_daemon_with_codex
+    daemon.config.codex_active_account = "personal"
+    daemon.config.codex_personal_api_key = "sk-codex-personal-test"
+
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo", "agent": "codex"})
+        await phone.next_event()  # session_started
+
+        assert fake_codex_clients[0].logged_in_with == "sk-codex-personal-test"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_start_session_codex_branch_passes_no_api_key_under_vscode_mode(
+    running_daemon_with_codex, phone_token
+):
+    """PKTD3: the default "vscode" mode must reach codex_adapter.connect
+    with no api_key at all - today's implicit-default behavior, unchanged."""
+    daemon, port, _fake_sdk_clients, fake_codex_clients = running_daemon_with_codex
+
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo", "agent": "codex"})
+        await phone.next_event()  # session_started
+
+        assert fake_codex_clients[0].logged_in_with is None
+    finally:
+        await phone.close()
+
+
 # --- U3: active-account-aware cli_env for new session spawns ---
 
 

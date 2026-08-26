@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from collections.abc import AsyncIterator
 from typing import Any, Callable, Optional
 
@@ -107,7 +106,22 @@ class CodexAdapter:
     def discover_sessions(self) -> list[str]:
         return list(self._sessions)
 
-    async def connect(self, session_id: str, *, cwd: Optional[str] = None, model: Optional[str] = None) -> None:
+    async def connect(
+        self,
+        session_id: str,
+        *,
+        cwd: Optional[str] = None,
+        model: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ) -> None:
+        """Codex Agent Integration plan (002), U2 (PKTD3): `api_key` is now
+        an explicit, caller-resolved value rather than this adapter reading
+        OPENAI_API_KEY out of its own process environment - the daemon is
+        the one place that knows whether codex_active_account is "personal"
+        (pass the configured codex_personal_api_key) or "vscode" (pass
+        nothing, the default). Omitting it entirely keeps today's
+        implicit-default "vscode" behavior - skip login_api_key() and let
+        the ambient CLI/SDK login resolve itself, exactly as before."""
         from openai_codex import ApprovalMode, AsyncCodex
 
         client = self._client_factory() if self._client_factory is not None else AsyncCodex()
@@ -116,7 +130,6 @@ class CodexAdapter:
         # to close it otherwise, since it's never stored until the
         # _CodexSession below is actually created.
         try:
-            api_key = os.environ.get("OPENAI_API_KEY")
             if api_key:
                 await client.login_api_key(api_key)
             resolved_cwd = cwd or self._cwd

@@ -349,10 +349,13 @@ async def test_set_session_auto_approve_returns_false_not_unsupported_operation(
 
 
 @pytest.mark.asyncio
-async def test_connect_logs_in_with_an_api_key_when_one_is_configured(adapter, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-test")
-
-    await adapter.connect("s1", cwd="/repo")
+async def test_connect_logs_in_with_an_api_key_when_one_is_configured(adapter):
+    """Codex Agent Integration plan (002), U2 (PKTD3): connect() now takes
+    an explicit, caller-resolved api_key instead of reading OPENAI_API_KEY
+    out of this process's own environment - the daemon is the one place
+    that resolves codex_active_account/codex_personal_api_key into this
+    parameter (personal mode: test scenario 4)."""
+    await adapter.connect("s1", cwd="/repo", api_key="sk-codex-test")
 
     client = adapter._test_clients["latest"]
     assert client.logged_in_with == "sk-codex-test"
@@ -360,7 +363,20 @@ async def test_connect_logs_in_with_an_api_key_when_one_is_configured(adapter, m
 
 @pytest.mark.asyncio
 async def test_connect_skips_login_with_no_api_key_configured(adapter):
+    """"vscode" mode (test scenario 3): no api_key passed at all means
+    login_api_key is never called - the default, unchanged behavior."""
     await adapter.connect("s1", cwd="/repo")
+
+    client = adapter._test_clients["latest"]
+    assert client.logged_in_with is None
+
+
+@pytest.mark.asyncio
+async def test_connect_skips_login_when_api_key_is_explicitly_none(adapter):
+    """Same as the no-argument case above, but for a caller (the daemon,
+    under "vscode" mode) that passes api_key=None explicitly rather than
+    omitting it - both must be equally inert."""
+    await adapter.connect("s1", cwd="/repo", api_key=None)
 
     client = adapter._test_clients["latest"]
     assert client.logged_in_with is None
