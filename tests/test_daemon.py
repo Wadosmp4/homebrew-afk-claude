@@ -25,11 +25,13 @@ import pytest_asyncio
 import uvicorn
 import websockets
 
+from companion.adapters.codex_adapter import CodexAdapter
 from companion.adapters.observe_adapter import KNOWN_ENTRYPOINTS, ObserveAdapter
 from companion.adapters.sdk_adapter import SDKAdapter
 from companion.config import CompanionConfig, load_config
 from companion.daemon import CompanionDaemon
 from companion import session_registry
+from companion.tests.test_codex_adapter import FakeCodexClient
 from companion.tests.test_sdk_adapter import _STOP, FakeSDKClient
 from relay import auth
 from relay.app import create_app
@@ -143,6 +145,20 @@ def _fake_sdk_adapter() -> tuple[SDKAdapter, dict[str, FakeSDKClient]]:
         return client
 
     return SDKAdapter(client_factory=factory), clients
+
+
+def _fake_codex_adapter() -> tuple[CodexAdapter, dict[str, FakeCodexClient]]:
+    """Mirrors _fake_sdk_adapter above, one level down - CodexAdapter's own
+    injection point (client_factory) stands in for AsyncCodex, per
+    test_codex_adapter.py's own FakeCodexClient convention."""
+    clients: dict[str, FakeCodexClient] = {}
+
+    def factory():
+        client = FakeCodexClient()
+        clients[len(clients)] = client
+        return client
+
+    return CodexAdapter(client_factory=factory), clients
 
 
 async def _stop_daemon(daemon: CompanionDaemon, task: asyncio.Task) -> None:
@@ -365,6 +381,30 @@ async def running_daemon(relay, companion_token, tmp_path):
     await _stop_daemon(daemon, task)
 
 
+@pytest_asyncio.fixture
+async def running_daemon_with_codex(relay, companion_token, tmp_path):
+    """Multi-Agent Adapter plan (009), U1: same shape as running_daemon
+    above, plus a fake-backed CodexAdapter so agent-routing tests can
+    assert against both adapters without either spawning a real `claude`
+    subprocess or a real Codex client/network call."""
+    _app, port, _db_path = relay
+    sdk_adapter, fake_sdk_clients = _fake_sdk_adapter()
+    codex_adapter, fake_codex_clients = _fake_codex_adapter()
+    daemon = CompanionDaemon(
+        _fast_config(port, companion_token),
+        sdk_adapter=sdk_adapter,
+        observe_adapter=_test_observe_adapter(tmp_path),
+        codex_adapter=codex_adapter,
+        recents_path=str(tmp_path / "recent_projects.json"),
+        config_path=str(tmp_path / "companion_config.json"),
+        session_registry_path=str(tmp_path / "session_registry.db"),
+    )
+    task = asyncio.create_task(daemon.run())
+    await _wait_until(lambda: daemon.state == "connected")
+    yield daemon, port, fake_sdk_clients, fake_codex_clients
+    await _stop_daemon(daemon, task)
+
+
 @pytest.mark.asyncio
 async def test_start_session_action_creates_sdk_session_and_forwards_session_started(
     running_daemon, phone_token
@@ -433,6 +473,139 @@ async def test_start_session_action_with_no_permission_mode_leaves_it_unset(runn
         assert event["type"] == "session_started"
         assert event["data"]["permission_mode"] is None
         assert fake_clients[0].options.permission_mode is None
+    finally:
+        await phone.close()
+
+
+# --- Multi-Agent Adapter plan (009), U1: start_session's `agent` routing --
+
+
+@pytest.mark.asyncio
+async def test_start_session_action_with_agent_codex_routes_to_the_codex_adapter(
+    running_daemon_with_codex, phone_token
+):
+    """R1/R2: an explicit agent: "codex" must reach codex_adapter.connect,
+    never sdk_adapter.connect - and the resulting session must be
+    discoverable via _adapter_for (the same registry lookup every other
+    action - send_message, interrupt, etc. - depends on to find its
+    owning adapter)."""
+    daemon, port, fake_sdk_clients, fake_codex_clients = running_daemon_with_codex
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo", "agent": "codex"})
+
+        event = await phone.next_event()
+        assert event["type"] == "session_started"
+        assert event["data"]["agent"] == "codex"
+        session_id = event["session_id"]
+
+        assert not fake_sdk_clients  # sdk_adapter.connect was never called
+        assert len(fake_codex_clients) == 1
+        assert daemon.codex_adapter.discover_sessions() == [session_id]
+        assert daemon._adapter_for(session_id) is daemon.codex_adapter
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_start_session_action_with_agent_claude_code_or_omitted_is_unchanged(
+    running_daemon_with_codex, phone_token
+):
+    """R2 regression: today's default behavior (agent omitted, or sent
+    explicitly as "claude_code") must still route to sdk_adapter exactly as
+    it did before this field existed, and must never touch codex_adapter at
+    all."""
+    daemon, port, fake_sdk_clients, fake_codex_clients = running_daemon_with_codex
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        event = await phone.next_event()
+        assert event["type"] == "session_started"
+        assert event["data"].get("agent", "claude_code") == "claude_code"
+        session_id = event["session_id"]
+        assert daemon.sdk_adapter.discover_sessions() == [session_id]
+        assert daemon._adapter_for(session_id) is daemon.sdk_adapter
+
+        await phone.send_action(
+            {"kind": "start_session", "cwd": "/tmp/some-repo", "agent": "claude_code"}
+        )
+        event2 = await phone.next_event()
+        assert event2["type"] == "session_started"
+
+        assert len(fake_sdk_clients) == 2
+        assert not fake_codex_clients  # codex_adapter.connect was never called
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_start_session_action_with_unknown_agent_is_rejected(running_daemon_with_codex, phone_token):
+    """R2: an unrecognized agent value is rejected outright - no session
+    created on either adapter, and (since start_session has no dedicated
+    confirm-back event) no event reaches the phone at all."""
+    daemon, port, fake_sdk_clients, fake_codex_clients = running_daemon_with_codex
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo", "agent": "gemini"})
+
+        with pytest.raises(asyncio.TimeoutError):
+            await phone.next_event(timeout=0.3)
+
+        assert daemon.sdk_adapter.discover_sessions() == []
+        assert daemon.codex_adapter.discover_sessions() == []
+        assert not fake_sdk_clients
+        assert not fake_codex_clients
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_send_message_on_a_live_codex_session_streams_events_back_to_the_phone(
+    running_daemon_with_codex, phone_token
+):
+    """R3/AE2: a Codex-owned session must forward events through the same
+    _spawn_forwarder path an SDK-owned one already uses - proven here with
+    a real openai_codex notification/item shape (mirroring
+    test_codex_adapter.py's own tool_call coverage), not just a
+    connect()-level assertion."""
+    from openai_codex.generated.v2_all import (
+        CommandExecutionStatus,
+        CommandExecutionThreadItem,
+        ThreadItem,
+    )
+    from openai_codex.models import ItemStartedNotification
+
+    daemon, port, _fake_sdk_clients, fake_codex_clients = running_daemon_with_codex
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo", "agent": "codex"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action({"kind": "send_message", "session_id": session_id, "text": "run the tests"})
+        user_message_event = await phone.next_event()
+        assert user_message_event["type"] == "user_message"
+        assert user_message_event["data"]["text"] == "run the tests"
+        assert user_message_event["session_id"] == session_id
+
+        turn_handle = fake_codex_clients[0].threads[0].turns[0]
+        item = CommandExecutionThreadItem(
+            id="item-1",
+            command="pytest",
+            commandActions=[],
+            cwd="/tmp/some-repo",
+            status=CommandExecutionStatus.in_progress,
+            type="commandExecution",
+        )
+        turn_handle.push(
+            ItemStartedNotification(item=ThreadItem(item), startedAtMs=0, threadId="t1", turnId="turn-1")
+        )
+
+        tool_call_event = await asyncio.wait_for(phone.next_event(), timeout=2)
+        assert tool_call_event["type"] == "tool_call"
+        assert tool_call_event["data"]["tool"] == "Bash"
+        assert tool_call_event["data"]["tool_use_id"] == "item-1"
+        assert tool_call_event["session_id"] == session_id
     finally:
         await phone.close()
 
@@ -2744,10 +2917,14 @@ async def test_read_session_history_redacts_secrets_from_the_replayed_transcript
 # --- Multi-Agent Adapter plan (009), U2: registry-based dispatch -------
 
 
-def test_adapters_registry_holds_both_named_adapters_in_the_original_order(tmp_path):
+def test_adapters_registry_holds_all_three_named_adapters_in_the_original_order(tmp_path):
+    """Multi-Agent Adapter plan (009), U1 (R1): codex_adapter joins the
+    registry as the third member, appended after sdk_adapter/observe_adapter
+    - existing short-circuit order (SDK-owned sessions resolve before
+    observed ones) is preserved, Codex-owned ones resolve last."""
     daemon = _bare_daemon(tmp_path)
 
-    assert daemon.adapters == [daemon.sdk_adapter, daemon.observe_adapter]
+    assert daemon.adapters == [daemon.sdk_adapter, daemon.observe_adapter, daemon.codex_adapter]
 
 
 @pytest.mark.asyncio

@@ -55,6 +55,7 @@ import websockets
 
 from . import digest, git_status, history, projects, session_registry
 from .adapters.base import AdapterProtocol
+from .adapters.codex_adapter import CodexAdapter
 from .adapters.events import Event
 from .adapters.observe_adapter import KNOWN_ENTRYPOINTS, ObserveAdapter
 from .adapters.sdk_adapter import SDKAdapter
@@ -108,6 +109,11 @@ def _redact_secrets(value: Any, secrets: tuple[str, ...]) -> Any:
 # near-instant SDK-connect case elsewhere in this module.
 _SETUP_TOKEN_TIMEOUT_SECONDS = 90.0
 _VALID_ACCOUNTS = frozenset({"vscode", "personal"})
+# Multi-Agent Adapter plan (009), U1 (R2): which adapter start_session
+# routes a new session to. "claude_code" is the default so every existing
+# caller that doesn't send `agent` at all keeps landing on sdk_adapter,
+# byte-for-byte unchanged from before this field existed.
+_VALID_AGENTS = frozenset({"claude_code", "codex"})
 
 # KTD4: set_personal_account_token's raw pasted token rides straight in the
 # action dict - _handle_action's generic exception logger (below) logs the
@@ -224,13 +230,13 @@ def _is_valid_remote_cli_path(cli_path: str) -> bool:
 
 class CompanionDaemon:
     """Owns one persistent (reconnecting) connection to the relay, plus the
-    SDK-owned and observe-only adapters that connection's actions/events
-    flow through.
+    SDK-owned, observe-only, and Codex-owned adapters that connection's
+    actions/events flow through.
 
-    `sdk_adapter`/`observe_adapter` are injectable so tests can substitute
-    fakes (mirroring each adapter's own `client_factory` injection point)
-    without spawning a real `claude` subprocess or touching the real
-    `~/.claude/projects` / hooks socket paths.
+    `sdk_adapter`/`observe_adapter`/`codex_adapter` are injectable so tests
+    can substitute fakes (mirroring each adapter's own `client_factory`
+    injection point) without spawning a real `claude`/Codex subprocess or
+    touching the real `~/.claude/projects` / hooks socket paths.
     """
 
     def __init__(
@@ -239,6 +245,7 @@ class CompanionDaemon:
         *,
         sdk_adapter: Optional[SDKAdapter] = None,
         observe_adapter: Optional[ObserveAdapter] = None,
+        codex_adapter: Optional[CodexAdapter] = None,
         recents_path: Optional[str] = None,
         config_path: Optional[str] = None,
         session_registry_path: Optional[str] = None,
@@ -251,6 +258,11 @@ class CompanionDaemon:
             auto_approve=config.observe_auto_approve,
             llm_judge=config.observe_llm_judge,
         )
+        # Multi-Agent Adapter plan (009), U1: the third adapter this
+        # registry was always meant to grow into (see U2's comment below) -
+        # CodexAdapter finally goes live here, wired into start_session's
+        # dispatch (below) rather than sitting orphaned.
+        self.codex_adapter = codex_adapter or CodexAdapter()
         # Multi-Agent Adapter plan (009), U2: dispatch/lookup/broadcast call
         # sites iterate this registry instead of naming self.sdk_adapter/
         # self.observe_adapter directly, so adding a third adapter (e.g.
@@ -259,7 +271,7 @@ class CompanionDaemon:
         # Claude-Code-specific adapter" (persistence gated on `adapter is
         # self.sdk_adapter`, observe-only settings actions, etc.), which
         # this plan deliberately leaves untouched (KTD2).
-        self.adapters: list[AdapterProtocol] = [self.sdk_adapter, self.observe_adapter]
+        self.adapters: list[AdapterProtocol] = [self.sdk_adapter, self.observe_adapter, self.codex_adapter]
         # Injectable for the same reason as the adapters above: tests must
         # never write into the developer's real recent-projects file
         # (projects.DEFAULT_RECENTS_PATH) just by exercising start_session.
@@ -405,28 +417,56 @@ class CompanionDaemon:
         kind = action.get("kind")
 
         if kind == "start_session":
-            session_id = str(uuid4())
-            try:
-                await self.sdk_adapter.connect(
-                    session_id,
-                    cwd=action.get("cwd"),
-                    model=action.get("model"),
-                    permission_mode=action.get("permission_mode"),
-                    # Unlike model/permission_mode above, cli_path/cli_env
-                    # (KTD5) are Mac-level settings with no phone-side
-                    # per-request equivalent - always sourced from this
-                    # companion's own config, never the action payload.
-                    # cli_env goes through _effective_cli_env (R2/KTD1/
-                    # KTD3), not the raw config field, so a "personal"-
-                    # identity spawn gets CLAUDE_CODE_OAUTH_TOKEN merged in.
-                    cli_path=self.config.cli_path,
-                    cli_env=self._effective_cli_env(),
+            # Multi-Agent Adapter plan (009), U1 (R2): "claude_code" default
+            # keeps every pre-existing caller (nothing sends `agent` yet)
+            # routed to sdk_adapter exactly as before - only an explicit
+            # "codex" opts into the new adapter. An unrecognized value is
+            # rejected outright (logged, no session created), mirroring
+            # _handle_set_active_account's own reject-unknown-value
+            # convention below - there's no start_session-specific confirm-
+            # back event to reply on, so silently declining to create a
+            # session (like the missing-session_id case elsewhere in this
+            # method) is the equivalent "reply".
+            agent = action.get("agent") or "claude_code"
+            if agent not in _VALID_AGENTS:
+                logger.warning(
+                    "rejected start_session agent %r: must be one of %r", agent, sorted(_VALID_AGENTS)
                 )
+                return
+            session_id = str(uuid4())
+            adapter: AdapterProtocol = self.codex_adapter if agent == "codex" else self.sdk_adapter
+            try:
+                if agent == "codex":
+                    # No permission_mode: Codex has no interactive
+                    # per-tool-call approval concept (see codex_adapter.py's
+                    # module docstring, spike-finding #2) - it runs under
+                    # its own ApprovalMode.auto_review instead.
+                    await self.codex_adapter.connect(
+                        session_id,
+                        cwd=action.get("cwd"),
+                        model=action.get("model"),
+                    )
+                else:
+                    await self.sdk_adapter.connect(
+                        session_id,
+                        cwd=action.get("cwd"),
+                        model=action.get("model"),
+                        permission_mode=action.get("permission_mode"),
+                        # Unlike model/permission_mode above, cli_path/cli_env
+                        # (KTD5) are Mac-level settings with no phone-side
+                        # per-request equivalent - always sourced from this
+                        # companion's own config, never the action payload.
+                        # cli_env goes through _effective_cli_env (R2/KTD1/
+                        # KTD3), not the raw config field, so a "personal"-
+                        # identity spawn gets CLAUDE_CODE_OAUTH_TOKEN merged in.
+                        cli_path=self.config.cli_path,
+                        cli_env=self._effective_cli_env(),
+                    )
             except Exception:
                 logger.exception("start_session failed for action %r", action)
                 return
-            self._spawn_forwarder(ws, self.sdk_adapter, session_id)
-            resolved_cwd = self.sdk_adapter.get_cwd(session_id)
+            self._spawn_forwarder(ws, adapter, session_id)
+            resolved_cwd = adapter.get_cwd(session_id)
             if resolved_cwd:
                 async with self._recents_lock:
                     await asyncio.to_thread(projects.record_recent, resolved_cwd, self.recents_path)
