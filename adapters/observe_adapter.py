@@ -41,7 +41,7 @@ import re
 import stat
 import time
 from collections.abc import AsyncIterator
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
@@ -373,10 +373,39 @@ class ObserveAdapter:
         """The synchronous glob half of the watch loop, run off the event
         loop via asyncio.to_thread by the caller - see _watch_projects_dir.
         Returns (path, agent) pairs from both watched roots, Claude first
-        (matches prior ordering/behavior for that root exactly)."""
+        (matches prior ordering/behavior for that root exactly).
+
+        Efficiency fix (simplify pass): unlike projects_dir (bounded by the
+        number of distinct project checkouts), codex_sessions_dir is
+        nested by calendar date and never pruned - every day this feature
+        has ever been used adds another leaf directory. A plain `*/*/*/`
+        glob would re-walk that entire history on every 1s poll tick
+        forever, even though anything from a date directory older than
+        _stale_after_seconds is guaranteed to be rejected as stale by
+        _check_transcript_eligibility anyway. Only glob the date
+        directories that could plausibly still be within that window."""
         claude = [(p, "claude") for p in sorted(self.projects_dir.glob("*/*.jsonl"))]
-        codex = [(p, "codex") for p in sorted(self.codex_sessions_dir.glob("*/*/*/rollout-*.jsonl"))]
+        codex = [
+            (p, "codex")
+            for date_dir in self._codex_candidate_date_dirs()
+            for p in sorted(date_dir.glob("rollout-*.jsonl"))
+        ]
         return claude + codex
+
+    def _codex_candidate_date_dirs(self) -> list[Path]:
+        """The YYYY/MM/DD directories under codex_sessions_dir that could
+        still hold a non-stale transcript, per _list_candidate_transcripts'
+        own comment - today's plus enough trailing days to cover
+        _stale_after_seconds (with a one-day safety margin), so a longer-
+        than-default staleness window never silently drops a directory
+        that's still eligible."""
+        days_back = int(self._stale_after_seconds // 86400) + 2
+        today = datetime.now().date()
+        return [
+            self.codex_sessions_dir / day.strftime("%Y") / day.strftime("%m") / day.strftime("%d")
+            for offset in range(days_back)
+            for day in [today - timedelta(days=offset)]
+        ]
 
     def _check_transcript_eligibility(self, path: Path, agent: str = "claude") -> Optional[str]:
         """The synchronous (stat + bounded file read) half of deciding
@@ -415,9 +444,9 @@ class ObserveAdapter:
                 initial_offset = path.stat().st_size
             except OSError:
                 initial_offset = 0
-        session.tail_task = asyncio.create_task(self._tail_file(path, session, initial_offset, agent=agent))
+        session.tail_task = asyncio.create_task(self._tail_file(path, session, initial_offset))
 
-    async def _tail_file(self, path: Path, session: "_ObserveSession", offset: int = 0, *, agent: str = "claude") -> None:
+    async def _tail_file(self, path: Path, session: "_ObserveSession", offset: int = 0) -> None:
         pending = b""
         try:
             while True:
@@ -430,7 +459,7 @@ class ObserveAdapter:
                     while b"\n" in pending:
                         line, pending = pending.split(b"\n", 1)
                         if line.strip():
-                            self._normalize_line(session, line, agent)
+                            self._normalize_line(session, line)
                 await asyncio.sleep(self._tail_poll_interval)
         except asyncio.CancelledError:
             raise
@@ -438,13 +467,17 @@ class ObserveAdapter:
             logger.warning("transcript tail for %s failed: %s", session.session_id, exc)
             session.emit("error", message=str(exc))
 
-    def _normalize_line(self, session: "_ObserveSession", raw_line: bytes, agent: str = "claude") -> None:
+    def _normalize_line(self, session: "_ObserveSession", raw_line: bytes) -> None:
         try:
             entry = json.loads(raw_line.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             return
 
-        if agent == "codex":
+        # Simplify pass: reads session.agent directly rather than a second
+        # explicit `agent` parameter - session.agent was already set (to
+        # this same value) one call earlier, at the point this session was
+        # first discovered (see _get_or_create's own agent param).
+        if session.agent == "codex":
             self._normalize_codex_line(session, entry)
             return
 
@@ -550,6 +583,14 @@ class ObserveAdapter:
                 "tool_result",
                 tool_use_id=call_id,
                 content=truncate_tool_result_content(payload.get("output")),
+                # Unlike the Claude-transcript branch above (which reads a
+                # real is_error field off its own entry shape),
+                # function_call_output's actual rollout payload wasn't
+                # hands-on confirmed to carry an equivalent success/failure
+                # signal (see this method's own docstring) - always
+                # reporting success here is a known gap, not a verified
+                # "never fails", until a real transcript confirms whether
+                # one exists to read.
                 is_error=False,
                 duration_ms=duration_ms,
             )
