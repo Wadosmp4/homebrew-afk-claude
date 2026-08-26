@@ -1041,3 +1041,183 @@ async def test_set_session_auto_approve_emits_a_confirmation_event_once_opened(a
     assert confirm.type == "session_auto_approve"
     assert confirm.data["auto_approve"] is True
     assert confirm.data["llm_judge"] is True
+
+
+# --- U6 (Codex agent integration plan): observe-only Codex discovery -------
+#
+# A Codex session started outside the app (e.g. in a terminal) writes its
+# transcript to ~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl
+# - structurally analogous to Claude Code's own ~/.claude/projects/*/*.jsonl,
+# one directory level deeper for the year/month/day nesting. These tests use
+# the same tmp_path fixture-directory-injection convention as the
+# projects_dir tests above, via the new codex_sessions_dir constructor param.
+
+
+@pytest.mark.asyncio
+async def test_discovers_a_codex_rollout_transcript_and_tags_it_agent_codex(tmp_path):
+    """R12/KTD5: an externally-started Codex session is discoverable the
+    same way an externally-started Claude Code session already is - surfaced
+    by discover_sessions() and tagged agent="codex" on its session_started
+    event, mirroring how the live CodexAdapter tags its own sessions (see
+    codex_adapter.py), for consistency with the mobile agent badge that
+    reads this field."""
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    codex_sessions_dir = tmp_path / "codex-sessions"
+    day_dir = codex_sessions_dir / "2026" / "08" / "26"
+    day_dir.mkdir(parents=True)
+    transcript = day_dir / "rollout-2026-08-26T12-00-00-abc123.jsonl"
+    transcript.touch()
+
+    a = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        codex_sessions_dir=str(codex_sessions_dir),
+        socket_path=_short_socket_path(),
+        watch_poll_interval=FAST_POLL,
+        tail_poll_interval=FAST_POLL,
+    )
+    await a.start()
+    try:
+        session_id = "rollout-2026-08-26T12-00-00-abc123"
+        await _wait_until(lambda: session_id in a.discover_sessions())
+
+        events = a.subscribe(session_id)
+        started = await events.__anext__()
+        assert started.type == "session_started"
+        assert started.data["agent"] == "codex"
+        assert started.data["mode"] == "observe_only"
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_codex_session_content_normalizes_user_and_assistant_messages(tmp_path):
+    """Best-effort parsing of a rollout line's response_item wrapping
+    (session's own comment on _normalize_codex_line explains this mapping
+    is not hands-on verified against a real Codex install - none was
+    available in this dev environment). This test pins down the shape this
+    adapter expects so a future correction against a real transcript has a
+    regression test to update alongside the parser."""
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    codex_sessions_dir = tmp_path / "codex-sessions"
+    day_dir = codex_sessions_dir / "2026" / "08" / "26"
+    day_dir.mkdir(parents=True)
+    transcript = day_dir / "rollout-2026-08-26T12-00-00-def456.jsonl"
+    transcript.touch()
+
+    a = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        codex_sessions_dir=str(codex_sessions_dir),
+        socket_path=_short_socket_path(),
+        watch_poll_interval=FAST_POLL,
+        tail_poll_interval=FAST_POLL,
+    )
+    await a.start()
+    try:
+        session_id = "rollout-2026-08-26T12-00-00-def456"
+        await _wait_until(lambda: session_id in a.discover_sessions())
+
+        events = a.subscribe(session_id)
+        started = await events.__anext__()
+        assert started.type == "session_started"
+        a.open_session(session_id)
+
+        _write_line(transcript, {"type": "session_meta", "payload": {"cwd": "/Users/x/codex-repo"}})
+        announced = await events.__anext__()
+        assert announced.type == "session_started"
+        assert announced.data["cwd"] == "/Users/x/codex-repo"
+        assert announced.data["agent"] == "codex"
+
+        _write_line(
+            transcript,
+            {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}},
+        )
+        user_event = await events.__anext__()
+        assert user_event.type == "user_message"
+        assert user_event.data["text"] == "hi"
+
+        _write_line(
+            transcript,
+            {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello there"}]}},
+        )
+        assistant_event = await events.__anext__()
+        assert assistant_event.type == "assistant_message"
+        assert assistant_event.data["text"] == "hello there"
+
+        _write_line(
+            transcript,
+            {"type": "response_item", "payload": {"type": "function_call", "call_id": "call-1", "name": "shell", "arguments": {"command": "ls"}}},
+        )
+        call_event = await events.__anext__()
+        assert call_event.type == "tool_call"
+        assert call_event.data["tool"] == "shell"
+
+        _write_line(
+            transcript,
+            {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "call-1", "output": "file.txt"}},
+        )
+        result_event = await events.__anext__()
+        assert result_event.type == "tool_result"
+        assert result_event.data["tool_use_id"] == "call-1"
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_claude_code_and_codex_discovery_coexist_without_interfering(tmp_path):
+    """Regression test: the Codex watch (codex_sessions_dir) is a second
+    root watched alongside the existing ~/.claude/projects watch, not a
+    replacement for it - both a Claude Code transcript and a Codex rollout
+    transcript, dropped at the same time, must each be discovered and
+    tagged correctly (Claude sessions carry no `agent` field at all, same
+    as before this unit; only Codex sessions get agent="codex")."""
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    project_dir = projects_dir / "my-repo"
+    project_dir.mkdir()
+    claude_transcript = project_dir / "session-claude-1.jsonl"
+    claude_transcript.touch()
+
+    codex_sessions_dir = tmp_path / "codex-sessions"
+    day_dir = codex_sessions_dir / "2026" / "08" / "26"
+    day_dir.mkdir(parents=True)
+    codex_transcript = day_dir / "rollout-2026-08-26T12-00-00-ghi789.jsonl"
+    codex_transcript.touch()
+
+    a = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        codex_sessions_dir=str(codex_sessions_dir),
+        socket_path=_short_socket_path(),
+        watch_poll_interval=FAST_POLL,
+        tail_poll_interval=FAST_POLL,
+    )
+    await a.start()
+    try:
+        claude_session_id = "session-claude-1"
+        codex_session_id = "rollout-2026-08-26T12-00-00-ghi789"
+        await _wait_until(
+            lambda: claude_session_id in a.discover_sessions() and codex_session_id in a.discover_sessions()
+        )
+
+        claude_events = a.subscribe(claude_session_id)
+        claude_started = await claude_events.__anext__()
+        assert claude_started.type == "session_started"
+        assert "agent" not in claude_started.data or claude_started.data["agent"] is None
+
+        codex_events = a.subscribe(codex_session_id)
+        codex_started = await codex_events.__anext__()
+        assert codex_started.type == "session_started"
+        assert codex_started.data["agent"] == "codex"
+
+        # Content still flows correctly for the pre-existing Claude path too.
+        a.open_session(claude_session_id)
+        _write_line(
+            claude_transcript,
+            {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "still works"}]}},
+        )
+        claude_content = await claude_events.__anext__()
+        assert claude_content.type == "assistant_message"
+        assert claude_content.data["text"] == "still works"
+    finally:
+        await a.stop()

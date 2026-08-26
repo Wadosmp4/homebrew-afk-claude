@@ -17,6 +17,18 @@ Two independent data sources feed the same per-session event stream:
 `UnsupportedOperation` result rather than raising, so a phone tapping Stop
 on an observed session gets a clear "can't do that" instead of a generic
 error.
+
+Codex agent integration plan, U6 (R12/KTD5): a Codex CLI session started
+outside the app writes its own transcript to
+~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl - one file
+per session, no hooks socket equivalent (Codex has no hooks mechanism this
+app integrates with). `_watch_projects_dir` polls *this* directory tree
+too, alongside ~/.claude/projects, tagging anything it finds agent="codex"
+(mirroring the live CodexAdapter's own session_started tagging - see
+codex_adapter.py - for consistency with the mobile agent badge). No Codex
+CLI install/transcript was available on the dev machine this was built on,
+so the per-line schema below is a best-effort mapping, not hands-on
+verified - see _normalize_codex_line's own docstring.
 """
 from __future__ import annotations
 
@@ -42,6 +54,10 @@ from .events import Event, EventSequencer, truncate_tool_result_content
 logger = logging.getLogger(__name__)
 
 DEFAULT_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+# U6 (Codex agent integration plan, PKTD5): a second watched root, run
+# alongside DEFAULT_PROJECTS_DIR above, not replacing it - see the module
+# docstring.
+DEFAULT_CODEX_SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
 DEFAULT_SOCKET_PATH = os.path.expanduser("~/.config/remote-claude-companion/hooks.sock")
 DEFAULT_WATCH_POLL_INTERVAL = 1.0
 DEFAULT_TAIL_POLL_INTERVAL = 0.5
@@ -103,8 +119,13 @@ class ObserveAdapter:
         required_entrypoints: Optional[frozenset[str]] = None,
         auto_approve: bool = False,
         llm_judge: bool = False,
+        codex_sessions_dir: Optional[str] = None,
     ):
         self.projects_dir = Path(projects_dir or DEFAULT_PROJECTS_DIR)
+        # U6: same fixture-directory-injection convention as projects_dir
+        # above (tests override this to a tmp_path tree rather than
+        # touching the real ~/.codex/sessions).
+        self.codex_sessions_dir = Path(codex_sessions_dir or DEFAULT_CODEX_SESSIONS_DIR)
         self.socket_path = socket_path or DEFAULT_SOCKET_PATH
         self._watch_poll_interval = watch_poll_interval
         self._tail_poll_interval = tail_poll_interval
@@ -160,6 +181,7 @@ class ObserveAdapter:
 
     async def start(self) -> None:
         self.projects_dir.mkdir(parents=True, exist_ok=True)
+        self.codex_sessions_dir.mkdir(parents=True, exist_ok=True)
         os.makedirs(os.path.dirname(self.socket_path) or ".", exist_ok=True)
         if os.path.exists(self.socket_path):
             os.remove(self.socket_path)  # stale socket from a prior crashed run
@@ -288,12 +310,19 @@ class ObserveAdapter:
         except KeyError:
             raise KeyError(f"unknown observed session: {session_id}") from None
 
-    def _get_or_create(self, session_id: str) -> "_ObserveSession":
+    def _get_or_create(self, session_id: str, agent: Optional[str] = None) -> "_ObserveSession":
         session = self._sessions.get(session_id)
         if session is None:
             # Snapshot, not a live reference - see _ObserveSession's own
             # comment on these two attributes for why.
-            session = _ObserveSession(session_id, auto_approve=self._auto_approve, llm_judge=self._llm_judge)
+            #
+            # U6: `agent` is only ever passed by the transcript-discovery
+            # path (_start_watching_transcript) - the hooks path
+            # (_dispatch_hook's SessionStart) never passes it, since Codex
+            # has no hooks integration; a session already created via
+            # hooks is therefore always agent=None (Claude), consistent
+            # with how it already behaved before this unit.
+            session = _ObserveSession(session_id, auto_approve=self._auto_approve, llm_judge=self._llm_judge, agent=agent)
             self._sessions[session_id] = session
         return session
 
@@ -309,8 +338,14 @@ class ObserveAdapter:
             # would otherwise block every other coroutine (message
             # handling, other sessions' tail loops) for the duration of
             # one poll tick. Offloaded to a thread rather than run inline.
-            candidates = await asyncio.to_thread(lambda: sorted(self.projects_dir.glob("*/*.jsonl")))
-            for path in candidates:
+            #
+            # U6: candidates now come from two independently-globbed roots
+            # - ~/.claude/projects (agent "claude") and ~/.codex/sessions
+            # (agent "codex", one directory level deeper for the
+            # YYYY/MM/DD nesting) - run through the same discover/dedup/
+            # cap/stale/tail pipeline below, just tagged by source.
+            candidates = await asyncio.to_thread(self._list_candidate_transcripts)
+            for path, agent in candidates:
                 if path in self._known_transcripts:
                     continue
                 # Marked known unconditionally (even when skipped below) so
@@ -326,15 +361,24 @@ class ObserveAdapter:
                     )
                     continue
                 skip_reason = await asyncio.to_thread(
-                    self._check_transcript_eligibility, path
+                    self._check_transcript_eligibility, path, agent
                 )
                 if skip_reason is not None:
                     continue
-                self._start_watching_transcript(path, skip_existing_content=is_initial_scan)
+                self._start_watching_transcript(path, agent, skip_existing_content=is_initial_scan)
             self._initial_scan_done = True
             await asyncio.sleep(self._watch_poll_interval)
 
-    def _check_transcript_eligibility(self, path: Path) -> Optional[str]:
+    def _list_candidate_transcripts(self) -> list[tuple[Path, str]]:
+        """The synchronous glob half of the watch loop, run off the event
+        loop via asyncio.to_thread by the caller - see _watch_projects_dir.
+        Returns (path, agent) pairs from both watched roots, Claude first
+        (matches prior ordering/behavior for that root exactly)."""
+        claude = [(p, "claude") for p in sorted(self.projects_dir.glob("*/*.jsonl"))]
+        codex = [(p, "codex") for p in sorted(self.codex_sessions_dir.glob("*/*/*/rollout-*.jsonl"))]
+        return claude + codex
+
+    def _check_transcript_eligibility(self, path: Path, agent: str = "claude") -> Optional[str]:
         """The synchronous (stat + bounded file read) half of deciding
         whether to watch a newly-discovered transcript - run off the event
         loop via asyncio.to_thread by the caller. Returns None when
@@ -346,13 +390,18 @@ class ObserveAdapter:
             return "unreadable"
         if time.time() - mtime > self._stale_after_seconds:
             return "stale"  # old history, not a live/recent session
-        if self._required_entrypoints and not _matches_required_entrypoints(path, self._required_entrypoints):
+        # required_entrypoints (KNOWN_ENTRYPOINTS) is a Claude Code-only
+        # concept - see the module-level comment on KNOWN_ENTRYPOINTS - a
+        # Codex rollout file has no "entrypoint" field to match, so this
+        # filter simply doesn't apply to it rather than rejecting every
+        # Codex session whenever a Claude-specific entrypoint is set.
+        if agent == "claude" and self._required_entrypoints and not _matches_required_entrypoints(path, self._required_entrypoints):
             return "entrypoint-mismatch"  # not written by a client the user chose to see
         return None
 
-    def _start_watching_transcript(self, path: Path, *, skip_existing_content: bool) -> None:
+    def _start_watching_transcript(self, path: Path, agent: str = "claude", *, skip_existing_content: bool) -> None:
         session_id = path.stem
-        session = self._get_or_create(session_id)
+        session = self._get_or_create(session_id, agent=agent)
         session.start()
         initial_offset = 0
         if skip_existing_content:
@@ -366,9 +415,9 @@ class ObserveAdapter:
                 initial_offset = path.stat().st_size
             except OSError:
                 initial_offset = 0
-        session.tail_task = asyncio.create_task(self._tail_file(path, session, initial_offset))
+        session.tail_task = asyncio.create_task(self._tail_file(path, session, initial_offset, agent=agent))
 
-    async def _tail_file(self, path: Path, session: "_ObserveSession", offset: int = 0) -> None:
+    async def _tail_file(self, path: Path, session: "_ObserveSession", offset: int = 0, *, agent: str = "claude") -> None:
         pending = b""
         try:
             while True:
@@ -381,7 +430,7 @@ class ObserveAdapter:
                     while b"\n" in pending:
                         line, pending = pending.split(b"\n", 1)
                         if line.strip():
-                            self._normalize_line(session, line)
+                            self._normalize_line(session, line, agent)
                 await asyncio.sleep(self._tail_poll_interval)
         except asyncio.CancelledError:
             raise
@@ -389,10 +438,14 @@ class ObserveAdapter:
             logger.warning("transcript tail for %s failed: %s", session.session_id, exc)
             session.emit("error", message=str(exc))
 
-    def _normalize_line(self, session: "_ObserveSession", raw_line: bytes) -> None:
+    def _normalize_line(self, session: "_ObserveSession", raw_line: bytes, agent: str = "claude") -> None:
         try:
             entry = json.loads(raw_line.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+
+        if agent == "codex":
+            self._normalize_codex_line(session, entry)
             return
 
         # U10 (R16): every real transcript entry carries the session's cwd;
@@ -435,6 +488,71 @@ class ObserveAdapter:
                         )
                     elif block.get("type") == "text":
                         session.emit("user_message", text=block["text"])
+
+    def _normalize_codex_line(self, session: "_ObserveSession", entry: dict) -> None:
+        """U6 (R12): best-effort mapping of a Codex CLI rollout JSONL line
+        onto the same normalized events the Claude Code branch above
+        produces - modeled on the session_meta + response_item wrapping
+        used by Codex's own OpenAI-Responses-API-shaped item types
+        (message/function_call/function_call_output), per external
+        research cited in this unit's plan. NOT hands-on verified against
+        a real ~/.codex/sessions file - no Codex CLI install or transcript
+        was available on the dev machine this was built on (see this
+        unit's report). A line whose shape doesn't match what's expected
+        below is silently skipped rather than raising, same defensive
+        posture as the Claude Code branch's own `.get()` chains - a schema
+        mismatch degrades to "some content missing," not a crash."""
+        entry_type = entry.get("type")
+
+        if entry_type == "session_meta":
+            cwd = (entry.get("payload") or {}).get("cwd")
+            if cwd:
+                session.cwd = cwd
+                session.note_cwd_known()
+            return
+
+        if entry_type != "response_item":
+            return
+        payload = entry.get("payload") or {}
+        item_type = payload.get("type")
+        timestamp = entry.get("timestamp")
+
+        if item_type == "message":
+            role = payload.get("role")
+            content = payload.get("content")
+            if not isinstance(content, list):
+                return
+            text = "".join(
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") in ("input_text", "output_text", "text")
+            )
+            if not text:
+                return
+            if role == "user":
+                session.emit("user_message", text=text)
+            elif role == "assistant":
+                session.emit("assistant_message", text=text)
+        elif item_type == "function_call":
+            call_id = payload.get("call_id")
+            if timestamp and call_id:
+                session.tool_started_at[call_id] = timestamp
+            session.emit(
+                "tool_call",
+                tool_use_id=call_id,
+                tool=payload.get("name"),
+                input=payload.get("arguments"),
+            )
+        elif item_type == "function_call_output":
+            call_id = payload.get("call_id")
+            duration_ms = self._duration_since(session, call_id, timestamp)
+            session.emit(
+                "tool_result",
+                tool_use_id=call_id,
+                content=truncate_tool_result_content(payload.get("output")),
+                is_error=False,
+                duration_ms=duration_ms,
+            )
 
     @staticmethod
     def _duration_since(session: "_ObserveSession", tool_use_id: Optional[str], result_timestamp: Optional[str]) -> Optional[float]:
@@ -602,8 +720,17 @@ class _ObserveSession:
     not a monotonic clock like U3's SDK-owned session - `tool_started_at`
     tracks the entry timestamp captured when each tool_call was emitted."""
 
-    def __init__(self, session_id: str, *, auto_approve: bool = False, llm_judge: bool = False):
+    def __init__(self, session_id: str, *, auto_approve: bool = False, llm_judge: bool = False, agent: Optional[str] = None):
         self.session_id = session_id
+        # U6: "claude" (the transcript-discovery path's own default,
+        # _list_candidate_transcripts) and None (the hooks path, which
+        # never passes this) are both treated as "the default agent, don't
+        # tag it" below - only "codex" ever rides the emitted event, same
+        # as the live CodexAdapter's own session_started (codex_adapter.py)
+        # and matching what the mobile agent badge already expects
+        # (SessionListScreen.tsx: no badge unless agent is set and isn't
+        # the default).
+        self.agent = agent
         self.sequencer = EventSequencer(session_id)
         self.events: asyncio.Queue[Event] = asyncio.Queue()
         self.pending: dict[str, asyncio.Future] = {}
@@ -651,7 +778,12 @@ class _ObserveSession:
             return
         self._cwd_announced = True
         self.emit(
-            "session_started", mode="observe_only", cwd=self.cwd, auto_approve=self.auto_approve, llm_judge=self.llm_judge
+            "session_started",
+            mode="observe_only",
+            cwd=self.cwd,
+            auto_approve=self.auto_approve,
+            llm_judge=self.llm_judge,
+            **self._agent_tag(),
         )
 
     def start(self) -> None:
@@ -663,7 +795,19 @@ class _ObserveSession:
         if self._started:
             return
         self._started = True
-        self.emit("session_started", mode="observe_only", auto_approve=self.auto_approve, llm_judge=self.llm_judge)
+        self.emit(
+            "session_started",
+            mode="observe_only",
+            auto_approve=self.auto_approve,
+            llm_judge=self.llm_judge,
+            **self._agent_tag(),
+        )
+
+    def _agent_tag(self) -> dict[str, str]:
+        """U6: only a real non-default agent (currently just "codex")
+        rides the emitted event at all - see this class's __init__ comment
+        on self.agent for why "claude"/None both mean "don't tag it"."""
+        return {"agent": self.agent} if self.agent and self.agent != "claude" else {}
 
     def end(self, reason: str) -> None:
         if self._ended:
