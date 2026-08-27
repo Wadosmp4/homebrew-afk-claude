@@ -19,6 +19,7 @@ import socket
 import subprocess
 import sys
 import uuid
+from datetime import datetime
 
 import pytest
 import pytest_asyncio
@@ -1729,6 +1730,104 @@ async def test_list_active_sessions_action_returns_a_snapshot_of_both_adapters(r
         assert by_id["observed-session-1"]["mode"] == "observe_only"
         assert by_id["observed-session-1"]["active"] is True
         assert by_id["observed-session-1"]["agent"] == "claude_code"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_list_active_sessions_includes_a_live_codex_session(running_daemon_with_codex, phone_token):
+    """Code-review finding: this snapshot previously only knew about
+    sdk_adapter/observe_adapter (from before codex_adapter was wired into
+    the live registry) - a live Codex session was entirely absent from
+    it, disappearing from the phone's list on any remount that lost
+    live-witnessed state (nav away/back, app background/kill + reopen),
+    even though the daemon was still actively forwarding its events."""
+    daemon, port, _fake_sdk_clients, _fake_codex_clients = running_daemon_with_codex
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo", "agent": "codex"})
+        started = await phone.next_event()
+        codex_session_id = started["session_id"]
+
+        await phone.send_action({"kind": "list_active_sessions"})
+        event = await phone.next_event()
+
+        by_id = {s["session_id"]: s for s in event["data"]["sessions"]}
+        assert by_id[codex_session_id]["mode"] == "sdk_owned"
+        assert by_id[codex_session_id]["active"] is True
+        assert by_id[codex_session_id]["agent"] == "codex"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_list_active_sessions_labels_an_observed_codex_session_correctly(
+    relay, companion_token, phone_token, tmp_path
+):
+    """Code-review finding: the observe_adapter half of this snapshot used
+    to hardcode "agent": "claude_code" unconditionally, which was correct
+    only back when Claude Code was the only agent ObserveAdapter could
+    ever discover. An observed session can genuinely be Codex now."""
+    _app, port, _db_path = relay
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    codex_sessions_dir = tmp_path / "codex-sessions"
+    today = datetime.now().date()
+    day_dir = codex_sessions_dir / today.strftime("%Y") / today.strftime("%m") / today.strftime("%d")
+    day_dir.mkdir(parents=True)
+    (day_dir / "rollout-observed-codex.jsonl").touch()
+
+    observe_adapter = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        codex_sessions_dir=str(codex_sessions_dir),
+        socket_path=_short_socket_path(),
+        watch_poll_interval=0.02,
+        tail_poll_interval=0.02,
+    )
+    daemon = CompanionDaemon(
+        _fast_config(port, companion_token),
+        observe_adapter=observe_adapter,
+        recents_path=str(tmp_path / "recent_projects.json"),
+        config_path=str(tmp_path / "companion_config.json"),
+        session_registry_path=str(tmp_path / "session_registry.db"),
+    )
+    task = asyncio.create_task(daemon.run())
+    await _wait_until(lambda: daemon.state == "connected")
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.next_event()  # the discovered transcript's own session_started
+
+        await phone.send_action({"kind": "list_active_sessions"})
+        event = await phone.next_event()
+
+        by_id = {s["session_id"]: s for s in event["data"]["sessions"]}
+        assert by_id["rollout-observed-codex"]["mode"] == "observe_only"
+        assert by_id["rollout-observed-codex"]["agent"] == "codex"
+    finally:
+        await phone.close()
+        await _stop_daemon(daemon, task)
+
+
+@pytest.mark.asyncio
+async def test_starting_a_codex_session_never_creates_a_session_registry_row(
+    running_daemon_with_codex, phone_token
+):
+    """Code-review finding: a session_registry row only exists to support
+    _try_resume_sdk_session after a restart, which resolves cwd via
+    observe_adapter.projects_dir (~/.claude/projects) - a Codex
+    session_id can never match there, so a Codex row could never actually
+    be resumed. Writing one anyway would leave it permanently 'active'
+    forever, since the end-marking gates are (correctly) sdk_adapter-only
+    - simplest fix is to never create the row for codex_adapter sessions
+    in the first place."""
+    daemon, port, _fake_sdk_clients, _fake_codex_clients = running_daemon_with_codex
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo", "agent": "codex"})
+        started = await phone.next_event()
+        codex_session_id = started["session_id"]
+
+        assert session_registry.get_session(codex_session_id, daemon.session_registry_path) is None
     finally:
         await phone.close()
 

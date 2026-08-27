@@ -489,15 +489,26 @@ class CompanionDaemon:
             if resolved_cwd:
                 async with self._recents_lock:
                     await asyncio.to_thread(projects.record_recent, resolved_cwd, self.recents_path)
-                async with self._session_registry_lock:
-                    await asyncio.to_thread(
-                        session_registry.upsert_session,
-                        session_id,
-                        cwd=resolved_cwd,
-                        model=action.get("model"),
-                        permission_mode=action.get("permission_mode"),
-                        path=self.session_registry_path,
-                    )
+                # Code-review fix: only sdk_adapter sessions get a
+                # session_registry row. That row exists purely to support
+                # _try_resume_sdk_session after a restart, which resolves
+                # cwd via observe_adapter.projects_dir (~/.claude/projects)
+                # - a Codex session_id can never match there, so a Codex
+                # row could never actually be resumed. Writing one anyway
+                # would leave it permanently 'active' forever, since the
+                # end-marking gates below are (correctly) sdk_adapter-only
+                # - simpler to never create the unresumable row than to
+                # widen every end-marking gate just to clean up after it.
+                if adapter is self.sdk_adapter:
+                    async with self._session_registry_lock:
+                        await asyncio.to_thread(
+                            session_registry.upsert_session,
+                            session_id,
+                            cwd=resolved_cwd,
+                            model=action.get("model"),
+                            permission_mode=action.get("permission_mode"),
+                            path=self.session_registry_path,
+                        )
             return
 
         if kind == "list_projects":
@@ -745,10 +756,29 @@ class CompanionDaemon:
         ] + [
             {
                 "session_id": sid,
+                "cwd": self.codex_adapter.get_cwd(sid),
+                "mode": "sdk_owned",
+                "active": bool(self.codex_adapter.is_active(sid)),
+                # Code-review fix: this snapshot previously only knew
+                # about sdk_adapter/observe_adapter (from before
+                # codex_adapter existed) - a live Codex session was
+                # entirely absent from it, disappearing from the phone's
+                # list on any remount that lost live-witnessed state.
+                "agent": "codex",
+            }
+            for sid in self.codex_adapter.discover_sessions()
+        ] + [
+            {
+                "session_id": sid,
                 "cwd": self.observe_adapter.get_cwd(sid),
                 "mode": "observe_only",
                 "active": bool(self.observe_adapter.is_active(sid)),
-                "agent": "claude_code",
+                # Code-review fix: an observed session can genuinely be
+                # Codex now (ObserveAdapter.get_agent) - the "claude_code"
+                # literal here used to be correct unconditionally, back
+                # when this was the only agent ObserveAdapter could ever
+                # discover.
+                "agent": self.observe_adapter.get_agent(sid) or "claude_code",
             }
             for sid in self.observe_adapter.discover_sessions()
         ]

@@ -326,6 +326,34 @@ class ObserveAdapter:
             self._sessions[session_id] = session
         return session
 
+    def _watched_count_for_agent(self, agent: str) -> int:
+        """Code-review fix: how many already-watched sessions count against
+        `agent`'s own per-agent budget (see _watch_projects_dir's cap
+        check) - "codex" counts only real Codex sessions; any other value
+        counts everything else (a hooks-created session's `agent` is
+        always None per _get_or_create's own comment, and must still count
+        toward Claude's budget, not escape capping entirely)."""
+        is_codex = agent == "codex"
+        return sum(1 for s in self._sessions.values() if (s.agent == "codex") == is_codex)
+
+    def get_agent(self, session_id: str) -> Optional[str]:
+        """Code-review fix: exposes a session's real agent to callers
+        outside this module (companion/daemon.py's list_active_sessions
+        snapshot) the same way get_cwd/is_active already do - without
+        this, an observed Codex session had no way to report itself as
+        anything but the hardcoded "claude_code" default.
+
+        Normalizes this module's own internal "claude" tag (see
+        _list_candidate_transcripts) to the external wire value
+        "claude_code" - that split was harmless while session.agent never
+        left this module (_agent_tag only rides non-default/"codex"
+        values onto the wire), but this accessor is a new boundary where
+        it would otherwise leak through for the first time."""
+        session = self._sessions.get(session_id)
+        if session is None:
+            return None
+        return "claude_code" if session.agent in (None, "claude") else session.agent
+
     # --- JSONL transcript discovery + tailing -------------------------------
 
     async def _watch_projects_dir(self) -> None:
@@ -354,10 +382,17 @@ class ObserveAdapter:
                 # the next daemon restart, which is an acceptable trade-off
                 # for a personal-use app.
                 self._known_transcripts.add(path)
-                if len(self._sessions) >= self._max_watched_sessions:
+                # Code-review fix: capped per-agent (not against one shared
+                # total) so a burst of transcripts from one root can't
+                # permanently consume the whole budget and starve the
+                # other's discovery until the next restart - each agent
+                # gets the same _max_watched_sessions ceiling an existing
+                # Claude-only user already had, rather than splitting it.
+                agent_count = self._watched_count_for_agent(agent)
+                if agent_count >= self._max_watched_sessions:
                     logger.info(
-                        "not watching %s: already watching %d sessions (max %d)",
-                        path, len(self._sessions), self._max_watched_sessions,
+                        "not watching %s: already watching %d %s sessions (max %d)",
+                        path, agent_count, agent, self._max_watched_sessions,
                     )
                     continue
                 skip_reason = await asyncio.to_thread(

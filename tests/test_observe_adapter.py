@@ -10,6 +10,7 @@ import asyncio
 import json
 import socket
 import uuid
+from datetime import datetime
 
 import pytest
 
@@ -1053,6 +1054,19 @@ async def test_set_session_auto_approve_emits_a_confirmation_event_once_opened(a
 # projects_dir tests above, via the new codex_sessions_dir constructor param.
 
 
+def _today_codex_day_dir(codex_sessions_dir):
+    """Code-review fix: _codex_candidate_date_dirs() (observe_adapter.py)
+    only globs a trailing window from *today* - a hardcoded past-dated
+    fixture would silently fall outside that window and start failing
+    these tests on some future run with no code change involved.
+    Computing "today" here keeps the fixture inside the watched window
+    regardless of when the suite actually runs."""
+    today = datetime.now().date()
+    day_dir = codex_sessions_dir / today.strftime("%Y") / today.strftime("%m") / today.strftime("%d")
+    timestamp = today.strftime("%Y-%m-%dT12-00-00")
+    return day_dir, timestamp
+
+
 @pytest.mark.asyncio
 async def test_discovers_a_codex_rollout_transcript_and_tags_it_agent_codex(tmp_path):
     """R12/KTD5: an externally-started Codex session is discoverable the
@@ -1064,9 +1078,9 @@ async def test_discovers_a_codex_rollout_transcript_and_tags_it_agent_codex(tmp_
     projects_dir = tmp_path / "projects"
     projects_dir.mkdir()
     codex_sessions_dir = tmp_path / "codex-sessions"
-    day_dir = codex_sessions_dir / "2026" / "08" / "26"
+    day_dir, ts = _today_codex_day_dir(codex_sessions_dir)
     day_dir.mkdir(parents=True)
-    transcript = day_dir / "rollout-2026-08-26T12-00-00-abc123.jsonl"
+    transcript = day_dir / f"rollout-{ts}-abc123.jsonl"
     transcript.touch()
 
     a = ObserveAdapter(
@@ -1078,7 +1092,7 @@ async def test_discovers_a_codex_rollout_transcript_and_tags_it_agent_codex(tmp_
     )
     await a.start()
     try:
-        session_id = "rollout-2026-08-26T12-00-00-abc123"
+        session_id = f"rollout-{ts}-abc123"
         await _wait_until(lambda: session_id in a.discover_sessions())
 
         events = a.subscribe(session_id)
@@ -1101,9 +1115,9 @@ async def test_codex_session_content_normalizes_user_and_assistant_messages(tmp_
     projects_dir = tmp_path / "projects"
     projects_dir.mkdir()
     codex_sessions_dir = tmp_path / "codex-sessions"
-    day_dir = codex_sessions_dir / "2026" / "08" / "26"
+    day_dir, ts = _today_codex_day_dir(codex_sessions_dir)
     day_dir.mkdir(parents=True)
-    transcript = day_dir / "rollout-2026-08-26T12-00-00-def456.jsonl"
+    transcript = day_dir / f"rollout-{ts}-def456.jsonl"
     transcript.touch()
 
     a = ObserveAdapter(
@@ -1115,7 +1129,7 @@ async def test_codex_session_content_normalizes_user_and_assistant_messages(tmp_
     )
     await a.start()
     try:
-        session_id = "rollout-2026-08-26T12-00-00-def456"
+        session_id = f"rollout-{ts}-def456"
         await _wait_until(lambda: session_id in a.discover_sessions())
 
         events = a.subscribe(session_id)
@@ -1180,9 +1194,9 @@ async def test_claude_code_and_codex_discovery_coexist_without_interfering(tmp_p
     claude_transcript.touch()
 
     codex_sessions_dir = tmp_path / "codex-sessions"
-    day_dir = codex_sessions_dir / "2026" / "08" / "26"
+    day_dir, ts = _today_codex_day_dir(codex_sessions_dir)
     day_dir.mkdir(parents=True)
-    codex_transcript = day_dir / "rollout-2026-08-26T12-00-00-ghi789.jsonl"
+    codex_transcript = day_dir / f"rollout-{ts}-ghi789.jsonl"
     codex_transcript.touch()
 
     a = ObserveAdapter(
@@ -1195,7 +1209,7 @@ async def test_claude_code_and_codex_discovery_coexist_without_interfering(tmp_p
     await a.start()
     try:
         claude_session_id = "session-claude-1"
-        codex_session_id = "rollout-2026-08-26T12-00-00-ghi789"
+        codex_session_id = f"rollout-{ts}-ghi789"
         await _wait_until(
             lambda: claude_session_id in a.discover_sessions() and codex_session_id in a.discover_sessions()
         )
@@ -1219,5 +1233,90 @@ async def test_claude_code_and_codex_discovery_coexist_without_interfering(tmp_p
         claude_content = await claude_events.__anext__()
         assert claude_content.type == "assistant_message"
         assert claude_content.data["text"] == "still works"
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_codex_transcript_from_yesterday_is_still_discovered(tmp_path):
+    """Code-review finding: the days_back>0 branch of
+    _codex_candidate_date_dirs() (observe_adapter.py) - which is what makes
+    a transcript from a day other than today discoverable at all - was
+    previously only exercised by calendar accident (a hardcoded fixture
+    date happening to land at offset=1), never deliberately. This pins the
+    behavior down directly: a transcript dated yesterday, well within the
+    default 6-hour staleness window's 2-day glob margin, must still be
+    found."""
+    from datetime import timedelta
+
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    codex_sessions_dir = tmp_path / "codex-sessions"
+    yesterday = datetime.now().date() - timedelta(days=1)
+    day_dir = codex_sessions_dir / yesterday.strftime("%Y") / yesterday.strftime("%m") / yesterday.strftime("%d")
+    day_dir.mkdir(parents=True)
+    ts = yesterday.strftime("%Y-%m-%dT23-59-00")
+    transcript = day_dir / f"rollout-{ts}-jkl012.jsonl"
+    transcript.touch()
+
+    a = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        codex_sessions_dir=str(codex_sessions_dir),
+        socket_path=_short_socket_path(),
+        watch_poll_interval=FAST_POLL,
+        tail_poll_interval=FAST_POLL,
+    )
+    await a.start()
+    try:
+        session_id = f"rollout-{ts}-jkl012"
+        await _wait_until(lambda: session_id in a.discover_sessions())
+
+        events = a.subscribe(session_id)
+        started = await events.__anext__()
+        assert started.type == "session_started"
+        assert started.data["agent"] == "codex"
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_full_claude_budget_does_not_starve_codex_discovery(tmp_path):
+    """Code-review finding: before this fix, both roots shared one
+    _max_watched_sessions counter, Claude-first - a burst of Claude
+    transcripts alone could fill the whole cap and permanently (until
+    restart) block every Codex candidate from ever being watched. Each
+    agent must get its own independent budget of the same size an
+    existing Claude-only user already had."""
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    project_dir = projects_dir / "my-repo"
+    project_dir.mkdir()
+    (project_dir / "session-a.jsonl").touch()
+    (project_dir / "session-b.jsonl").touch()
+
+    codex_sessions_dir = tmp_path / "codex-sessions"
+    day_dir, ts = _today_codex_day_dir(codex_sessions_dir)
+    day_dir.mkdir(parents=True)
+    (day_dir / f"rollout-{ts}-mno345.jsonl").touch()
+
+    a = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        codex_sessions_dir=str(codex_sessions_dir),
+        socket_path=_short_socket_path(),
+        watch_poll_interval=FAST_POLL,
+        tail_poll_interval=FAST_POLL,
+        max_watched_sessions=1,
+    )
+    await a.start()
+    try:
+        codex_session_id = f"rollout-{ts}-mno345"
+        # A full Claude budget (max_watched_sessions=1, two Claude
+        # candidates competing for it) must not block the Codex session
+        # from also being watched under its own separate budget.
+        await _wait_until(lambda: codex_session_id in a.discover_sessions())
+        await asyncio.sleep(FAST_POLL * 10)
+        claude_watched = [s for s in a.discover_sessions() if s.startswith("session-")]
+        assert len(claude_watched) == 1
+        assert codex_session_id in a.discover_sessions()
     finally:
         await a.stop()
