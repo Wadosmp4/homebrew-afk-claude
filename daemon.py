@@ -459,6 +459,7 @@ class CompanionDaemon:
                         session_id,
                         cwd=action.get("cwd"),
                         model=action.get("model"),
+                        sandbox=action.get("sandbox"),
                         api_key=(
                             self.config.codex_personal_api_key
                             if self.config.codex_active_account == "personal"
@@ -702,10 +703,32 @@ class CompanionDaemon:
                 # R10: model's counterpart to set_session_permission_mode
                 # directly above - same guard, same persist-on-success-only
                 # shape.
+                #
+                # Codex Model & Sandbox Config plan (001), U2 (KTD5): widened
+                # to branch by adapter instead of introducing a Codex-
+                # specific action name for the same concept - a Codex-owned
+                # session's set_session_model reaches CodexAdapter directly.
+                # No `await` (CodexAdapter.set_session_model is sync - purely
+                # local state, no SDK round-trip) and no session_registry
+                # persistence (that registry only exists to support
+                # sdk_adapter's own _try_resume_sdk_session; Codex sessions
+                # never get a row there - see start_session's own comment on
+                # this above).
                 if adapter is self.sdk_adapter:
                     model = action.get("model")
                     if await adapter.set_session_model(session_id, model):
                         await self._persist_sdk_session_registry(session_id, model=model)
+                elif adapter is self.codex_adapter:
+                    self.codex_adapter.set_session_model(session_id, action.get("model"))
+            elif kind == "set_session_sandbox":
+                # Codex Model & Sandbox Config plan (001), U2 (R6/R7/KTD5):
+                # Codex-only - Claude has no sandbox concept, so this is
+                # guarded to CodexAdapter alone (not a shared-name branch
+                # like set_session_model above) and is a no-op for any other
+                # adapter, matching the existing observe-only-session no-op
+                # convention.
+                if adapter is self.codex_adapter:
+                    self.codex_adapter.set_session_sandbox(session_id, action.get("sandbox"))
             else:
                 logger.warning("unknown action kind: %r", kind)
         except Exception:
