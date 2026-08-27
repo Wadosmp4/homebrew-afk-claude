@@ -75,6 +75,24 @@ def _tool_input_for_item(item: Any) -> dict[str, Any]:
     return {}
 
 
+def _sandbox_from_wire(sandbox: Optional[str]) -> Optional[Any]:
+    """Codex Model & Sandbox Config plan (001), simplify pass: the one
+    place the wire-string -> Sandbox enum conversion lives, called from both
+    connect() and set_session_sandbox() - previously duplicated in each.
+    `sandbox` is a wire string using the SDK's *member name* convention
+    ("workspace_write"), not its hyphenated enum *value* ("workspace-write"),
+    so this is always a name-based `Sandbox[sandbox]` lookup, never
+    `Sandbox(sandbox)` - the latter raises ValueError for every valid wire
+    string. Returns None unchanged for a None input (connect()'s own
+    "no sandbox requested" case); raises KeyError for an unrecognized name,
+    same as a bare `Sandbox[sandbox]` would - each call site decides for
+    itself whether that should propagate (connect(), fail-closed) or be
+    caught (set_session_sandbox(), fail-soft)."""
+    from openai_codex import Sandbox
+
+    return Sandbox[sandbox] if sandbox is not None else None
+
+
 def _tool_result_for_item(item: Any) -> tuple[str, bool]:
     """Returns (content, is_error), matching sdk_adapter.py's own
     tool_result shape."""
@@ -124,17 +142,14 @@ class CodexAdapter:
         implicit-default "vscode" behavior - skip login_api_key() and let
         the ambient CLI/SDK login resolve itself, exactly as before.
 
-        Codex Model & Sandbox Config plan (001), U1: `sandbox` is a wire
-        string using the *member name* convention ("workspace_write"), not
-        the SDK's own hyphenated enum *value* ("workspace-write") - so the
-        conversion below is a name-based `Sandbox[sandbox]` lookup, not
-        `Sandbox(sandbox)`. A `Sandbox(sandbox)` value-based lookup would
-        raise ValueError for every valid wire string, since none of them
-        match the hyphenated values. An unrecognized wire string raises
-        (KeyError) here and propagates uncaught out of connect() - fails
-        closed at daemon.py's existing start_session outer exception
-        handler, no new handling needed in this adapter."""
-        from openai_codex import ApprovalMode, AsyncCodex, Sandbox
+        Codex Model & Sandbox Config plan (001), U1: `sandbox` is converted
+        via the shared `_sandbox_from_wire()` helper above (name-based
+        lookup, not value-based - see its own docstring for why). An
+        unrecognized wire string raises (KeyError) here and propagates
+        uncaught out of connect() - fails closed at daemon.py's existing
+        start_session outer exception handler, no new handling needed in
+        this adapter."""
+        from openai_codex import ApprovalMode, AsyncCodex
 
         client = self._client_factory() if self._client_factory is not None else AsyncCodex()
         # Code-review fix: a failure anywhere in this setup sequence must
@@ -144,7 +159,7 @@ class CodexAdapter:
         # unrecognized sandbox string's KeyError, which must close the
         # client identically to any other setup failure.
         try:
-            sandbox_enum = Sandbox[sandbox] if sandbox is not None else None
+            sandbox_enum = _sandbox_from_wire(sandbox)
             if api_key:
                 await client.login_api_key(api_key)
             resolved_cwd = cwd or self._cwd
@@ -269,18 +284,17 @@ class CodexAdapter:
         return True
 
     def set_session_sandbox(self, session_id: str, sandbox: str) -> bool:
-        """Same shape as set_session_model above. An unrecognized wire
-        string is caught here (unlike connect()'s deliberate fail-closed
+        """Same shape as set_session_model above. Uses the same shared
+        `_sandbox_from_wire()` helper connect() does, but an unrecognized
+        wire string is caught here (unlike connect()'s deliberate fail-closed
         raise) since this is a live user action against an already-running
         session, not session creation - returns False and leaves the
         session's stored sandbox unchanged rather than raising."""
-        from openai_codex import Sandbox
-
         session = self._sessions.get(session_id)
         if session is None:
             return False
         try:
-            sandbox_enum = Sandbox[sandbox]
+            sandbox_enum = _sandbox_from_wire(sandbox)
         except KeyError:
             return False
         session.sandbox = sandbox_enum
