@@ -112,6 +112,7 @@ class CodexAdapter:
         *,
         cwd: Optional[str] = None,
         model: Optional[str] = None,
+        sandbox: Optional[str] = None,
         api_key: Optional[str] = None,
     ) -> None:
         """Codex Agent Integration plan (002), U2 (PKTD3): `api_key` is now
@@ -121,25 +122,43 @@ class CodexAdapter:
         (pass the configured codex_personal_api_key) or "vscode" (pass
         nothing, the default). Omitting it entirely keeps today's
         implicit-default "vscode" behavior - skip login_api_key() and let
-        the ambient CLI/SDK login resolve itself, exactly as before."""
-        from openai_codex import ApprovalMode, AsyncCodex
+        the ambient CLI/SDK login resolve itself, exactly as before.
+
+        Codex Model & Sandbox Config plan (001), U1: `sandbox` is a wire
+        string using the *member name* convention ("workspace_write"), not
+        the SDK's own hyphenated enum *value* ("workspace-write") - so the
+        conversion below is a name-based `Sandbox[sandbox]` lookup, not
+        `Sandbox(sandbox)`. A `Sandbox(sandbox)` value-based lookup would
+        raise ValueError for every valid wire string, since none of them
+        match the hyphenated values. An unrecognized wire string raises
+        (KeyError) here and propagates uncaught out of connect() - fails
+        closed at daemon.py's existing start_session outer exception
+        handler, no new handling needed in this adapter."""
+        from openai_codex import ApprovalMode, AsyncCodex, Sandbox
 
         client = self._client_factory() if self._client_factory is not None else AsyncCodex()
         # Code-review fix: a failure anywhere in this setup sequence must
         # not leak the just-constructed client - nothing else can reach it
         # to close it otherwise, since it's never stored until the
-        # _CodexSession below is actually created.
+        # _CodexSession below is actually created. This also covers an
+        # unrecognized sandbox string's KeyError, which must close the
+        # client identically to any other setup failure.
         try:
+            sandbox_enum = Sandbox[sandbox] if sandbox is not None else None
             if api_key:
                 await client.login_api_key(api_key)
             resolved_cwd = cwd or self._cwd
-            thread = await client.thread_start(approval_mode=ApprovalMode.auto_review, cwd=resolved_cwd, model=model)
+            thread = await client.thread_start(
+                approval_mode=ApprovalMode.auto_review, cwd=resolved_cwd, model=model, sandbox=sandbox_enum
+            )
         except Exception:
             await client.close()
             raise
 
         session = _CodexSession(session_id, client=client, thread=thread)
         session.cwd = resolved_cwd
+        session.model = model
+        session.sandbox = sandbox_enum
         self._sessions[session_id] = session
         # KTD4: agent="codex" is the only shape difference from SDKAdapter's
         # own session_started - mobile reads it for KTD5's minimal labeling,
@@ -159,7 +178,9 @@ class CodexAdapter:
         if session.stream_task is not None and not session.stream_task.done():
             session.stream_task.cancel()
         try:
-            turn_handle = await session.thread.turn(TextInput(text=text))
+            turn_handle = await session.thread.turn(
+                TextInput(text=text), model=session.model, sandbox=session.sandbox
+            )
         except Exception as exc:
             logger.warning("Codex turn failed to start for session %s: %s", session_id, exc)
             session.emit("error", message=str(exc))
@@ -232,6 +253,39 @@ class CodexAdapter:
         # there's no per-session auto_approve/llm_judge concept for Codex
         # to actually set (only the coarse, thread-level ApprovalMode).
         return False
+
+    def set_session_model(self, session_id: str, model: str) -> bool:
+        """Codex Model & Sandbox Config plan (001), U1: no SDK round-trip -
+        purely local state, applied starting with the session's next
+        send_message()/turn() call (KTD2). Mirrors sdk_adapter.py's own
+        set_session_model emit/return-bool shape, minus its
+        asyncio.wait_for/CLIConnectionError handling, which this
+        local-state-only path doesn't need."""
+        session = self._sessions.get(session_id)
+        if session is None:
+            return False
+        session.model = model
+        session.emit("session_model", model=model)
+        return True
+
+    def set_session_sandbox(self, session_id: str, sandbox: str) -> bool:
+        """Same shape as set_session_model above. An unrecognized wire
+        string is caught here (unlike connect()'s deliberate fail-closed
+        raise) since this is a live user action against an already-running
+        session, not session creation - returns False and leaves the
+        session's stored sandbox unchanged rather than raising."""
+        from openai_codex import Sandbox
+
+        session = self._sessions.get(session_id)
+        if session is None:
+            return False
+        try:
+            sandbox_enum = Sandbox[sandbox]
+        except KeyError:
+            return False
+        session.sandbox = sandbox_enum
+        session.emit("session_sandbox", sandbox=sandbox)
+        return True
 
     def get_cwd(self, session_id: str) -> Optional[str]:
         session = self._sessions.get(session_id)
@@ -331,6 +385,8 @@ class _CodexSession:
         self.sequencer = EventSequencer(session_id)
         self.events: asyncio.Queue[Event] = asyncio.Queue()
         self.cwd: Optional[str] = None
+        self.model: Optional[str] = None
+        self.sandbox: Optional[Any] = None
         self.current_turn: Optional[Any] = None
         self.stream_task: Optional[asyncio.Task] = None
         self._ended = False
