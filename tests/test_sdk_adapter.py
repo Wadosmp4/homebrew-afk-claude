@@ -117,6 +117,30 @@ async def test_connect_emits_session_started(adapter):
 
 
 @pytest.mark.asyncio
+async def test_connect_echoes_client_request_id_on_session_started(adapter):
+    """Bug fix (user report): the phone matches a fresh session to its own
+    start_session tap via this echoed value, not by comparing cwd strings -
+    cwd-string matching breaks whenever realpath's symlink resolution (see
+    connect()'s own cwd handling) produces a different string than what the
+    phone requested."""
+    await adapter.connect("s1", client_request_id="req-123")
+
+    event, _gen = await _next_event(adapter, "s1")
+    assert event.data["client_request_id"] == "req-123"
+
+
+@pytest.mark.asyncio
+async def test_connect_without_client_request_id_emits_none(adapter):
+    """A caller with no phone-initiated request (e.g. daemon.py's
+    _try_resume_sdk_session after a restart) leaves this unset rather than
+    crashing or omitting the key entirely."""
+    await adapter.connect("s1")
+
+    event, _gen = await _next_event(adapter, "s1")
+    assert event.data["client_request_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_connect_passes_the_requested_model_to_claude_agent_options(adapter):
     await adapter.connect("s1", model="claude-opus-5")
 

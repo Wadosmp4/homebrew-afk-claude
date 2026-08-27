@@ -421,6 +421,12 @@ class CompanionDaemon:
                     # identity spawn gets CLAUDE_CODE_OAUTH_TOKEN merged in.
                     cli_path=self.config.cli_path,
                     cli_env=self._effective_cli_env(),
+                    # Bug fix (user report): echoed back verbatim on
+                    # session_started so the requesting phone can recognize
+                    # its own new session without comparing cwd strings -
+                    # see sdk_adapter.py's connect() for why cwd-string
+                    # matching broke (realpath resolves through symlinks).
+                    client_request_id=action.get("client_request_id"),
                 )
             except Exception:
                 logger.exception("start_session failed for action %r", action)

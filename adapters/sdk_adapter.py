@@ -78,6 +78,7 @@ class SDKAdapter:
         resume: Optional[str] = None,
         cli_path: Optional[str] = None,
         cli_env: dict[str, str] = {},
+        client_request_id: Optional[str] = None,
     ) -> None:
         if session_id in self._sessions:
             raise ValueError(f"session already connected: {session_id}")
@@ -155,6 +156,14 @@ class SDKAdapter:
             cwd=session.cwd,
             model=model,
             permission_mode=permission_mode,
+            # Bug fix (user report): lets the requesting phone match this
+            # event to its own in-flight start_session call without
+            # comparing cwd strings, which breaks whenever session.cwd's
+            # realpath resolution (see above) differs from the raw path the
+            # phone sent - e.g. a symlinked project folder. None on any
+            # caller that isn't a phone-initiated request (e.g.
+            # _try_resume_sdk_session after a companion restart).
+            client_request_id=client_request_id,
         )
         session.reader_task = asyncio.create_task(session.read_loop())
 

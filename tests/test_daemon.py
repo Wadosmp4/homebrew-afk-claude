@@ -418,6 +418,27 @@ async def test_start_session_action_passes_the_requested_permission_mode_through
 
 
 @pytest.mark.asyncio
+async def test_start_session_action_echoes_client_request_id_through(running_daemon, phone_token):
+    """Bug fix (user report): lets the requesting phone recognize its own
+    freshly-created session on session_started without comparing cwd
+    strings - cwd comparison broke whenever sdk_adapter.py's realpath
+    resolution produced a different string than the raw path requested
+    (e.g. a symlinked project folder)."""
+    daemon, port, fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action(
+            {"kind": "start_session", "cwd": "/tmp/some-repo", "client_request_id": "req-abc"}
+        )
+
+        event = await phone.next_event()
+        assert event["type"] == "session_started"
+        assert event["data"]["client_request_id"] == "req-abc"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
 async def test_start_session_action_with_no_permission_mode_leaves_it_unset(running_daemon, phone_token):
     """R7: a start_session action that doesn't choose a mode (every
     session before this feature existed, or any client that hasn't
