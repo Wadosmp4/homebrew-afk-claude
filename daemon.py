@@ -42,6 +42,7 @@ entrypoint the plist invokes (`python3 -m companion.daemon`).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -59,7 +60,7 @@ from .adapters.codex_adapter import CodexAdapter
 from .adapters.events import Event
 from .adapters.observe_adapter import KNOWN_ENTRYPOINTS, ObserveAdapter
 from .adapters.sdk_adapter import SDKAdapter
-from .config import DEFAULT_CONFIG_PATH, CompanionConfig, load_config, save_config
+from .config import DEFAULT_SESSION_REGISTRY_PATH, CompanionConfig, load_config, save_config
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +257,11 @@ class CompanionDaemon:
         session_registry_path: Optional[str] = None,
     ):
         self.config = config
-        self.config_path = config_path or DEFAULT_CONFIG_PATH
+        # Companion-Local Token Entry & SQLite Config plan, KTD2: the
+        # shared session_registry.db file, not the legacy JSON path -
+        # config.py's own load_config/save_config now read/write a table
+        # inside it.
+        self.config_path = config_path or DEFAULT_SESSION_REGISTRY_PATH
         self.sdk_adapter = sdk_adapter or SDKAdapter()
         self.observe_adapter = observe_adapter or ObserveAdapter(
             required_entrypoints=frozenset(config.observe_entrypoints),
@@ -294,6 +299,13 @@ class CompanionDaemon:
         # for why these must be torn down on disconnect, not left to
         # discover their own dead socket.
         self._forwarding: dict[str, asyncio.Task] = {}
+        # session_id -> which adapter object owns the entry above - lets
+        # _watch_active_sessions detect and correct the one case where the
+        # wrong adapter won a session_id's forwarder slot (see that
+        # method's own comment on ObserveAdapter/SDKAdapter session_id
+        # collisions) rather than silently forwarding the wrong session's
+        # events forever.
+        self._forwarding_adapter: dict[str, object] = {}
         # _receive_loop dispatches every inbound action as its own
         # asyncio.create_task, unordered - so two actions that each read-
         # modify-write the same on-disk file (session_registry.py's
@@ -327,6 +339,14 @@ class CompanionDaemon:
                 self._backoff = min(self._backoff * 2, self.config.reconnect_max_delay)
         finally:
             await self.observe_adapter.stop()
+            # A still-active SDK-owned/Codex session's own background task
+            # (SDKAdapter's reader_task, CodexAdapter's stream_task) would
+            # otherwise outlive this daemon shutdown, leaked - orphaned,
+            # pending, and destroyed by the interpreter with no one left to
+            # await it (asyncio's own "Task was destroyed but it is
+            # pending!" warning). disconnect_all() cancels and awaits each.
+            await self.sdk_adapter.disconnect_all()
+            await self.codex_adapter.disconnect_all()
         self.state = "stopped"
 
     async def _connect_and_serve(self) -> None:
@@ -378,6 +398,7 @@ class CompanionDaemon:
                 task.cancel()
             await asyncio.gather(*forwarder_tasks, return_exceptions=True)
             self._forwarding.clear()
+            self._forwarding_adapter.clear()
 
     async def _heartbeat_loop(self, ws: "websockets.WebSocketClientProtocol") -> None:
         while True:
@@ -596,9 +617,11 @@ class CompanionDaemon:
             logger.warning("action missing session_id: %r", action)
             return
 
-        adapter = self._adapter_for(session_id)
+        adapter = self._adapter_for(session_id, include_observed=False)
         if adapter is None:
             adapter = await self._try_resume_sdk_session(session_id)
+        if adapter is None:
+            adapter = self._adapter_for(session_id)
         if adapter is None:
             logger.warning("action for unknown session_id=%r: %r", session_id, action)
             # fix(review): discovered via real-device testing - previously
@@ -662,6 +685,16 @@ class CompanionDaemon:
                 await self._handle_git_status(adapter, session_id)
             elif kind == "git_diff":
                 await self._handle_git_diff(adapter, session_id, action.get("path"))
+            elif kind == "get_file_content":
+                await self._handle_get_file_content(adapter, session_id, action.get("path"))
+            elif kind == "write_session_file":
+                await self._handle_write_session_file(
+                    adapter,
+                    session_id,
+                    action.get("path"),
+                    action.get("previous_content"),
+                    action.get("new_content"),
+                )
             elif kind == "get_session_digest":
                 await self._handle_session_digest(adapter, session_id)
             elif kind == "set_session_auto_approve":
@@ -729,6 +762,16 @@ class CompanionDaemon:
                 # convention.
                 if adapter is self.codex_adapter:
                     self.codex_adapter.set_session_sandbox(session_id, action.get("sandbox"))
+            elif kind == "stop_task":
+                # Bug fix (user report): stops a background subagent this
+                # session dispatched via the "Task" tool - SDK-owned only,
+                # same guard as set_session_permission_mode/set_session_model
+                # above (ObserveAdapter/CodexAdapter have no client of ours
+                # to send this control request to). Nothing to persist on
+                # success - unlike permission_mode/model, there's no
+                # resume-time state a stopped task needs to carry forward.
+                if adapter is self.sdk_adapter:
+                    await adapter.stop_task(session_id, action.get("task_id"))
             else:
                 logger.warning("unknown action kind: %r", kind)
         except Exception:
@@ -1166,6 +1209,45 @@ class CompanionDaemon:
         diff = await asyncio.to_thread(git_status.get_diff, cwd, path)
         adapter.emit_custom(session_id, "git_diff", path=path, **diff.to_dict())
 
+    async def _handle_get_file_content(self, adapter, session_id: str, path: Optional[str]) -> None:
+        """Quick-Edit Changed Files plan, U1 (KTD10): unlike _handle_git_diff
+        above, a missing/invalid `path` always emits a specific rejection
+        event rather than a silent log-and-drop - F3 requires every
+        rejection to reach the client with a reason."""
+        if not path:
+            adapter.emit_custom(session_id, "file_content", path=path, ok=False, content=None, reason="missing_path")
+            return
+        cwd = adapter.get_cwd(session_id)
+        if cwd is None:
+            adapter.emit_custom(session_id, "file_content", path=path, ok=False, content=None, reason="no_cwd")
+            return
+        result = await asyncio.to_thread(git_status.get_file_content, cwd, path)
+        adapter.emit_custom(session_id, "file_content", path=path, **result.to_dict())
+
+    async def _handle_write_session_file(
+        self,
+        adapter,
+        session_id: str,
+        path: Optional[str],
+        previous_content: Optional[str],
+        new_content: Optional[str],
+    ) -> None:
+        """Quick-Edit Changed Files plan, U2 (KTD10): same always-emit-a-
+        rejection convention as _handle_get_file_content above. `is None`,
+        not falsy - an empty string is a legitimate previous/new content
+        (an emptied file), not a missing field."""
+        if not path or previous_content is None or new_content is None:
+            adapter.emit_custom(session_id, "write_session_file", path=path, ok=False, reason="missing_input")
+            return
+        cwd = adapter.get_cwd(session_id)
+        if cwd is None:
+            adapter.emit_custom(session_id, "write_session_file", path=path, ok=False, reason="no_cwd")
+            return
+        result = await asyncio.to_thread(
+            git_status.write_session_file, cwd, path, previous_content, new_content
+        )
+        adapter.emit_custom(session_id, "write_session_file", path=path, **result.to_dict())
+
     async def _handle_session_digest(self, adapter, session_id: str) -> None:
         """AFK Digest plan (U2): on-demand "Catch me up" - same off-loop
         I/O + emit_custom shape as _handle_git_status/_handle_git_diff
@@ -1273,12 +1355,28 @@ class CompanionDaemon:
                 path=self.session_registry_path,
             )
 
-    def _adapter_for(self, session_id: str) -> Optional[AdapterProtocol]:
+    def _adapter_for(self, session_id: str, *, include_observed: bool = True) -> Optional[AdapterProtocol]:
         # U2 (KTD2): iterates the registry rather than naming sdk_adapter/
         # observe_adapter - preserves today's short-circuit order (SDK-owned
         # sessions resolve before observed ones) since self.adapters is
         # constructed in that same order in __init__.
-        for adapter in self.adapters:
+        #
+        # `include_observed=False` restricts this to actively-controlled
+        # adapters (sdk_adapter/codex_adapter), skipping observe_adapter
+        # entirely. The action dispatch below calls it this way *before*
+        # attempting an SDK resume: observe_adapter polls the same on-disk
+        # transcript directory an SDK-owned session's own transcript lives
+        # in, and can independently discover a just-restarted session's
+        # file before anything has resumed it - with observe_adapter left
+        # in the normal priority list at that point, this method would
+        # return it directly (list order only matters when a session_id
+        # already appears in *some* adapter's discover_sessions() - it
+        # doesn't make the SDK resume path get tried first), permanently
+        # routing every action for that session_id to observe_adapter
+        # (a no-op there for send_message and friends) instead of ever
+        # calling _try_resume_sdk_session.
+        adapters = self.adapters if include_observed else [a for a in self.adapters if a is not self.observe_adapter]
+        for adapter in adapters:
             if session_id in adapter.discover_sessions():
                 return adapter
         return None
@@ -1374,14 +1472,50 @@ class CompanionDaemon:
           re-forwarding it - _serve_connection's cleanup cancels the old
           connection's forwarder tasks and clears `self._forwarding` on
           disconnect specifically so this loop sees every still-active
-          session as needing a fresh forwarder here, on the new `ws`."""
+          session as needing a fresh forwarder here, on the new `ws`.
+
+        A session_id can (rarely, but really) be discoverable by both
+        ObserveAdapter and sdk_adapter/codex_adapter at once - ObserveAdapter
+        scans the same on-disk transcript directory an SDK-owned session's
+        own transcript lives in, and its poll can occasionally notice a
+        fresh file before that session_id's own resume/connect() has
+        finished registering it. _spawn_forwarder's "already forwarding"
+        guard means whichever adapter's tick wins that race would otherwise
+        keep the session_id's forwarder slot *permanently* - if
+        ObserveAdapter won, the SDK-owned session's own events would never
+        be forwarded at all, not even after the resume completes, since the
+        guard never re-checks who actually owns a session_id once claimed.
+        sdk_adapter/codex_adapter are authoritative for a session_id they
+        actively control; an ObserveAdapter forwarder found holding that
+        slot is reclaimed and replaced below rather than left to win by
+        having gotten there first."""
         while True:
             await self._sleep_or_stop(self.config.observe_scan_interval)
             if self._stop_event.is_set():
                 return
+            authoritative_ids = set(self.sdk_adapter.discover_sessions()) | set(self.codex_adapter.discover_sessions())
             for adapter in self.adapters:
                 for session_id in adapter.discover_sessions():
+                    if (
+                        adapter is not self.observe_adapter
+                        and session_id in authoritative_ids
+                        and self._forwarding_adapter.get(session_id) is self.observe_adapter
+                    ):
+                        await self._reclaim_forwarder(session_id)
                     self._spawn_forwarder(ws, adapter, session_id)
+
+    async def _reclaim_forwarder(self, session_id: str) -> None:
+        """Cancels and awaits an ObserveAdapter forwarder wrongly holding a
+        session_id that sdk_adapter/codex_adapter now also claims (see
+        _watch_active_sessions's own comment), then clears both bookkeeping
+        dicts so the immediately-following _spawn_forwarder call below can
+        claim it for the authoritative adapter instead."""
+        task = self._forwarding.pop(session_id, None)
+        self._forwarding_adapter.pop(session_id, None)
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     def _spawn_forwarder(self, ws: "websockets.WebSocketClientProtocol", adapter, session_id: str) -> None:
         """The only place a forwarder task is created, so `self._forwarding`
@@ -1392,6 +1526,7 @@ class CompanionDaemon:
         if session_id in self._forwarding:
             return
         self._forwarding[session_id] = asyncio.create_task(self._forward_events(ws, adapter, session_id))
+        self._forwarding_adapter[session_id] = adapter
 
     async def _forward_events(self, ws: "websockets.WebSocketClientProtocol", adapter, session_id: str) -> None:
         try:
@@ -1420,6 +1555,7 @@ class CompanionDaemon:
             logger.exception("event forwarding failed for session %r", session_id)
         finally:
             self._forwarding.pop(session_id, None)
+            self._forwarding_adapter.pop(session_id, None)
 
     def _effective_cli_env(self) -> dict[str, str]:
         """KTD1/KTD3: the env a new SDK-owned session actually launches
@@ -1485,7 +1621,7 @@ class CompanionDaemon:
 
 def main(config_path: Optional[str] = None) -> None:
     logging.basicConfig(level=logging.INFO)
-    resolved_config_path = config_path or DEFAULT_CONFIG_PATH
+    resolved_config_path = config_path or DEFAULT_SESSION_REGISTRY_PATH
     config = load_config(resolved_config_path)
     daemon = CompanionDaemon(config, config_path=resolved_config_path)
     try:

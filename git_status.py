@@ -9,6 +9,7 @@ event on the requesting session's stream (see its `_handle_action`).
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass, field
 from typing import Optional
@@ -123,3 +124,118 @@ def get_diff(cwd: str, path: str) -> GitDiff:
         return GitDiff(is_git_repo=True, is_binary=True)
 
     return GitDiff(is_git_repo=True, is_binary=False, diff=output or None)
+
+
+@dataclass
+class PathValidation:
+    ok: bool
+    resolved_path: Optional[str] = None
+    # One of "path_escape" / "deleted" / "not_changed" when ok=False.
+    reason: Optional[str] = None
+
+
+def _validate_session_path(cwd: str, path: str) -> PathValidation:
+    """Quick-Edit Changed Files plan, KTD1: shared by get_file_content and
+    write_session_file - a path must both stay inside the session's own
+    working directory (containment) and currently be one of the files
+    `git status` reports as changed (membership) before either read or
+    write touches it.
+
+    Containment mirrors auto_approve.py's _edit_is_auto_approvable exactly:
+    a relative path is joined with `cwd` *before* being resolved; an
+    absolute path is resolved as-is. This is the one existing path-safety
+    precedent anywhere in companion/ - git_diff's own `path` parameter has
+    none, which is deliberately not the pattern followed here.
+
+    Membership compares `os.path.relpath(resolved_path, resolved_cwd)`,
+    forward-slash-normalized, for an *exact* match against get_status(cwd)'s
+    modified/added lists - never a substring/endswith match, and never the
+    absolute resolved path itself, since git's own porcelain output is
+    always cwd-relative. A doc-review pass on this plan found the originally
+    drafted check compared the absolute path directly, which would have
+    rejected every legitimate changed file it was ever handed."""
+    try:
+        resolved_cwd = os.path.realpath(cwd)
+        resolved_path = os.path.realpath(path if os.path.isabs(path) else os.path.join(cwd, path))
+    except OSError:
+        return PathValidation(ok=False, reason="path_escape")
+    if not (resolved_path == resolved_cwd or resolved_path.startswith(resolved_cwd + os.sep)):
+        return PathValidation(ok=False, reason="path_escape")
+
+    status = get_status(cwd)
+    relative = os.path.relpath(resolved_path, resolved_cwd).replace(os.sep, "/")
+    if relative in status.deleted:
+        return PathValidation(ok=False, reason="deleted")
+    if relative not in status.modified and relative not in status.added:
+        return PathValidation(ok=False, reason="not_changed")
+    return PathValidation(ok=True, resolved_path=resolved_path)
+
+
+@dataclass
+class FileContentResult:
+    ok: bool
+    content: Optional[str] = None
+    # One of "path_escape" / "deleted" / "not_changed" / "binary" /
+    # "read_failed" when ok=False.
+    reason: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {"ok": self.ok, "content": self.content, "reason": self.reason}
+
+
+def get_file_content(cwd: str, path: str) -> FileContentResult:
+    """Quick-Edit Changed Files plan (R1, R4, R5, R8): the file's current
+    on-disk content, once path containment and changed-file membership
+    both hold. Binary detection (KTD5) reuses get_diff's own heuristic
+    rather than a second one - a binary changed file is flagged, not read,
+    matching the deleted-file rejection _validate_session_path already
+    gives for a deleted one."""
+    validation = _validate_session_path(cwd, path)
+    if not validation.ok:
+        return FileContentResult(ok=False, reason=validation.reason)
+    if get_diff(cwd, path).is_binary:
+        return FileContentResult(ok=False, reason="binary")
+    try:
+        with open(validation.resolved_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError:
+        return FileContentResult(ok=False, reason="read_failed")
+    return FileContentResult(ok=True, content=content)
+
+
+@dataclass
+class WriteFileResult:
+    ok: bool
+    # One of "path_escape" / "deleted" / "not_changed" / "conflict" /
+    # "read_failed" / "write_failed" when ok=False.
+    reason: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {"ok": self.ok, "reason": self.reason}
+
+
+def write_session_file(cwd: str, path: str, previous_content: str, new_content: str) -> WriteFileResult:
+    """Quick-Edit Changed Files plan (R3, R4, R5, R6; KTD2): overwrites the
+    file with `new_content`, full-content (no diff/patch), once path
+    containment and changed-file membership both hold and the file's
+    current on-disk content still matches `previous_content` byte-for-byte
+    - the exact content the client fetched when editing began, not a hash.
+    The read-compare-write below is back-to-back with no other I/O between
+    the compare and the write, minimizing (not eliminating - see the
+    plan's own Scope Boundaries) the race against a concurrent writer."""
+    validation = _validate_session_path(cwd, path)
+    if not validation.ok:
+        return WriteFileResult(ok=False, reason=validation.reason)
+    try:
+        with open(validation.resolved_path, "r", encoding="utf-8") as f:
+            current_content = f.read()
+    except OSError:
+        return WriteFileResult(ok=False, reason="read_failed")
+    if current_content != previous_content:
+        return WriteFileResult(ok=False, reason="conflict")
+    try:
+        with open(validation.resolved_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+    except OSError:
+        return WriteFileResult(ok=False, reason="write_failed")
+    return WriteFileResult(ok=True)
