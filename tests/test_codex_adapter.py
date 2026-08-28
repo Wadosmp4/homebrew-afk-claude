@@ -31,6 +31,8 @@ from openai_codex.models import (
     TurnCompletedNotification,
 )
 
+from openai_codex import Sandbox
+
 from companion.adapters.base import AdapterProtocol
 from companion.adapters.codex_adapter import CodexAdapter, UnsupportedOperation
 
@@ -70,6 +72,7 @@ class FakeThread:
 
     def __init__(self):
         self.turns: list[FakeTurnHandle] = []
+        self.turn_kwargs: list[dict] = []
         self.compact_calls = 0
         self.raise_on_turn: Exception | None = None
         self.raise_on_compact: Exception | None = None
@@ -77,6 +80,7 @@ class FakeThread:
     async def turn(self, input, **kwargs):
         if self.raise_on_turn is not None:
             raise self.raise_on_turn
+        self.turn_kwargs.append(kwargs)
         handle = FakeTurnHandle()
         self.turns.append(handle)
         return handle
@@ -155,6 +159,37 @@ async def test_connect_emits_session_started_with_agent_codex(adapter):
     assert event.type == "session_started"
     assert event.data["agent"] == "codex"
     assert event.data["cwd"] == "/repo"
+
+
+@pytest.mark.asyncio
+async def test_connect_includes_model_and_sandbox_in_session_started(adapter):
+    """code-review finding: unlike SDKAdapter's own session_started (which
+    carries model/permission_mode), CodexAdapter's originally didn't - the
+    dashboard's derivedModel/derivedSandbox both read the latest of
+    session_started or a live session_model/session_sandbox event, so a
+    freshly created Codex session with a non-default model/sandbox showed
+    "Default"/"Workspace write" until some later live change fired its own
+    event."""
+    await adapter.connect("s1", cwd="/repo", model="gpt-5.2-codex", sandbox="full_access")
+
+    events = adapter.subscribe("s1")
+    event = await events.__anext__()
+
+    assert event.type == "session_started"
+    assert event.data["model"] == "gpt-5.2-codex"
+    assert event.data["sandbox"] == "full_access"
+
+
+@pytest.mark.asyncio
+async def test_connect_with_no_model_or_sandbox_emits_session_started_with_both_none(adapter):
+    await adapter.connect("s1", cwd="/repo")
+
+    events = adapter.subscribe("s1")
+    event = await events.__anext__()
+
+    assert event.type == "session_started"
+    assert event.data["model"] is None
+    assert event.data["sandbox"] is None
 
 
 @pytest.mark.asyncio
@@ -349,10 +384,13 @@ async def test_set_session_auto_approve_returns_false_not_unsupported_operation(
 
 
 @pytest.mark.asyncio
-async def test_connect_logs_in_with_an_api_key_when_one_is_configured(adapter, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-test")
-
-    await adapter.connect("s1", cwd="/repo")
+async def test_connect_logs_in_with_an_api_key_when_one_is_configured(adapter):
+    """Codex Agent Integration plan (002), U2 (PKTD3): connect() now takes
+    an explicit, caller-resolved api_key instead of reading OPENAI_API_KEY
+    out of this process's own environment - the daemon is the one place
+    that resolves codex_active_account/codex_personal_api_key into this
+    parameter (personal mode: test scenario 4)."""
+    await adapter.connect("s1", cwd="/repo", api_key="sk-codex-test")
 
     client = adapter._test_clients["latest"]
     assert client.logged_in_with == "sk-codex-test"
@@ -360,7 +398,20 @@ async def test_connect_logs_in_with_an_api_key_when_one_is_configured(adapter, m
 
 @pytest.mark.asyncio
 async def test_connect_skips_login_with_no_api_key_configured(adapter):
+    """"vscode" mode (test scenario 3): no api_key passed at all means
+    login_api_key is never called - the default, unchanged behavior."""
     await adapter.connect("s1", cwd="/repo")
+
+    client = adapter._test_clients["latest"]
+    assert client.logged_in_with is None
+
+
+@pytest.mark.asyncio
+async def test_connect_skips_login_when_api_key_is_explicitly_none(adapter):
+    """Same as the no-argument case above, but for a caller (the daemon,
+    under "vscode" mode) that passes api_key=None explicitly rather than
+    omitting it - both must be equally inert."""
+    await adapter.connect("s1", cwd="/repo", api_key=None)
 
     client = adapter._test_clients["latest"]
     assert client.logged_in_with is None
@@ -507,3 +558,147 @@ async def test_unsupported_operation_reasons_differ_between_adapters():
 
     assert observe_result.reason == "not supported for observed sessions"
     assert codex_result.reason == "not supported for Codex sessions"
+
+
+# --- Codex Model & Sandbox Config plan (2026-08-27-001), U1 --------------
+
+
+@pytest.mark.asyncio
+async def test_connect_converts_sandbox_wire_string_to_enum_by_name(adapter):
+    """The SDK's real Sandbox enum values are hyphenated
+    ("workspace-write") while this app's wire strings are the underscored
+    member names ("workspace_write") - a value-based Sandbox(value) lookup
+    raises ValueError for every valid wire string. This asserts the exact
+    enum member reached thread_start(), so a regression back to
+    value-based lookup fails the test rather than passing on a
+    coincidentally-equal string."""
+    await adapter.connect("s1", cwd="/repo", sandbox="workspace_write")
+
+    client = adapter._test_clients["latest"]
+    assert client.thread_start_kwargs[0]["sandbox"] is Sandbox.workspace_write
+
+
+@pytest.mark.asyncio
+async def test_set_session_model_applies_starting_with_the_next_send_message(adapter):
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    result = adapter.set_session_model("s1", "gpt-5.1-codex-mini")
+    assert result is True
+
+    await adapter.send_message("s1", "hello")
+    await events.__anext__()  # user_message
+
+    thread = adapter._test_clients["latest"].threads[0]
+    assert thread.turn_kwargs[-1]["model"] == "gpt-5.1-codex-mini"
+
+
+@pytest.mark.asyncio
+async def test_set_session_sandbox_applies_starting_with_the_next_send_message(adapter):
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    result = adapter.set_session_sandbox("s1", "full_access")
+    assert result is True
+
+    await adapter.send_message("s1", "hello")
+    await events.__anext__()  # user_message
+
+    thread = adapter._test_clients["latest"].threads[0]
+    assert thread.turn_kwargs[-1]["sandbox"] is Sandbox.full_access
+
+
+@pytest.mark.asyncio
+async def test_connect_with_an_unrecognized_sandbox_string_raises_and_propagates(adapter):
+    """Fails closed at the daemon.py layer (start_session's existing outer
+    exception handler) - not silently swallowed inside connect()."""
+    with pytest.raises(KeyError):
+        await adapter.connect("s1", cwd="/repo", sandbox="not-a-real-value")
+
+
+@pytest.mark.asyncio
+async def test_set_session_sandbox_with_an_unrecognized_string_returns_false_and_leaves_sandbox_unchanged(adapter):
+    await adapter.connect("s1", cwd="/repo", sandbox="read_only")
+
+    result = adapter.set_session_sandbox("s1", "not-a-real-value")
+
+    assert result is False
+    session = adapter._sessions["s1"]
+    assert session.sandbox is Sandbox.read_only
+
+
+@pytest.mark.asyncio
+async def test_set_session_sandbox_with_none_returns_false_and_leaves_sandbox_unchanged(adapter):
+    """code-review finding: the simplify pass's shared _sandbox_from_wire()
+    helper returns None (no exception) for a None input - correct for
+    connect()'s own "no sandbox requested" semantics, but set_session_sandbox
+    must still fail closed for None here (matching the unrecognized-string
+    case above), not silently clear session.sandbox to None and report
+    success - that would be a fail-open regression on a safety-relevant
+    control the next turn() call would inherit."""
+    await adapter.connect("s1", cwd="/repo", sandbox="read_only")
+
+    result = adapter.set_session_sandbox("s1", None)
+
+    assert result is False
+    session = adapter._sessions["s1"]
+    assert session.sandbox is Sandbox.read_only
+
+
+@pytest.mark.asyncio
+async def test_set_session_model_against_an_unknown_session_id_returns_false(adapter):
+    result = adapter.set_session_model("does-not-exist", "gpt-5.1-codex-mini")
+
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_set_session_sandbox_against_an_unknown_session_id_returns_false(adapter):
+    result = adapter.set_session_sandbox("does-not-exist", "full_access")
+
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_connect_with_no_model_or_sandbox_still_calls_turn_with_both_none(adapter):
+    """Regression: a session connected with neither param set keeps today's
+    behavior - turn() is still called, now explicitly carrying
+    model=None, sandbox=None rather than omitting the kwargs."""
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    await adapter.send_message("s1", "hello")
+    await events.__anext__()  # user_message
+
+    thread = adapter._test_clients["latest"].threads[0]
+    assert thread.turn_kwargs[-1]["model"] is None
+    assert thread.turn_kwargs[-1]["sandbox"] is None
+
+
+@pytest.mark.asyncio
+async def test_set_session_model_emits_a_session_model_event(adapter):
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    adapter.set_session_model("s1", "gpt-5.1-codex-mini")
+
+    event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert event.type == "session_model"
+    assert event.data["model"] == "gpt-5.1-codex-mini"
+
+
+@pytest.mark.asyncio
+async def test_set_session_sandbox_emits_a_session_sandbox_event(adapter):
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    adapter.set_session_sandbox("s1", "full_access")
+
+    event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert event.type == "session_sandbox"
+    assert event.data["sandbox"] == "full_access"

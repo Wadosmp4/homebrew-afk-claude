@@ -98,6 +98,13 @@ class CompanionConfig:
     # file, same "never echoed back over the wire" posture as device_token.
     active_account: str = "vscode"
     personal_oauth_token: Optional[str] = None
+    # Codex Agent Integration plan (002), U2 (R8/R9/R10/PKTD3): Codex's own
+    # independent active_account/token pair, deliberately never read or
+    # written by any Claude-account code path (and vice versa) - mirrors
+    # active_account/personal_oauth_token's shape exactly, one level over,
+    # so switching one agent's identity can never bleed into the other's.
+    codex_active_account: str = "vscode"
+    codex_personal_api_key: Optional[str] = None
 
 
 def save_config(path: str, config: CompanionConfig) -> None:

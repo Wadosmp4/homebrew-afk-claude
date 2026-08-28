@@ -69,6 +69,12 @@ EVENT_TYPES = frozenset(
         # session_auto_approve's shape for the SDK-owned equivalents.
         "session_permission_mode",
         "session_model",
+        # Codex Model & Sandbox Config plan (001), U1
+        # (CodexAdapter.set_session_sandbox): Codex's own equivalent of
+        # session_model above, for the one session-level setting Codex has
+        # that Claude doesn't (Sandbox has no Claude-side counterpart, so
+        # there is no shared/renamed event - it's new and Codex-only).
+        "session_sandbox",
         # SDK-owned only (SDKAdapter._Session._emit_context_usage): a
         # ClaudeSDKClient.get_context_usage() snapshot polled once per
         # completed turn - matches what the CLI's own /context command

@@ -55,6 +55,7 @@ import websockets
 
 from . import digest, git_status, history, projects, session_registry
 from .adapters.base import AdapterProtocol
+from .adapters.codex_adapter import CodexAdapter
 from .adapters.events import Event
 from .adapters.observe_adapter import KNOWN_ENTRYPOINTS, ObserveAdapter
 from .adapters.sdk_adapter import SDKAdapter
@@ -108,6 +109,16 @@ def _redact_secrets(value: Any, secrets: tuple[str, ...]) -> Any:
 # near-instant SDK-connect case elsewhere in this module.
 _SETUP_TOKEN_TIMEOUT_SECONDS = 90.0
 _VALID_ACCOUNTS = frozenset({"vscode", "personal"})
+# Codex Agent Integration plan (002), U2 (R10): Codex's own independent
+# account-mode allowlist. Deliberately a distinct frozenset from
+# _VALID_ACCOUNTS above, not a shared alias - the two agents' reject paths
+# must stay independent even though the values happen to read the same.
+_VALID_CODEX_ACCOUNTS = frozenset({"vscode", "personal"})
+# Multi-Agent Adapter plan (009), U1 (R2): which adapter start_session
+# routes a new session to. "claude_code" is the default so every existing
+# caller that doesn't send `agent` at all keeps landing on sdk_adapter,
+# byte-for-byte unchanged from before this field existed.
+_VALID_AGENTS = frozenset({"claude_code", "codex"})
 
 # KTD4: set_personal_account_token's raw pasted token rides straight in the
 # action dict - _handle_action's generic exception logger (below) logs the
@@ -224,13 +235,13 @@ def _is_valid_remote_cli_path(cli_path: str) -> bool:
 
 class CompanionDaemon:
     """Owns one persistent (reconnecting) connection to the relay, plus the
-    SDK-owned and observe-only adapters that connection's actions/events
-    flow through.
+    SDK-owned, observe-only, and Codex-owned adapters that connection's
+    actions/events flow through.
 
-    `sdk_adapter`/`observe_adapter` are injectable so tests can substitute
-    fakes (mirroring each adapter's own `client_factory` injection point)
-    without spawning a real `claude` subprocess or touching the real
-    `~/.claude/projects` / hooks socket paths.
+    `sdk_adapter`/`observe_adapter`/`codex_adapter` are injectable so tests
+    can substitute fakes (mirroring each adapter's own `client_factory`
+    injection point) without spawning a real `claude`/Codex subprocess or
+    touching the real `~/.claude/projects` / hooks socket paths.
     """
 
     def __init__(
@@ -239,6 +250,7 @@ class CompanionDaemon:
         *,
         sdk_adapter: Optional[SDKAdapter] = None,
         observe_adapter: Optional[ObserveAdapter] = None,
+        codex_adapter: Optional[CodexAdapter] = None,
         recents_path: Optional[str] = None,
         config_path: Optional[str] = None,
         session_registry_path: Optional[str] = None,
@@ -251,6 +263,11 @@ class CompanionDaemon:
             auto_approve=config.observe_auto_approve,
             llm_judge=config.observe_llm_judge,
         )
+        # Multi-Agent Adapter plan (009), U1: the third adapter this
+        # registry was always meant to grow into (see U2's comment below) -
+        # CodexAdapter finally goes live here, wired into start_session's
+        # dispatch (below) rather than sitting orphaned.
+        self.codex_adapter = codex_adapter or CodexAdapter()
         # Multi-Agent Adapter plan (009), U2: dispatch/lookup/broadcast call
         # sites iterate this registry instead of naming self.sdk_adapter/
         # self.observe_adapter directly, so adding a third adapter (e.g.
@@ -259,7 +276,7 @@ class CompanionDaemon:
         # Claude-Code-specific adapter" (persistence gated on `adapter is
         # self.sdk_adapter`, observe-only settings actions, etc.), which
         # this plan deliberately leaves untouched (KTD2).
-        self.adapters: list[AdapterProtocol] = [self.sdk_adapter, self.observe_adapter]
+        self.adapters: list[AdapterProtocol] = [self.sdk_adapter, self.observe_adapter, self.codex_adapter]
         # Injectable for the same reason as the adapters above: tests must
         # never write into the developer's real recent-projects file
         # (projects.DEFAULT_RECENTS_PATH) just by exercising start_session.
@@ -405,46 +422,108 @@ class CompanionDaemon:
         kind = action.get("kind")
 
         if kind == "start_session":
-            session_id = str(uuid4())
-            try:
-                await self.sdk_adapter.connect(
-                    session_id,
-                    cwd=action.get("cwd"),
-                    model=action.get("model"),
-                    permission_mode=action.get("permission_mode"),
-                    # Unlike model/permission_mode above, cli_path/cli_env
-                    # (KTD5) are Mac-level settings with no phone-side
-                    # per-request equivalent - always sourced from this
-                    # companion's own config, never the action payload.
-                    # cli_env goes through _effective_cli_env (R2/KTD1/
-                    # KTD3), not the raw config field, so a "personal"-
-                    # identity spawn gets CLAUDE_CODE_OAUTH_TOKEN merged in.
-                    cli_path=self.config.cli_path,
-                    cli_env=self._effective_cli_env(),
-                    # Bug fix (user report): echoed back verbatim on
-                    # session_started so the requesting phone can recognize
-                    # its own new session without comparing cwd strings -
-                    # see sdk_adapter.py's connect() for why cwd-string
-                    # matching broke (realpath resolves through symlinks).
-                    client_request_id=action.get("client_request_id"),
+            # Multi-Agent Adapter plan (009), U1 (R2): "claude_code" default
+            # keeps every pre-existing caller (nothing sends `agent` yet)
+            # routed to sdk_adapter exactly as before - only an explicit
+            # "codex" opts into the new adapter. An unrecognized value is
+            # rejected outright (logged, no session created), mirroring
+            # _handle_set_active_account's own reject-unknown-value
+            # convention below - there's no start_session-specific confirm-
+            # back event to reply on, so silently declining to create a
+            # session (like the missing-session_id case elsewhere in this
+            # method) is the equivalent "reply".
+            agent = action.get("agent") or "claude_code"
+            if agent not in _VALID_AGENTS:
+                logger.warning(
+                    "rejected start_session agent %r: must be one of %r", agent, sorted(_VALID_AGENTS)
                 )
+                return
+            session_id = str(uuid4())
+            adapter: AdapterProtocol = self.codex_adapter if agent == "codex" else self.sdk_adapter
+            try:
+                if agent == "codex":
+                    # No permission_mode: Codex has no interactive
+                    # per-tool-call approval concept (see codex_adapter.py's
+                    # module docstring, spike-finding #2) - it runs under
+                    # its own ApprovalMode.auto_review instead.
+                    #
+                    # U2 (PKTD3): api_key mirrors _effective_cli_env's own
+                    # active_account branch above, one level simpler - Codex
+                    # has no ambient-env-precedence-stripping concern to
+                    # replicate (KTD3), just "pass the configured personal
+                    # key under 'personal', pass nothing under 'vscode'".
+                    # Only ever reads codex_active_account/
+                    # codex_personal_api_key, never Claude's own
+                    # active_account/personal_oauth_token (R10).
+                    #
+                    # Merge (main): client_request_id (bug fix, user report -
+                    # 2aba83b) applies equally to Codex-started sessions -
+                    # mobile's reduceEvent() matches ANY session_started event
+                    # by client_request_id regardless of agent, so omitting it
+                    # here would silently regress that fix back to cwd-string
+                    # matching for Codex sessions specifically.
+                    await self.codex_adapter.connect(
+                        session_id,
+                        cwd=action.get("cwd"),
+                        model=action.get("model"),
+                        sandbox=action.get("sandbox"),
+                        api_key=(
+                            self.config.codex_personal_api_key
+                            if self.config.codex_active_account == "personal"
+                            else None
+                        ),
+                        client_request_id=action.get("client_request_id"),
+                    )
+                else:
+                    await self.sdk_adapter.connect(
+                        session_id,
+                        cwd=action.get("cwd"),
+                        model=action.get("model"),
+                        permission_mode=action.get("permission_mode"),
+                        # Unlike model/permission_mode above, cli_path/cli_env
+                        # (KTD5) are Mac-level settings with no phone-side
+                        # per-request equivalent - always sourced from this
+                        # companion's own config, never the action payload.
+                        # cli_env goes through _effective_cli_env (R2/KTD1/
+                        # KTD3), not the raw config field, so a "personal"-
+                        # identity spawn gets CLAUDE_CODE_OAUTH_TOKEN merged in.
+                        cli_path=self.config.cli_path,
+                        cli_env=self._effective_cli_env(),
+                        # Bug fix (user report): echoed back verbatim on
+                        # session_started so the requesting phone can recognize
+                        # its own new session without comparing cwd strings -
+                        # see sdk_adapter.py's connect() for why cwd-string
+                        # matching broke (realpath resolves through symlinks).
+                        client_request_id=action.get("client_request_id"),
+                    )
             except Exception:
                 logger.exception("start_session failed for action %r", action)
                 return
-            self._spawn_forwarder(ws, self.sdk_adapter, session_id)
-            resolved_cwd = self.sdk_adapter.get_cwd(session_id)
+            self._spawn_forwarder(ws, adapter, session_id)
+            resolved_cwd = adapter.get_cwd(session_id)
             if resolved_cwd:
                 async with self._recents_lock:
                     await asyncio.to_thread(projects.record_recent, resolved_cwd, self.recents_path)
-                async with self._session_registry_lock:
-                    await asyncio.to_thread(
-                        session_registry.upsert_session,
-                        session_id,
-                        cwd=resolved_cwd,
-                        model=action.get("model"),
-                        permission_mode=action.get("permission_mode"),
-                        path=self.session_registry_path,
-                    )
+                # Code-review fix: only sdk_adapter sessions get a
+                # session_registry row. That row exists purely to support
+                # _try_resume_sdk_session after a restart, which resolves
+                # cwd via observe_adapter.projects_dir (~/.claude/projects)
+                # - a Codex session_id can never match there, so a Codex
+                # row could never actually be resumed. Writing one anyway
+                # would leave it permanently 'active' forever, since the
+                # end-marking gates below are (correctly) sdk_adapter-only
+                # - simpler to never create the unresumable row than to
+                # widen every end-marking gate just to clean up after it.
+                if adapter is self.sdk_adapter:
+                    async with self._session_registry_lock:
+                        await asyncio.to_thread(
+                            session_registry.upsert_session,
+                            session_id,
+                            cwd=resolved_cwd,
+                            model=action.get("model"),
+                            permission_mode=action.get("permission_mode"),
+                            path=self.session_registry_path,
+                        )
             return
 
         if kind == "list_projects":
@@ -512,6 +591,14 @@ class CompanionDaemon:
 
         if kind == "start_personal_account_setup":
             await self._handle_start_personal_account_setup(ws)
+            return
+
+        if kind == "set_active_codex_account":
+            await self._handle_set_active_codex_account(ws, action.get("codex_active_account"))
+            return
+
+        if kind == "set_personal_codex_account_token":
+            await self._handle_set_personal_codex_account_token(ws, action.get("token"))
             return
 
         if kind == "compose_digest":
@@ -630,10 +717,32 @@ class CompanionDaemon:
                 # R10: model's counterpart to set_session_permission_mode
                 # directly above - same guard, same persist-on-success-only
                 # shape.
+                #
+                # Codex Model & Sandbox Config plan (001), U2 (KTD5): widened
+                # to branch by adapter instead of introducing a Codex-
+                # specific action name for the same concept - a Codex-owned
+                # session's set_session_model reaches CodexAdapter directly.
+                # No `await` (CodexAdapter.set_session_model is sync - purely
+                # local state, no SDK round-trip) and no session_registry
+                # persistence (that registry only exists to support
+                # sdk_adapter's own _try_resume_sdk_session; Codex sessions
+                # never get a row there - see start_session's own comment on
+                # this above).
                 if adapter is self.sdk_adapter:
                     model = action.get("model")
                     if await adapter.set_session_model(session_id, model):
                         await self._persist_sdk_session_registry(session_id, model=model)
+                elif adapter is self.codex_adapter:
+                    self.codex_adapter.set_session_model(session_id, action.get("model"))
+            elif kind == "set_session_sandbox":
+                # Codex Model & Sandbox Config plan (001), U2 (R6/R7/KTD5):
+                # Codex-only - Claude has no sandbox concept, so this is
+                # guarded to CodexAdapter alone (not a shared-name branch
+                # like set_session_model above) and is a no-op for any other
+                # adapter, matching the existing observe-only-session no-op
+                # convention.
+                if adapter is self.codex_adapter:
+                    self.codex_adapter.set_session_sandbox(session_id, action.get("sandbox"))
             else:
                 logger.warning("unknown action kind: %r", kind)
         except Exception:
@@ -684,10 +793,29 @@ class CompanionDaemon:
         ] + [
             {
                 "session_id": sid,
+                "cwd": self.codex_adapter.get_cwd(sid),
+                "mode": "sdk_owned",
+                "active": bool(self.codex_adapter.is_active(sid)),
+                # Code-review fix: this snapshot previously only knew
+                # about sdk_adapter/observe_adapter (from before
+                # codex_adapter existed) - a live Codex session was
+                # entirely absent from it, disappearing from the phone's
+                # list on any remount that lost live-witnessed state.
+                "agent": "codex",
+            }
+            for sid in self.codex_adapter.discover_sessions()
+        ] + [
+            {
+                "session_id": sid,
                 "cwd": self.observe_adapter.get_cwd(sid),
                 "mode": "observe_only",
                 "active": bool(self.observe_adapter.is_active(sid)),
-                "agent": "claude_code",
+                # Code-review fix: an observed session can genuinely be
+                # Codex now (ObserveAdapter.get_agent) - the "claude_code"
+                # literal here used to be correct unconditionally, back
+                # when this was the only agent ObserveAdapter could ever
+                # discover.
+                "agent": self.observe_adapter.get_agent(sid) or "claude_code",
             }
             for sid in self.observe_adapter.discover_sessions()
         ]
@@ -883,7 +1011,16 @@ class CompanionDaemon:
         sessions launch under. Never reports personal_oauth_token's raw
         value (KTD4) - only whether it's configured, so the phone can show
         the "Custom auth token" option as available/unavailable without the
-        secret ever riding this response."""
+        secret ever riding this response.
+
+        Codex Agent Integration plan (002), U2 (R8): the same event now
+        also carries Codex's own, independent codex_active_account/
+        codex_personal_configured fields alongside Claude's - one wider
+        payload rather than a second event, since both describe the same
+        "what does this companion report as its account settings" moment
+        and the phone already re-fetches/re-renders this whole event on any
+        one change (R10: reads self.config.codex_* only, never
+        active_account/personal_oauth_token)."""
         event = {
             "session_id": "_account_settings",
             "event_id": 0,
@@ -892,6 +1029,8 @@ class CompanionDaemon:
             "data": {
                 "active_account": self.config.active_account,
                 "personal_configured": self.config.personal_oauth_token is not None,
+                "codex_active_account": self.config.codex_active_account,
+                "codex_personal_configured": self.config.codex_personal_api_key is not None,
             },
         }
         await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
@@ -961,6 +1100,62 @@ class CompanionDaemon:
             "data": {"available": False},
         }
         await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
+
+    async def _handle_set_active_codex_account(
+        self, ws: "websockets.WebSocketClientProtocol", codex_active_account: Optional[str]
+    ) -> None:
+        """Codex Agent Integration plan (002), U2 (R9/R10): mirrors
+        _handle_set_active_account exactly, one level over - rejects an
+        unknown value, and rejects switching to "personal" before a
+        codex_personal_api_key exists, same reject-outright-but-still-
+        confirm-back convention. Only ever reads/writes
+        self.config.codex_active_account - never Claude's own
+        active_account (R10)."""
+        if codex_active_account is None:
+            logger.warning("set_active_codex_account action missing codex_active_account")
+            await self._handle_get_account_settings(ws)
+            return
+        if codex_active_account not in _VALID_CODEX_ACCOUNTS:
+            logger.warning(
+                "rejected set_active_codex_account %r: must be one of %r",
+                codex_active_account,
+                sorted(_VALID_CODEX_ACCOUNTS),
+            )
+            await self._handle_get_account_settings(ws)
+            return
+        if codex_active_account == "personal" and self.config.codex_personal_api_key is None:
+            logger.warning(
+                "rejected set_active_codex_account 'personal': no codex_personal_api_key configured yet"
+            )
+            await self._handle_get_account_settings(ws)
+            return
+        self.config.codex_active_account = codex_active_account
+        await asyncio.to_thread(save_config, self.config_path, self.config)
+        await self._handle_get_account_settings(ws)
+
+    async def _store_personal_codex_account_token(self, token: str) -> None:
+        """Codex's own persistence path, mirroring
+        _store_personal_account_token - only ever writes
+        self.config.codex_personal_api_key, never Claude's own
+        personal_oauth_token (R10). Unlike Claude's pair of callers, there
+        is no automated pty-capture flow to share this with: Codex has no
+        `claude setup-token`-equivalent CLI command to shell out to (see
+        _handle_start_personal_account_setup's own docstring) - a manual
+        paste is the only entry point."""
+        self.config.codex_personal_api_key = token
+        await asyncio.to_thread(save_config, self.config_path, self.config)
+
+    async def _handle_set_personal_codex_account_token(
+        self, ws: "websockets.WebSocketClientProtocol", token: Optional[str]
+    ) -> None:
+        """Codex's own manual-entry point, mirroring
+        _handle_set_personal_account_token."""
+        if token is None or not token.strip():
+            logger.warning("rejected set_personal_codex_account_token: empty or missing token")
+            await self._handle_get_account_settings(ws)
+            return
+        await self._store_personal_codex_account_token(token.strip())
+        await self._handle_get_account_settings(ws)
 
     async def _handle_git_status(self, adapter, session_id: str) -> None:
         """U10 (R16): computes git status for the session's cwd off the
@@ -1275,8 +1470,19 @@ class CompanionDaemon:
     def _secret_values(self) -> tuple[str, ...]:
         """KTD8: current secret values to redact from forwarded content -
         filters out personal_oauth_token when unset (None) rather than
-        passing an empty-string redaction target."""
-        return tuple(value for value in (self.config.device_token, self.config.personal_oauth_token) if value)
+        passing an empty-string redaction target. codex_personal_api_key
+        (U2) gets the same treatment - a Codex session's own forwarded
+        tool output is just as capable of echoing a configured secret back
+        verbatim as an SDK-owned Claude session is."""
+        return tuple(
+            value
+            for value in (
+                self.config.device_token,
+                self.config.personal_oauth_token,
+                self.config.codex_personal_api_key,
+            )
+            if value
+        )
 
     async def _send_event(self, ws: "websockets.WebSocketClientProtocol", event: Event) -> None:
         wire = event.to_dict()

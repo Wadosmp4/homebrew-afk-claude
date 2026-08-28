@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from collections.abc import AsyncIterator
 from typing import Any, Callable, Optional
 
@@ -76,6 +75,24 @@ def _tool_input_for_item(item: Any) -> dict[str, Any]:
     return {}
 
 
+def _sandbox_from_wire(sandbox: Optional[str]) -> Optional[Any]:
+    """Codex Model & Sandbox Config plan (001), simplify pass: the one
+    place the wire-string -> Sandbox enum conversion lives, called from both
+    connect() and set_session_sandbox() - previously duplicated in each.
+    `sandbox` is a wire string using the SDK's *member name* convention
+    ("workspace_write"), not its hyphenated enum *value* ("workspace-write"),
+    so this is always a name-based `Sandbox[sandbox]` lookup, never
+    `Sandbox(sandbox)` - the latter raises ValueError for every valid wire
+    string. Returns None unchanged for a None input (connect()'s own
+    "no sandbox requested" case); raises KeyError for an unrecognized name,
+    same as a bare `Sandbox[sandbox]` would - each call site decides for
+    itself whether that should propagate (connect(), fail-closed) or be
+    caught (set_session_sandbox(), fail-soft)."""
+    from openai_codex import Sandbox
+
+    return Sandbox[sandbox] if sandbox is not None else None
+
+
 def _tool_result_for_item(item: Any) -> tuple[str, bool]:
     """Returns (content, is_error), matching sdk_adapter.py's own
     tool_result shape."""
@@ -107,32 +124,86 @@ class CodexAdapter:
     def discover_sessions(self) -> list[str]:
         return list(self._sessions)
 
-    async def connect(self, session_id: str, *, cwd: Optional[str] = None, model: Optional[str] = None) -> None:
+    async def connect(
+        self,
+        session_id: str,
+        *,
+        cwd: Optional[str] = None,
+        model: Optional[str] = None,
+        sandbox: Optional[str] = None,
+        api_key: Optional[str] = None,
+        client_request_id: Optional[str] = None,
+    ) -> None:
+        """Codex Agent Integration plan (002), U2 (PKTD3): `api_key` is now
+        an explicit, caller-resolved value rather than this adapter reading
+        OPENAI_API_KEY out of its own process environment - the daemon is
+        the one place that knows whether codex_active_account is "personal"
+        (pass the configured codex_personal_api_key) or "vscode" (pass
+        nothing, the default). Omitting it entirely keeps today's
+        implicit-default "vscode" behavior - skip login_api_key() and let
+        the ambient CLI/SDK login resolve itself, exactly as before.
+
+        Codex Model & Sandbox Config plan (001), U1: `sandbox` is converted
+        via the shared `_sandbox_from_wire()` helper above (name-based
+        lookup, not value-based - see its own docstring for why). An
+        unrecognized wire string raises (KeyError) here and propagates
+        uncaught out of connect() - fails closed at daemon.py's existing
+        start_session outer exception handler, no new handling needed in
+        this adapter."""
         from openai_codex import ApprovalMode, AsyncCodex
 
         client = self._client_factory() if self._client_factory is not None else AsyncCodex()
         # Code-review fix: a failure anywhere in this setup sequence must
         # not leak the just-constructed client - nothing else can reach it
         # to close it otherwise, since it's never stored until the
-        # _CodexSession below is actually created.
+        # _CodexSession below is actually created. This also covers an
+        # unrecognized sandbox string's KeyError, which must close the
+        # client identically to any other setup failure.
         try:
-            api_key = os.environ.get("OPENAI_API_KEY")
+            sandbox_enum = _sandbox_from_wire(sandbox)
             if api_key:
                 await client.login_api_key(api_key)
             resolved_cwd = cwd or self._cwd
-            thread = await client.thread_start(approval_mode=ApprovalMode.auto_review, cwd=resolved_cwd, model=model)
+            thread = await client.thread_start(
+                approval_mode=ApprovalMode.auto_review, cwd=resolved_cwd, model=model, sandbox=sandbox_enum
+            )
         except Exception:
             await client.close()
             raise
 
         session = _CodexSession(session_id, client=client, thread=thread)
         session.cwd = resolved_cwd
+        session.model = model
+        session.sandbox = sandbox_enum
         self._sessions[session_id] = session
         # KTD4: agent="codex" is the only shape difference from SDKAdapter's
         # own session_started - mobile reads it for KTD5's minimal labeling,
         # defaulting to "claude_code" everywhere else so no existing event
         # payload needs to change shape.
-        session.emit("session_started", mode="sdk_owned", agent="codex", cwd=resolved_cwd)
+        #
+        # code-review finding: model/sandbox must be included here, matching
+        # SDKAdapter's own session_started (which carries model/permission_mode) -
+        # the dashboard's derivedModel/derivedSandbox both read the latest of
+        # session_started or a live session_model/session_sandbox event, so
+        # without these fields a freshly created Codex session showed
+        # "Default"/"Workspace write" regardless of what was actually chosen,
+        # until some later live change happened to fire its own event. Wire
+        # strings (model/sandbox as passed in, not sandbox_enum) match what
+        # set_session_model/set_session_sandbox already emit on a live change.
+        #
+        # Merge (main): client_request_id (bug fix, user report - 2aba83b)
+        # mirrors sdk_adapter.py's own connect() - mobile's reduceEvent()
+        # matches ANY session_started event by client_request_id regardless
+        # of agent, not just SDK-owned ones.
+        session.emit(
+            "session_started",
+            mode="sdk_owned",
+            agent="codex",
+            cwd=resolved_cwd,
+            model=model,
+            sandbox=sandbox,
+            client_request_id=client_request_id,
+        )
 
     async def send_message(self, session_id: str, text: str) -> None:
         from openai_codex import TextInput
@@ -146,7 +217,9 @@ class CodexAdapter:
         if session.stream_task is not None and not session.stream_task.done():
             session.stream_task.cancel()
         try:
-            turn_handle = await session.thread.turn(TextInput(text=text))
+            turn_handle = await session.thread.turn(
+                TextInput(text=text), model=session.model, sandbox=session.sandbox
+            )
         except Exception as exc:
             logger.warning("Codex turn failed to start for session %s: %s", session_id, exc)
             session.emit("error", message=str(exc))
@@ -219,6 +292,49 @@ class CodexAdapter:
         # there's no per-session auto_approve/llm_judge concept for Codex
         # to actually set (only the coarse, thread-level ApprovalMode).
         return False
+
+    def set_session_model(self, session_id: str, model: Optional[str]) -> bool:
+        """Codex Model & Sandbox Config plan (001), U1: no SDK round-trip -
+        purely local state, applied starting with the session's next
+        send_message()/turn() call (KTD2). Mirrors sdk_adapter.py's own
+        set_session_model emit/return-bool shape, minus its
+        asyncio.wait_for/CLIConnectionError handling, which this
+        local-state-only path doesn't need."""
+        session = self._sessions.get(session_id)
+        if session is None:
+            return False
+        session.model = model
+        session.emit("session_model", model=model)
+        return True
+
+    def set_session_sandbox(self, session_id: str, sandbox: Optional[str]) -> bool:
+        """Same shape as set_session_model above. Uses the same shared
+        `_sandbox_from_wire()` helper connect() does, but an unrecognized
+        wire string is caught here (unlike connect()'s deliberate fail-closed
+        raise) since this is a live user action against an already-running
+        session, not session creation - returns False and leaves the
+        session's stored sandbox unchanged rather than raising.
+
+        code-review finding: `sandbox=None` must fail the same way as any
+        other unrecognized value here, even though `_sandbox_from_wire(None)`
+        itself returns None (no exception) - that None-passthrough is only
+        correct for connect()'s own "no sandbox requested" semantics. Left
+        unguarded, a live action missing its sandbox field would silently
+        clear session.sandbox to None instead of leaving it unchanged, and
+        the next turn() call would send the real SDK no sandbox override at
+        all - a fail-open regression on a safety-relevant control."""
+        if sandbox is None:
+            return False
+        session = self._sessions.get(session_id)
+        if session is None:
+            return False
+        try:
+            sandbox_enum = _sandbox_from_wire(sandbox)
+        except KeyError:
+            return False
+        session.sandbox = sandbox_enum
+        session.emit("session_sandbox", sandbox=sandbox)
+        return True
 
     def get_cwd(self, session_id: str) -> Optional[str]:
         session = self._sessions.get(session_id)
@@ -318,6 +434,8 @@ class _CodexSession:
         self.sequencer = EventSequencer(session_id)
         self.events: asyncio.Queue[Event] = asyncio.Queue()
         self.cwd: Optional[str] = None
+        self.model: Optional[str] = None
+        self.sandbox: Optional[Any] = None
         self.current_turn: Optional[Any] = None
         self.stream_task: Optional[asyncio.Task] = None
         self._ended = False
