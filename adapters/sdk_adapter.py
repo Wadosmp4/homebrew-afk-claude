@@ -13,6 +13,7 @@ fields beyond what's captured in each event's `data`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 from collections.abc import AsyncIterator, Callable
@@ -29,12 +30,17 @@ from claude_agent_sdk import (
     PermissionResultDeny,
     RateLimitEvent,
     ResultMessage,
+    TaskNotificationMessage,
+    TaskProgressMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
 )
 
 from ..auto_approve import is_structured_question as _is_structured_question
+from ..rate_limit_estimator import RateLimitEstimator
 from .events import Event, EventSequencer, truncate_tool_result_content
 
 logger = logging.getLogger(__name__)
@@ -64,6 +70,13 @@ class SDKAdapter:
         self._client_factory: ClientFactory = client_factory or (lambda options: ClaudeSDKClient(options))
         self._default_cwd = os.path.realpath(cwd) if cwd else None
         self._sessions: dict[str, "_Session"] = {}
+        # Bug fix (user report): one estimator for this whole adapter, not
+        # per-session - an account's rate limit is shared across every
+        # session this companion happens to be driving concurrently, so the
+        # token counter and per-window calibration must be too. See
+        # rate_limit_estimator.py's own module docstring for why this
+        # exists and what it can't do.
+        self._rate_limit_estimator = RateLimitEstimator()
 
     def discover_sessions(self) -> list[str]:
         return list(self._sessions)
@@ -82,7 +95,7 @@ class SDKAdapter:
         if session_id in self._sessions:
             raise ValueError(f"session already connected: {session_id}")
 
-        session = _Session(session_id)
+        session = _Session(session_id, rate_limit_estimator=self._rate_limit_estimator)
         # Resolved (not just whatever string the phone sent) so this
         # matches what the real `claude` subprocess itself records as its
         # transcript's own cwd (it resolves symlinks internally - e.g.
@@ -267,6 +280,42 @@ class SDKAdapter:
         session.emit("session_model", model=model)
         return True
 
+    async def stop_task(self, session_id: str, task_id: str) -> bool:
+        """Bug fix (user report): stops a background subagent this session
+        dispatched via the "Task" tool - claude_agent_sdk.ClaudeSDKClient's
+        own stop_task() control request, same live-control-request shape
+        as set_session_permission_mode/set_session_model above (bounded
+        wait, same unknown-session/racing-end_session handling, see that
+        method's docstring for both).
+
+        Does not emit anything itself - per stop_task()'s own docstring, a
+        task_notification message (TaskNotificationMessage, status
+        'stopped') follows asynchronously through the normal read_loop once
+        the CLI subprocess actually stops it, which _handle_message already
+        turns into a task_update event above. Returns False (no-op, same
+        convention as every other method here) for an unknown session_id or
+        an unknown/already-finished task_id - claude_agent_sdk's own
+        stop_task() raises neither in that case (confirmed via its
+        docstring/signature), but nothing here assumes what it does when
+        the task_id is already terminal beyond "don't crash the read loop
+        over it"."""
+        session = self._sessions.get(session_id)
+        if session is None:
+            return False
+        try:
+            await asyncio.wait_for(session.client.stop_task(task_id), timeout=_LIVE_CONTROL_REQUEST_TIMEOUT_SECONDS)
+        except CLIConnectionError:
+            logger.info(
+                "stop_task for %s/%s raced a concurrent end_session and lost - client already disconnected",
+                session_id,
+                task_id,
+            )
+            return False
+        except asyncio.TimeoutError:
+            logger.warning("stop_task for %s/%s timed out waiting on the CLI subprocess", session_id, task_id)
+            return False
+        return True
+
     async def respond_to_permission(
         self, session_id: str, request_id: str, decision: str, *, message: str = ""
     ) -> None:
@@ -286,8 +335,27 @@ class SDKAdapter:
             session.resolve_permission(request_id, "deny", "Session ended before this was answered")
         if session.reader_task is not None:
             session.reader_task.cancel()
+            # cancel() only *schedules* cancellation - without awaiting the
+            # task afterward, disconnect() can return (and a test's event
+            # loop can close) while read_loop() is still pending, which
+            # asyncio reports as "Task was destroyed but it is pending!"
+            # and, if it was itself awaiting a queue .get(), sometimes a
+            # "RuntimeError: Event loop is closed" from that coroutine
+            # being garbage-collected after the loop is gone.
+            with contextlib.suppress(asyncio.CancelledError):
+                await session.reader_task
         await session.client.disconnect()
         session.end("disconnected")
+
+    async def disconnect_all(self) -> None:
+        """Daemon shutdown (companion/daemon.py's run()): every still-active
+        session's reader_task must be cancelled and awaited before the
+        process exits, or it's leaked - orphaned, pending, and destroyed by
+        the interpreter with no one left to await it. discover_sessions()'s
+        own snapshot is taken once up front since disconnect() mutates
+        _sessions as it goes."""
+        for session_id in self.discover_sessions():
+            await self.disconnect(session_id)
 
     def get_cwd(self, session_id: str) -> Optional[str]:
         """U10 (R16): the working directory git_status/git_diff should
@@ -337,7 +405,7 @@ class _Session:
     for (respond_to_permission resolves a Future here, unblocking the
     can_use_tool callback the SDK is awaiting on)."""
 
-    def __init__(self, session_id: str):
+    def __init__(self, session_id: str, *, rate_limit_estimator: RateLimitEstimator):
         self.session_id = session_id
         self.sequencer = EventSequencer(session_id)
         self.events: asyncio.Queue[Event] = asyncio.Queue()
@@ -345,6 +413,10 @@ class _Session:
         self.pending: dict[str, asyncio.Future] = {}
         self.auto_allowed_tools: set[str] = set()
         self.tool_started_at: dict[str, float] = {}
+        # Bug fix (user report): shared across every session this adapter
+        # drives (see SDKAdapter.__init__'s own comment) - not this
+        # session's own private tracker.
+        self.rate_limit_estimator = rate_limit_estimator
         self.client: Any = None
         self.reader_task: Optional[asyncio.Task] = None
         self.cwd: Optional[str] = None
@@ -490,8 +562,92 @@ class _Session:
                 self.emit("error", message=message.result or f"turn ended with error: {message.subtype}")
             else:
                 self.emit("waiting_for_input", subtype=message.subtype)
+            # Bug fix (user report): this turn's own token usage, recorded
+            # regardless of is_error - a failed turn still spent tokens
+            # getting there. See rate_limit_estimator.py's own docstring
+            # for why this exists.
+            self.rate_limit_estimator.record_turn_usage(message.model_usage)
+            self._emit_rate_limit_estimates()
         elif isinstance(message, RateLimitEvent):
             self._handle_rate_limit(message)
+        # Bug fix (user report): a background subagent dispatched via the
+        # "Task" tool (claude_agent_sdk.ToolUseBlock with name "Task",
+        # already rendered as "Running subagent" - see
+        # mobile/lib/toolDescriptions.ts) keeps running after the
+        # dispatching turn's own ResultMessage/waiting_for_input fires -
+        # the two are unrelated: one SDK query() call completing has
+        # nothing to do with a detached subagent it kicked off still being
+        # active. These four message types (all claude_agent_sdk.SystemMessage
+        # subclasses, so must be checked as their own isinstance branches,
+        # not folded into a generic SystemMessage case that doesn't exist
+        # here) are the CLI's own lifecycle reporting for that subagent -
+        # forwarding them lets the phone track "is a task I dispatched
+        # still running" independently of this turn's own waiting_for_input,
+        # and lets stop_task() below give it something real to cancel.
+        elif isinstance(message, TaskStartedMessage):
+            self.emit(
+                "task_update",
+                phase="started",
+                task_id=message.task_id,
+                description=message.description,
+                tool_use_id=message.tool_use_id,
+            )
+        elif isinstance(message, TaskProgressMessage):
+            self.emit(
+                "task_update",
+                phase="progress",
+                task_id=message.task_id,
+                description=message.description,
+                tool_use_id=message.tool_use_id,
+            )
+            # Bug fix (user report): a periodic progress tick is exactly
+            # when a token-hungry subagent's usage would otherwise go
+            # unnoticed until it finally finishes - record and re-estimate
+            # here too, not only at the notification below.
+            self.rate_limit_estimator.record_task_usage(message.task_id, message.usage)
+            self._emit_rate_limit_estimates()
+        elif isinstance(message, TaskUpdatedMessage):
+            self.emit(
+                "task_update",
+                phase="updated",
+                task_id=message.task_id,
+                status=message.status,
+            )
+        elif isinstance(message, TaskNotificationMessage):
+            # The authoritative "this task is over" signal - stop_task()'s
+            # own docstring says a stopped task always reports here with
+            # status 'stopped'; a naturally-finished one reports 'completed'
+            # or 'failed'. All three are terminal (claude_agent_sdk's own
+            # TERMINAL_TASK_STATUSES agrees, though that frozenset also
+            # includes TaskUpdatedMessage's 'killed', not reachable from
+            # this message type).
+            self.emit(
+                "task_update",
+                phase="notification",
+                task_id=message.task_id,
+                status=message.status,
+                summary=message.summary,
+                tool_use_id=message.tool_use_id,
+            )
+            # Bug fix (user report): this task's final usage total - see
+            # record_task_usage's own docstring for why only the delta
+            # since the last progress tick (if any) actually gets added.
+            self.rate_limit_estimator.record_task_usage(message.task_id, message.usage)
+            self._emit_rate_limit_estimates()
+
+    def _emit_rate_limit_estimates(self) -> None:
+        """Bug fix (user report): a fresh guess for every window with
+        enough real history to extrapolate from, sent right after new
+        token usage was just recorded - see rate_limit_estimator.py's own
+        module docstring for what this can and can't do. A window with no
+        real reading yet, or only one (nothing to calibrate a slope from),
+        is silently skipped rather than guessing at it - see estimate()'s
+        own docstring for why None isn't "assume zero"."""
+        for rate_limit_type in self.rate_limit_estimator.calibrated_types():
+            utilization = self.rate_limit_estimator.estimate(rate_limit_type)
+            if utilization is None:
+                continue
+            self.emit("rate_limit_estimate", rate_limit_type=rate_limit_type, utilization=utilization)
 
     def _handle_rate_limit(self, message: RateLimitEvent) -> None:
         # Pushed by the CLI only on a status transition (e.g.
@@ -517,6 +673,13 @@ class _Session:
             overage_resets_at=info.overage_resets_at,
             raw=info.raw,
         )
+        # Bug fix (user report): a real reading always wins - recalibrates
+        # (or starts calibrating) this window's own estimate from here.
+        # Skipped when rate_limit_type itself is nullable-and-null in the
+        # CLI's own payload - nothing to calibrate for a window we don't
+        # even know the identity of.
+        if info.rate_limit_type is not None:
+            self.rate_limit_estimator.record_real_reading(info.rate_limit_type, info.utilization)
 
     def _handle_tool_result(self, block: ToolResultBlock) -> None:
         started_at = self.tool_started_at.pop(block.tool_use_id, None)

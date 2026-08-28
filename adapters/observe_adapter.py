@@ -191,11 +191,23 @@ class ObserveAdapter:
         self._watch_task = asyncio.create_task(self._watch_projects_dir())
 
     async def stop(self) -> None:
+        # cancel() alone only *schedules* cancellation - without awaiting
+        # each task afterward, a still-pending one (a coroutine suspended
+        # on a queue/socket read) can outlive this daemon shutdown, leaked
+        # and later destroyed by the interpreter with no one left to await
+        # it (asyncio's own "Task was destroyed but it is pending!"
+        # warning, and - if it was itself waiting on a selector-registered
+        # fd - a "RuntimeError: Event loop is closed" from that coroutine's
+        # own cleanup running after the loop that owned it already closed).
         if self._watch_task is not None:
             self._watch_task.cancel()
-        for session in self._sessions.values():
-            if session.tail_task is not None:
-                session.tail_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._watch_task
+        tail_tasks = [session.tail_task for session in self._sessions.values() if session.tail_task is not None]
+        for task in tail_tasks:
+            task.cancel()
+        if tail_tasks:
+            await asyncio.gather(*tail_tasks, return_exceptions=True)
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()

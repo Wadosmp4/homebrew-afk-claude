@@ -94,6 +94,39 @@ EVENT_TYPES = frozenset(
         # own memory. Mirrors "permission_request"'s own auto_approved=True
         # self-documenting shape for the manual/interrupt-denied path.
         "permission_resolved",
+        # Bug fix (user report): a background subagent dispatched via the
+        # "Task" tool keeps running after the SDK's own turn ends
+        # (waiting_for_input fires the moment the dispatching turn itself
+        # completes, independent of the subagent it just kicked off) - the
+        # phone was showing "Waiting for your input" and disabling Cancel
+        # while a subagent it dispatched was still actively working.
+        # SDK-owned only (SDKAdapter._handle_message, claude_agent_sdk's
+        # TaskStartedMessage/TaskProgressMessage/TaskUpdatedMessage/
+        # TaskNotificationMessage) - `phase` discriminates which of those
+        # four this came from; `status` (when present) is one of
+        # claude_agent_sdk's own pending/running/paused/completed/failed/
+        # killed/stopped values. ObserveAdapter/CodexAdapter never emit
+        # this - neither drives a session through a client with its own
+        # stop_task() control request to report on.
+        "task_update",
+        # Bug fix (user report): a calibrated guess at a rate-limit
+        # window's current utilization, filling the gap between real
+        # "rate_limit" readings - see companion/rate_limit_estimator.py's
+        # own module docstring for the full explanation and its explicit
+        # limits. Never replaces "rate_limit"; only ever supplements it
+        # between real readings, and only for a window that already has
+        # one to extrapolate from.
+        "rate_limit_estimate",
+        # Quick-Edit Changed Files plan: get_file_content's result -
+        # {ok, content, reason} alongside the requested `path`, same
+        # always-emit-a-result shape as git_status/git_diff above, except
+        # a rejection is a specific `reason` (never a silent drop - KTD10).
+        "file_content",
+        # Quick-Edit Changed Files plan: write_session_file's result -
+        # {ok, reason} alongside the requested `path`. A success carries
+        # no content back (the client already has what it just sent);
+        # ChangesScreen re-dispatches git_diff itself to refresh (KTD7).
+        "write_session_file",
     }
 )
 
