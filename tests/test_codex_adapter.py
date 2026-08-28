@@ -162,6 +162,37 @@ async def test_connect_emits_session_started_with_agent_codex(adapter):
 
 
 @pytest.mark.asyncio
+async def test_connect_includes_model_and_sandbox_in_session_started(adapter):
+    """code-review finding: unlike SDKAdapter's own session_started (which
+    carries model/permission_mode), CodexAdapter's originally didn't - the
+    dashboard's derivedModel/derivedSandbox both read the latest of
+    session_started or a live session_model/session_sandbox event, so a
+    freshly created Codex session with a non-default model/sandbox showed
+    "Default"/"Workspace write" until some later live change fired its own
+    event."""
+    await adapter.connect("s1", cwd="/repo", model="gpt-5.2-codex", sandbox="full_access")
+
+    events = adapter.subscribe("s1")
+    event = await events.__anext__()
+
+    assert event.type == "session_started"
+    assert event.data["model"] == "gpt-5.2-codex"
+    assert event.data["sandbox"] == "full_access"
+
+
+@pytest.mark.asyncio
+async def test_connect_with_no_model_or_sandbox_emits_session_started_with_both_none(adapter):
+    await adapter.connect("s1", cwd="/repo")
+
+    events = adapter.subscribe("s1")
+    event = await events.__anext__()
+
+    assert event.type == "session_started"
+    assert event.data["model"] is None
+    assert event.data["sandbox"] is None
+
+
+@pytest.mark.asyncio
 async def test_send_message_reports_a_tool_call_event_shaped_like_claude_codes(adapter):
     """Covers AE2: a command-execution item started notification becomes a
     tool_call event identically shaped (tool/input/tool_use_id) to a
@@ -592,6 +623,24 @@ async def test_set_session_sandbox_with_an_unrecognized_string_returns_false_and
     await adapter.connect("s1", cwd="/repo", sandbox="read_only")
 
     result = adapter.set_session_sandbox("s1", "not-a-real-value")
+
+    assert result is False
+    session = adapter._sessions["s1"]
+    assert session.sandbox is Sandbox.read_only
+
+
+@pytest.mark.asyncio
+async def test_set_session_sandbox_with_none_returns_false_and_leaves_sandbox_unchanged(adapter):
+    """code-review finding: the simplify pass's shared _sandbox_from_wire()
+    helper returns None (no exception) for a None input - correct for
+    connect()'s own "no sandbox requested" semantics, but set_session_sandbox
+    must still fail closed for None here (matching the unrecognized-string
+    case above), not silently clear session.sandbox to None and report
+    success - that would be a fail-open regression on a safety-relevant
+    control the next turn() call would inherit."""
+    await adapter.connect("s1", cwd="/repo", sandbox="read_only")
+
+    result = adapter.set_session_sandbox("s1", None)
 
     assert result is False
     session = adapter._sessions["s1"]

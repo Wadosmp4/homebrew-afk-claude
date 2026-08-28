@@ -179,7 +179,19 @@ class CodexAdapter:
         # own session_started - mobile reads it for KTD5's minimal labeling,
         # defaulting to "claude_code" everywhere else so no existing event
         # payload needs to change shape.
-        session.emit("session_started", mode="sdk_owned", agent="codex", cwd=resolved_cwd)
+        #
+        # code-review finding: model/sandbox must be included here, matching
+        # SDKAdapter's own session_started (which carries model/permission_mode) -
+        # the dashboard's derivedModel/derivedSandbox both read the latest of
+        # session_started or a live session_model/session_sandbox event, so
+        # without these fields a freshly created Codex session showed
+        # "Default"/"Workspace write" regardless of what was actually chosen,
+        # until some later live change happened to fire its own event. Wire
+        # strings (model/sandbox as passed in, not sandbox_enum) match what
+        # set_session_model/set_session_sandbox already emit on a live change.
+        session.emit(
+            "session_started", mode="sdk_owned", agent="codex", cwd=resolved_cwd, model=model, sandbox=sandbox
+        )
 
     async def send_message(self, session_id: str, text: str) -> None:
         from openai_codex import TextInput
@@ -269,7 +281,7 @@ class CodexAdapter:
         # to actually set (only the coarse, thread-level ApprovalMode).
         return False
 
-    def set_session_model(self, session_id: str, model: str) -> bool:
+    def set_session_model(self, session_id: str, model: Optional[str]) -> bool:
         """Codex Model & Sandbox Config plan (001), U1: no SDK round-trip -
         purely local state, applied starting with the session's next
         send_message()/turn() call (KTD2). Mirrors sdk_adapter.py's own
@@ -283,13 +295,24 @@ class CodexAdapter:
         session.emit("session_model", model=model)
         return True
 
-    def set_session_sandbox(self, session_id: str, sandbox: str) -> bool:
+    def set_session_sandbox(self, session_id: str, sandbox: Optional[str]) -> bool:
         """Same shape as set_session_model above. Uses the same shared
         `_sandbox_from_wire()` helper connect() does, but an unrecognized
         wire string is caught here (unlike connect()'s deliberate fail-closed
         raise) since this is a live user action against an already-running
         session, not session creation - returns False and leaves the
-        session's stored sandbox unchanged rather than raising."""
+        session's stored sandbox unchanged rather than raising.
+
+        code-review finding: `sandbox=None` must fail the same way as any
+        other unrecognized value here, even though `_sandbox_from_wire(None)`
+        itself returns None (no exception) - that None-passthrough is only
+        correct for connect()'s own "no sandbox requested" semantics. Left
+        unguarded, a live action missing its sandbox field would silently
+        clear session.sandbox to None instead of leaving it unchanged, and
+        the next turn() call would send the real SDK no sandbox override at
+        all - a fail-open regression on a safety-relevant control."""
+        if sandbox is None:
+            return False
         session = self._sessions.get(session_id)
         if session is None:
             return False
