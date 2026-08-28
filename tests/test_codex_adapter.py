@@ -15,6 +15,9 @@ import asyncio
 import pytest
 from openai_codex.generated.v2_all import (
     AgentMessageThreadItem,
+    CollabAgentTool,
+    CollabAgentToolCallStatus,
+    CollabAgentToolCallThreadItem,
     CommandExecutionStatus,
     CommandExecutionThreadItem,
     McpToolCallStatus,
@@ -122,7 +125,16 @@ class FakeCodexClient:
 
 
 @pytest.fixture
-def adapter(monkeypatch):
+async def adapter(monkeypatch):
+    """Mirrors test_sdk_adapter.py's own `adapter` fixture teardown - a
+    session connect()'d here but never explicitly disconnect()'d by the
+    test body would otherwise leave its stream_task running forever,
+    cancel()'d by nothing and awaited by no one, leaked until the
+    interpreter garbage-collects it at some later, unpredictable point
+    (surfacing as a misattributed "Task was destroyed but it is pending!"
+    warning against whatever unrelated test happens to be running then -
+    this was the root cause of a run of test_daemon.py flakiness this
+    fixture's missing teardown was silently contributing to)."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     clients: dict[str, FakeCodexClient] = {}
 
@@ -133,7 +145,10 @@ def adapter(monkeypatch):
 
     a = CodexAdapter(client_factory=factory)
     a._test_clients = clients  # type: ignore[attr-defined]
-    return a
+    yield a
+
+    for session_id in list(a.discover_sessions()):
+        await a.disconnect(session_id)
 
 
 def test_codex_adapter_conforms_to_adapter_protocol(adapter):
@@ -274,6 +289,101 @@ async def test_a_failed_mcp_tool_call_reports_an_error_tool_result(adapter):
     tool_result_event = await asyncio.wait_for(events.__anext__(), timeout=1)
     assert tool_result_event.type == "tool_result"
     assert tool_result_event.data["is_error"] is True
+
+
+def _collab_spawn_item(status: CollabAgentToolCallStatus, **overrides) -> CollabAgentToolCallThreadItem:
+    fields = dict(
+        id="item-4",
+        agentsStates={},
+        receiverThreadIds=["agent-t1"],
+        senderThreadId="t1",
+        status=status,
+        tool=CollabAgentTool.spawn_agent,
+        prompt="investigate the failing test",
+        type="collabAgentToolCall",
+    )
+    fields.update(overrides)
+    return CollabAgentToolCallThreadItem(**fields)
+
+
+@pytest.mark.asyncio
+async def test_a_spawn_agent_collab_call_reports_a_tool_call_event_shaped_like_claudes_task_tool(adapter):
+    """Same "same flow as Claude" convention as the other item-type tests
+    above: a Codex subagent dispatch (collabAgentToolCall/spawnAgent) is
+    reported using the literal tool name "Task", identically to
+    claude_agent_sdk's own Task-tool dispatch, so mobile's existing
+    rendering (mobile/lib/toolDescriptions.ts's "Running subagent") applies
+    with no Codex-specific mobile code."""
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+    await adapter.send_message("s1", "investigate the failing test")
+    await events.__anext__()  # user_message
+
+    turn_handle = adapter._test_clients["latest"].threads[0].turns[0]
+    item = _collab_spawn_item(CollabAgentToolCallStatus.in_progress)
+    turn_handle.push(ItemStartedNotification(item=ThreadItem(item), startedAtMs=0, threadId="t1", turnId="turn-1"))
+
+    tool_call_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert tool_call_event.type == "tool_call"
+    assert tool_call_event.data["tool"] == "Task"
+    assert tool_call_event.data["input"] == {"prompt": "investigate the failing test"}
+    assert tool_call_event.data["tool_use_id"] == "item-4"
+
+
+@pytest.mark.asyncio
+async def test_a_completed_spawn_agent_call_reports_a_tool_result_event(adapter):
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+    await adapter.send_message("s1", "investigate the failing test")
+    await events.__anext__()  # user_message
+
+    turn_handle = adapter._test_clients["latest"].threads[0].turns[0]
+    item = _collab_spawn_item(CollabAgentToolCallStatus.completed)
+    turn_handle.push(ItemCompletedNotification(item=ThreadItem(item), completedAtMs=1, threadId="t1", turnId="turn-1"))
+
+    tool_result_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert tool_result_event.type == "tool_result"
+    assert tool_result_event.data["tool_use_id"] == "item-4"
+    assert tool_result_event.data["is_error"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_failed_spawn_agent_call_reports_an_error_tool_result(adapter):
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+    await adapter.send_message("s1", "investigate the failing test")
+    await events.__anext__()  # user_message
+
+    turn_handle = adapter._test_clients["latest"].threads[0].turns[0]
+    item = _collab_spawn_item(CollabAgentToolCallStatus.failed)
+    turn_handle.push(ItemCompletedNotification(item=ThreadItem(item), completedAtMs=1, threadId="t1", turnId="turn-1"))
+
+    tool_result_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert tool_result_event.type == "tool_result"
+    assert tool_result_event.data["is_error"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_non_spawn_collab_agent_call_is_not_reported_as_a_new_tool_call(adapter):
+    """R3 (see _is_spawn_subagent_call's own docstring): sendInput/
+    resumeAgent/wait/closeAgent are management calls on an already-running
+    subagent, not new dispatches - they must not each generate their own
+    "Running subagent" bubble."""
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+    await adapter.send_message("s1", "investigate the failing test")
+    await events.__anext__()  # user_message
+
+    turn_handle = adapter._test_clients["latest"].threads[0].turns[0]
+    item = _collab_spawn_item(CollabAgentToolCallStatus.in_progress, tool=CollabAgentTool.wait, id="item-5")
+    turn_handle.push(ItemStartedNotification(item=ThreadItem(item), startedAtMs=0, threadId="t1", turnId="turn-1"))
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(events.__anext__(), timeout=0.2)
 
 
 @pytest.mark.asyncio

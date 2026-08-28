@@ -30,10 +30,29 @@ that reshaped scope versus the plan's original assumption:
 
 `compact` IS implemented for real (`AsyncThread.compact()` exists on the
 real SDK) - no reason to leave working functionality unsupported.
+
+Subagent visibility (user-reported: Codex sessions showed no equivalent of
+Claude's "Running subagent" indicator at all, and Cancel had nothing to
+reach): a `collabAgentToolCall` item with `tool == CollabAgentTool.
+spawn_agent` is Codex's own subagent-dispatch primitive - mapped onto the
+same `tool_call`/`tool_result` shape as `commandExecution` etc., using the
+literal tool name `"Task"` so mobile's existing Claude-authored rendering
+(mobile/lib/toolDescriptions.ts) picks it up with no Codex-specific mobile
+code. Unlike claude_agent_sdk's Task tool, there is no SDK-level
+`stop_task`-equivalent to cancel *just* the subagent - see
+_is_spawn_subagent_call's own docstring for the other CollabAgentTool
+values this deliberately excludes. The existing plain `interrupt()`
+(already sent by the phone's Cancel button whenever a turn is active) is
+the only cancellation path; since a `collabAgentToolCall` item is a normal
+child item of the same turn, not a claude_agent_sdk-style detached
+background process, interrupting the turn also stops it - there is no
+known equivalent of Claude's "subagent outlives the turn" scenario to
+cover here.
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncIterator
 from typing import Any, Callable, Optional
@@ -53,6 +72,21 @@ ClientFactory = Callable[[], Any]
 _TOOL_ITEM_TYPES = ("commandExecution", "mcpToolCall", "fileChange")
 
 
+def _is_spawn_subagent_call(item: Any) -> bool:
+    """A `collabAgentToolCall` item's own `tool` field distinguishes actually
+    spawning a new subagent (`spawnAgent`) from the other multi-agent
+    management calls on an *already-running* one (`sendInput`/`resumeAgent`/
+    `wait`/`closeAgent`) - only the former is a new "Running subagent" the
+    phone hasn't seen yet; the others are follow-up management calls on it,
+    not additional dispatches, and mapping them the same way would show a
+    fresh "Running subagent" bubble for what's really one ongoing subagent's
+    lifecycle. See _handle_notification's own comment for why this is kept
+    separate from _TOOL_ITEM_TYPES's generic type-only dispatch."""
+    from openai_codex.generated.v2_all import CollabAgentTool
+
+    return getattr(item, "type", None) == "collabAgentToolCall" and getattr(item, "tool", None) == CollabAgentTool.spawn_agent
+
+
 def _tool_name_for_item(item: Any) -> str:
     item_type = getattr(item, "type", None)
     if item_type == "commandExecution":
@@ -61,6 +95,12 @@ def _tool_name_for_item(item: Any) -> str:
         return getattr(item, "tool", "McpTool")
     if item_type == "fileChange":
         return "ApplyPatch"
+    if _is_spawn_subagent_call(item):
+        # "Task" (not a Codex-native name) deliberately matches
+        # claude_agent_sdk's own Task-tool dispatch verbatim - mobile/lib/
+        # toolDescriptions.ts already renders tool: "Task" as "Running
+        # subagent" with zero Codex-specific mobile code needed.
+        return "Task"
     return item_type or "unknown"
 
 
@@ -72,6 +112,10 @@ def _tool_input_for_item(item: Any) -> dict[str, Any]:
         return {"arguments": getattr(item, "arguments", None)}
     if item_type == "fileChange":
         return {"changes": [str(change) for change in getattr(item, "changes", [])]}
+    if _is_spawn_subagent_call(item):
+        # toolDescriptions.ts's Task case reads description ?? prompt -
+        # Codex's own spawn call only ever carries `prompt`.
+        return {"prompt": getattr(item, "prompt", None) or ""}
     return {}
 
 
@@ -109,6 +153,8 @@ def _tool_result_for_item(item: Any) -> tuple[str, bool]:
         return str(getattr(item, "result", "")), is_error
     if item_type == "fileChange":
         return f"{len(getattr(item, 'changes', []))} file(s) changed", is_error
+    if _is_spawn_subagent_call(item):
+        return ("Subagent failed" if is_error else "Subagent finished"), is_error
     return "", is_error
 
 
@@ -249,6 +295,12 @@ class CodexAdapter:
                 logger.exception("failed to interrupt Codex turn on disconnect for session_id=%r", session_id)
         if session.stream_task is not None:
             session.stream_task.cancel()
+            # cancel() only schedules cancellation - without awaiting it,
+            # this task can still be pending when the caller (or a test's
+            # event loop) tears down, which asyncio reports as "Task was
+            # destroyed but it is pending!".
+            with contextlib.suppress(asyncio.CancelledError):
+                await session.stream_task
         # Code-review fix: close() must not skip session.end() - the
         # session is already popped from self._sessions above, so if close()
         # raises here, nothing else will ever emit session_ended, stranding
@@ -258,6 +310,13 @@ class CodexAdapter:
         except Exception:
             logger.exception("failed to close Codex client on disconnect for session_id=%r", session_id)
         session.end("disconnected")
+
+    async def disconnect_all(self) -> None:
+        """Mirrors SDKAdapter.disconnect_all() - see its own docstring for
+        why daemon shutdown needs this rather than letting active sessions'
+        stream_tasks leak."""
+        for session_id in self.discover_sessions():
+            await self.disconnect(session_id)
 
     async def respond_to_permission(
         self, session_id: str, request_id: str, decision: str, *, message: str = ""
@@ -388,7 +447,15 @@ class CodexAdapter:
             item = notification.item.root if hasattr(notification.item, "root") else notification.item
             item_type = getattr(item, "type", None)
             item_id = getattr(item, "id", None)
-            if item_type in _TOOL_ITEM_TYPES and item_id not in seen_item_ids:
+            # `or _is_spawn_subagent_call(item)`: a `collabAgentToolCall`
+            # item's own type isn't in _TOOL_ITEM_TYPES (it isn't an
+            # ordinary command/MCP/file-change tool), but a spawnAgent call
+            # specifically should still render as "Running subagent" -
+            # mirroring claude_agent_sdk's own Task-tool dispatch (see
+            # mobile/lib/toolDescriptions.ts) so the phone shows the same
+            # thing, and Cancel's existing interrupt() has something visible
+            # to be canceling.
+            if (item_type in _TOOL_ITEM_TYPES or _is_spawn_subagent_call(item)) and item_id not in seen_item_ids:
                 seen_item_ids.add(item_id)
                 session.emit(
                     "tool_call",
@@ -402,7 +469,7 @@ class CodexAdapter:
             item = notification.item.root if hasattr(notification.item, "root") else notification.item
             item_type = getattr(item, "type", None)
             item_id = getattr(item, "id", None)
-            if item_type in _TOOL_ITEM_TYPES:
+            if item_type in _TOOL_ITEM_TYPES or _is_spawn_subagent_call(item):
                 content, is_error = _tool_result_for_item(item)
                 session.emit("tool_result", tool_use_id=item_id, content=content, is_error=is_error)
             elif item_type == "agentMessage":
