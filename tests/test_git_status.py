@@ -243,6 +243,38 @@ def test_write_session_file_rejects_a_file_not_reported_as_changed_without_touch
     assert (repo / "untouched.txt").read_text() == "never modified\n"
 
 
+def test_get_file_content_reports_read_failed_for_a_non_utf8_file_instead_of_crashing(repo):
+    """code-review finding (P1): a changed file with non-UTF-8 bytes but no
+    NUL byte isn't caught by get_diff's binary heuristic (which looks for
+    "Binary files" / a NUL byte in the diff output), so it reaches the
+    `open(..., encoding="utf-8")` read - which must raise UnicodeDecodeError
+    caught here (not left to propagate uncaught) and reported the same way
+    any other unreadable file is."""
+    target = repo / "latin1.txt"
+    # 0xe9 is 'é' in latin-1 but not a valid UTF-8 continuation byte on its
+    # own - and contains no NUL byte, so get_diff's binary heuristic won't
+    # flag it.
+    target.write_bytes(b"caf\xe9\n")
+    _git(repo, "add", "latin1.txt")
+
+    result = get_file_content(str(repo), "latin1.txt")
+
+    assert result.ok is False
+    assert result.reason == "read_failed"
+    assert result.content is None
+
+
+def test_write_session_file_reports_read_failed_for_a_non_utf8_file_instead_of_crashing(repo):
+    target = repo / "latin1.txt"
+    target.write_bytes(b"caf\xe9\n")
+    _git(repo, "add", "latin1.txt")
+
+    result = write_session_file(str(repo), "latin1.txt", previous_content="anything", new_content="new")
+
+    assert result.ok is False
+    assert result.reason == "read_failed"
+
+
 def test_write_session_file_rejects_a_deleted_file_without_recreating_it(repo):
     (repo / "to_delete.txt").write_text("bye\n")
     _git(repo, "add", "to_delete.txt")

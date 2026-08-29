@@ -51,6 +51,21 @@ class _WindowEstimate:
 
 
 class RateLimitEstimator:
+    # code-review finding (P3): a daemon-lifetime singleton (see this
+    # module's own docstring) means every distinct task_id ever seen would
+    # otherwise get a permanent dict entry with nothing to prune it, however
+    # long the process runs. A generous, fixed cap is the least invasive
+    # fix available here - this class has no signal at all for "this
+    # task's session has ended" (that's tracked elsewhere, per-adapter, not
+    # threaded through record_task_usage's call sites), so eviction is
+    # FIFO by first-seen order rather than anything session-aware. Losing
+    # an old, still-active task's running total this way would make its
+    # very next reading look like a brand-new task (delta = its full total
+    # rather than just the increment) - a one-time, small over-count for a
+    # metric that's explicitly an approximation already (see this module's
+    # own docstring), not a correctness issue worth a heavier mechanism.
+    _MAX_TRACKED_TASKS = 1000
+
     def __init__(self) -> None:
         self._cumulative_tokens = 0
         self._windows: dict[str, _WindowEstimate] = {}
@@ -93,6 +108,13 @@ class RateLimitEstimator:
         if total > previous:
             self._cumulative_tokens += total - previous
         self._task_totals[task_id] = total
+        if len(self._task_totals) > self._MAX_TRACKED_TASKS:
+            # Plain dicts preserve insertion order (3.7+), and assigning to
+            # an *existing* key above doesn't move it - so the first key in
+            # iteration order really is the oldest still-tracked task_id,
+            # not just an arbitrary one.
+            oldest_task_id = next(iter(self._task_totals))
+            del self._task_totals[oldest_task_id]
 
     def record_real_reading(self, rate_limit_type: str, utilization: Optional[float]) -> None:
         """A genuine RateLimitEvent for this window. Always replaces the

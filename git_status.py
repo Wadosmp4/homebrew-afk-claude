@@ -26,6 +26,20 @@ def _run_git(cwd: str, *args: str) -> subprocess.CompletedProcess:
         cwd=cwd,
         capture_output=True,
         text=True,
+        # code-review finding (P1, follow-on from the get_file_content/
+        # write_session_file UnicodeDecodeError fix below): `text=True`
+        # decodes stdout/stderr with the strict error handler by default -
+        # a tracked file with non-UTF-8 bytes (get_diff's own diff output
+        # embeds the file's actual content) would otherwise raise
+        # UnicodeDecodeError straight out of subprocess.run, before
+        # get_file_content's own binary check ever gets a chance to run,
+        # let alone reach the open() call its except clause now covers.
+        # `errors="replace"` keeps this call in the same "never raises for
+        # file content, only for real OSError-shaped failures" contract
+        # every other caller here already relies on - a decode-mangled
+        # diff is still readable enough for the "Binary files"/binary-byte
+        # heuristics that consume it.
+        errors="replace",
         timeout=10,
     )
 
@@ -198,7 +212,14 @@ def get_file_content(cwd: str, path: str) -> FileContentResult:
     try:
         with open(validation.resolved_path, "r", encoding="utf-8") as f:
             content = f.read()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # code-review finding (P1): a text file with non-UTF-8 bytes but no
+        # NUL byte (so get_diff's own binary heuristic doesn't catch it)
+        # raises UnicodeDecodeError here - a ValueError subclass, not an
+        # OSError, so the original `except OSError` alone let it propagate
+        # uncaught, get swallowed by daemon.py's generic exception handler,
+        # and never reach the phone as the rejection event the contract
+        # promises. Reported the same way any other unreadable file is.
         return FileContentResult(ok=False, reason="read_failed")
     return FileContentResult(ok=True, content=content)
 
@@ -229,13 +250,16 @@ def write_session_file(cwd: str, path: str, previous_content: str, new_content: 
     try:
         with open(validation.resolved_path, "r", encoding="utf-8") as f:
             current_content = f.read()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # code-review finding (P1): same UnicodeDecodeError gap as
+        # get_file_content above - a non-UTF-8-but-no-NUL-byte file must
+        # produce the read_failed rejection event, not an uncaught crash.
         return WriteFileResult(ok=False, reason="read_failed")
     if current_content != previous_content:
         return WriteFileResult(ok=False, reason="conflict")
     try:
         with open(validation.resolved_path, "w", encoding="utf-8") as f:
             f.write(new_content)
-    except OSError:
+    except (OSError, UnicodeEncodeError):
         return WriteFileResult(ok=False, reason="write_failed")
     return WriteFileResult(ok=True)

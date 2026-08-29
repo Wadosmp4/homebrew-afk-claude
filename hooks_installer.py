@@ -33,10 +33,25 @@ def _load_settings(path: str) -> dict[str, Any]:
 
 
 def _save_settings(path: str, settings: dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w") as f:
+    """Code-review finding: `.claude/settings.json` is shared, mutable
+    state other tooling also reads (see this module's own docstring) -
+    writing straight to `path` via `open(path, "w")` truncates it
+    immediately, so a crash between truncation and `json.dump` completing
+    leaves a corrupt (or empty) file behind for that other tooling to read
+    next. Write to a `.tmp` sibling in the same directory first, then
+    `os.replace` it over the real target - `os.replace` is an atomic
+    rename on both POSIX and Windows, so any reader of `path` always sees
+    either the old, complete content or the new, complete content, never a
+    partial write. The sibling is in the same directory (not a system temp
+    dir) so the rename is a same-filesystem rename, not a cross-device
+    copy that could itself fail partway."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(settings, f, indent=2)
         f.write("\n")
+    os.replace(tmp_path, path)
 
 
 def _our_command(event: str, socket_path: str, python_bin: str) -> str:

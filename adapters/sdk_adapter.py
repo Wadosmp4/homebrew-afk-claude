@@ -90,11 +90,27 @@ class SDKAdapter:
         permission_mode: Optional[str] = None,
         resume: Optional[str] = None,
         cli_path: Optional[str] = None,
-        cli_env: dict[str, str] = {},
+        # Code-review fix (P3): a mutable {} default is created once at
+        # function-definition time and shared across every call that omits
+        # this argument - latent today (daemon.py's own callers always
+        # pass an explicit fresh dict), but a landmine for any future/test
+        # caller that doesn't. `None` (materialized to a fresh {} below)
+        # is the safe sentinel instead.
+        cli_env: Optional[dict[str, str]] = None,
     ) -> None:
-        if session_id in self._sessions:
+        # Code-review fix (P1): a crashed session (read_loop's own except
+        # branch, see its own comment) now marks itself `_ended` the same
+        # way a normal completion already does, so this guard must allow
+        # reconnecting under the same session_id once the previous
+        # occupant is actually done - only a still-live entry blocks a
+        # fresh connect(). Without this, a crash permanently blocked any
+        # future reconnect attempt for that session_id until a full
+        # daemon restart wiped this adapter's in-memory _sessions.
+        existing = self._sessions.get(session_id)
+        if existing is not None and not existing._ended:
             raise ValueError(f"session already connected: {session_id}")
 
+        cli_env = cli_env if cli_env is not None else {}
         session = _Session(session_id, rate_limit_estimator=self._rate_limit_estimator)
         # Resolved (not just whatever string the phone sent) so this
         # matches what the real `claude` subprocess itself records as its
@@ -158,6 +174,24 @@ class SDKAdapter:
         session.client = self._client_factory(options)
 
         await session.client.connect(session.prompt_stream())
+        # Code-review fix (P3, narrow race): a concurrently-dispatched
+        # disconnect() (daemon.py dispatches every phone action as its own
+        # unordered asyncio.create_task, same race set_session_permission_
+        # mode/set_session_model/stop_task already guard against) can pop
+        # this exact session back out of _sessions while the await above
+        # was still in flight. Left unchecked, connect() would still
+        # finish anyway: emitting session_started and creating a
+        # reader_task for a session nothing else references any more -
+        # untracked, never cancelled, and leaked for the life of the
+        # process. Back out (and make sure the now-connected client
+        # doesn't itself leak) rather than resurrecting it.
+        if self._sessions.get(session_id) is not session:
+            logger.info(
+                "connect() for %s lost a race with a concurrent disconnect() - backing out", session_id
+            )
+            with contextlib.suppress(Exception):
+                await session.client.disconnect()
+            return
         # `mode` lets the mobile client (U7) tell an SDK-owned session
         # (full remote control) from an observe-only one (no
         # send_message/interrupt, per R5) without a side-channel - see
@@ -524,6 +558,16 @@ class _Session:
         except Exception as exc:  # SDK/subprocess crash - surface, don't go quiet
             logger.warning("SDK-owned session %s crashed: %s", self.session_id, exc)
             self.emit("error", message=str(exc))
+            # Code-review fix (P1): previously only the normal-completion
+            # path below called self.end("completed") - this branch left
+            # `_ended` False forever, so is_active() reported True forever,
+            # the session stayed in SDKAdapter._sessions, and any reconnect
+            # attempt for this session_id was permanently blocked by
+            # connect()'s "already connected" guard until a full daemon
+            # restart. "crashed" is a distinct reason (mirroring
+            # disconnect()'s own "disconnected") so a durable session_ended
+            # event still records how this session actually stopped.
+            self.end("crashed")
 
     async def _emit_context_usage(self) -> None:
         """Polled once per completed turn (ResultMessage), not on every

@@ -312,6 +312,22 @@ def test_pairing_code_with_no_config_prints_guidance_instead_of_crashing(tmp_pat
     assert "pair" in out or "configure" in out
 
 
+def test_pairing_code_with_a_corrupted_db_prints_guidance_instead_of_crashing(tmp_path, capsys):
+    """code-review finding: load_config's SQLite backing store can raise
+    sqlite3.Error (a corrupted file, e.g. truncated or overwritten by
+    something else), not just OSError/ValueError/TypeError - this must
+    produce the same friendly message as a missing config, not a raw
+    traceback."""
+    config_path = tmp_path / "config.json"
+    config_path.write_bytes(b"not a valid sqlite database, just garbage bytes")
+
+    main(["pairing-code", "--config-path", str(config_path)])
+
+    out = capsys.readouterr().out
+    assert "Could not read config" in out
+    assert "setup" in out
+
+
 def test_pairing_code_stops_cleanly_on_an_http_error(monkeypatch, tmp_path, capsys):
     def raise_error(relay_url, device_token):
         raise urllib.error.HTTPError(relay_url, 401, "invalid_companion_token", None, None)

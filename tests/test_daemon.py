@@ -19,6 +19,8 @@ import os
 import socket
 import subprocess
 import sys
+import threading
+import time
 import uuid
 from datetime import datetime
 
@@ -33,7 +35,7 @@ from companion.adapters.observe_adapter import KNOWN_ENTRYPOINTS, ObserveAdapter
 from companion.adapters.sdk_adapter import SDKAdapter
 from companion.config import CompanionConfig, load_config
 from companion.daemon import CompanionDaemon
-from companion import session_registry
+from companion import git_status, session_registry
 from companion.tests.test_codex_adapter import FakeCodexClient
 from companion.tests.test_sdk_adapter import _STOP, FakeSDKClient
 from relay import auth
@@ -368,6 +370,126 @@ async def test_sdk_session_forwarding_resumes_after_relay_reconnect(tmp_path, pg
             await _stop_server(server2)
     finally:
         await _stop_daemon(daemon, task)
+
+
+class _FakeReclaimAdapter:
+    """Minimal AdapterProtocol double for exercising _watch_active_sessions/
+    _reclaim_forwarder's ObserveAdapter-vs-authoritative-adapter collision
+    handling in isolation - no real transcript file or relay connection
+    needed, just two adapter doubles whose discover_sessions() lists can be
+    mutated mid-test to simulate ObserveAdapter's poll noticing a session
+    before the authoritative adapter's own resume/connect() call finishes
+    registering it (see _watch_active_sessions's own docstring)."""
+
+    def __init__(self):
+        self.session_ids: list[str] = []
+        self.subscribed_session_ids: list[str] = []
+        self.cancelled_session_ids: list[str] = []
+
+    def discover_sessions(self) -> list[str]:
+        return list(self.session_ids)
+
+    def get_cwd(self, session_id):
+        return "/tmp"
+
+    def is_active(self, session_id):
+        return True
+
+    def emit_custom(self, session_id, type_, **data):
+        pass
+
+    async def send_message(self, session_id, text):
+        raise NotImplementedError
+
+    async def interrupt(self, session_id):
+        raise NotImplementedError
+
+    async def compact(self, session_id):
+        raise NotImplementedError
+
+    async def disconnect(self, session_id):
+        raise NotImplementedError
+
+    async def respond_to_permission(self, session_id, request_id, decision, *, message=""):
+        raise NotImplementedError
+
+    async def subscribe(self, session_id):
+        self.subscribed_session_ids.append(session_id)
+        try:
+            await asyncio.Event().wait()  # blocks until this forwarder task is cancelled
+        except asyncio.CancelledError:
+            self.cancelled_session_ids.append(session_id)
+            raise
+        if False:
+            yield  # pragma: no cover - unreachable, just makes this an async generator function
+
+
+class _FakeWs:
+    async def send(self, message):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_reclaim_forwarder_hands_a_session_back_to_its_authoritative_adapter(tmp_path):
+    """code-review finding (P1): _forwarding_adapter/_watch_active_sessions/
+    _reclaim_forwarder implement a nontrivial race-condition fix with zero
+    prior test coverage. ObserveAdapter's poll can notice a session_id (it
+    scans the same on-disk transcript directory an SDK-owned session's own
+    transcript lives in) before that session's own resume/connect() call
+    finishes registering it with sdk_adapter - without the reclaim,
+    ObserveAdapter's forwarder would permanently win that session_id's
+    slot (the "already forwarding" guard in _spawn_forwarder never
+    re-checks who actually owns it), and the SDK-owned session's own
+    events would never be forwarded at all, not even after the resume
+    completes."""
+    config = CompanionConfig(
+        relay_url="ws://127.0.0.1:1/ws/companion", device_token="t", observe_scan_interval=0.01
+    )
+    fake_sdk = _FakeReclaimAdapter()
+    fake_observe = _FakeReclaimAdapter()
+    fake_codex = _FakeReclaimAdapter()
+    daemon = CompanionDaemon(
+        config,
+        sdk_adapter=fake_sdk,
+        observe_adapter=fake_observe,
+        codex_adapter=fake_codex,
+        recents_path=str(tmp_path / "recent_projects.json"),
+        config_path=str(tmp_path / "companion_config.json"),
+        session_registry_path=str(tmp_path / "session_registry.db"),
+    )
+    ws = _FakeWs()
+    session_id = "collision-session"
+
+    # ObserveAdapter is first to discover it - a genuine tick of
+    # _watch_active_sessions spawns its forwarder here, the wrong adapter
+    # winning the race this test exists to cover.
+    fake_observe.session_ids.append(session_id)
+
+    watcher = asyncio.create_task(daemon._watch_active_sessions(ws))
+    try:
+        await _wait_until(lambda: daemon._forwarding_adapter.get(session_id) is fake_observe)
+        assert fake_observe.subscribed_session_ids == [session_id]
+
+        # The authoritative adapter's own resume/connect completes -
+        # sdk_adapter now discovers the same session_id too.
+        fake_sdk.session_ids.append(session_id)
+
+        # The reclaim: the wrongly-held ObserveAdapter forwarder is
+        # cancelled and replaced by one bound to sdk_adapter instead.
+        await _wait_until(lambda: daemon._forwarding_adapter.get(session_id) is fake_sdk)
+        await _wait_until(lambda: session_id in fake_observe.cancelled_session_ids)
+        assert fake_sdk.subscribed_session_ids == [session_id]
+        # Not re-forwarded a second time once already reclaimed.
+        assert fake_observe.subscribed_session_ids == [session_id]
+    finally:
+        daemon._stop_event.set()
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
+        remaining = list(daemon._forwarding.values())
+        for task in remaining:
+            task.cancel()
+        await asyncio.gather(*remaining, return_exceptions=True)
 
 
 # --- Action routing + event forwarding (daemon <-> SDK adapter <-> phone) --
@@ -842,12 +964,16 @@ async def test_a_session_that_completes_naturally_also_marks_the_registry_row_en
 
 
 @pytest.mark.asyncio
-async def test_a_crashed_session_leaves_the_registry_row_active(running_daemon, phone_token):
-    """A crash (read_loop's own except-branch) never calls SDKAdapter.end()
-    and so never emits session_ended - deliberately left 'active' in the
-    registry, since the session genuinely still exists, just wasn't cleanly
-    closed (R4's job is keeping that visible, not R5's ended-durability
-    guarantee)."""
+async def test_a_crashed_session_marks_the_registry_row_ended(running_daemon, phone_token):
+    """Updated for a concurrent sdk_adapter.py fix (code-review, P1): a
+    crash (read_loop's own except-branch) now calls self.end("crashed")
+    the same way a normal completion already does, so it emits
+    session_ended and this daemon's own _forward_events funnel point marks
+    the registry row 'ended' just like any other way an SDK-owned session
+    stops - previously a crash left the row 'active' forever, permanently
+    blocking any future reconnect attempt for that session_id (connect()'s
+    own "already connected" guard) until a full daemon restart wiped
+    SDKAdapter's in-memory _sessions."""
     daemon, port, fake_clients = running_daemon
     phone = await _FakePhone.connect(port, phone_token)
     try:
@@ -859,7 +985,10 @@ async def test_a_crashed_session_leaves_the_registry_row_active(running_daemon, 
         error_event = await phone.next_event()
         assert error_event["type"] == "error"
 
-        assert session_registry.get_session(session_id, daemon.session_registry_path).status == "active"
+        session_ended_event = await phone.next_event()
+        assert session_ended_event["type"] == "session_ended"
+
+        assert session_registry.get_session(session_id, daemon.session_registry_path).status == "ended"
     finally:
         await phone.close()
 
@@ -1781,6 +1910,98 @@ async def test_write_session_file_action_missing_input_emits_a_rejection_event_n
 
 
 @pytest.mark.asyncio
+async def test_write_session_file_action_serializes_concurrent_writes_to_the_same_path(
+    running_daemon, phone_token, tmp_path, monkeypatch
+):
+    """code-review finding (P1): write_session_file's own read-compare-write
+    conflict check (git_status.py) is race-safe only *within* one call -
+    nothing serialized two concurrently-dispatched saves for the same
+    (session_id, path) before this fix, so both could pass their own check
+    against the same stale content and one would silently overwrite the
+    other. Directly asserts the daemon's per-(session_id, path) lock
+    enforces mutual exclusion: an artificial delay is injected into
+    git_status.write_session_file itself so two concurrent dispatches
+    would provably overlap in real wall-clock time without the lock, then
+    this checks no more than one call is ever inside it at once - and that
+    the second, now genuinely serialized after the first, correctly sees
+    the first's already-written content as a conflict rather than
+    clobbering it."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
+    (repo / "README.md").write_text("original\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "Initial"], cwd=repo, check=True)
+    (repo / "README.md").write_text("updated\n")
+
+    real_write = git_status.write_session_file
+    active = 0
+    max_active = 0
+    counter_lock = threading.Lock()
+
+    def slow_write(cwd, path, previous_content, new_content):
+        nonlocal active, max_active
+        with counter_lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.1)  # widen the window a real race would need
+            return real_write(cwd, path, previous_content, new_content)
+        finally:
+            with counter_lock:
+                active -= 1
+
+    monkeypatch.setattr(git_status, "write_session_file", slow_write)
+
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": str(repo)})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action(
+            {
+                "kind": "write_session_file",
+                "session_id": session_id,
+                "path": "README.md",
+                "previous_content": "updated\n",
+                "new_content": "from_a\n",
+            }
+        )
+        await phone.send_action(
+            {
+                "kind": "write_session_file",
+                "session_id": session_id,
+                "path": "README.md",
+                "previous_content": "updated\n",
+                "new_content": "from_b\n",
+            }
+        )
+
+        event1 = await phone.next_event()
+        event2 = await phone.next_event()
+    finally:
+        await phone.close()
+
+    # The lock's whole point: never two calls inside write_session_file for
+    # the same path at once, even though both dispatches were in flight
+    # concurrently and each sleeps long enough to overlap without it.
+    assert max_active == 1
+
+    results = [event1["data"]["ok"], event2["data"]["ok"]]
+    assert sorted(results) == [False, True]  # exactly one succeeded
+    failed_event = event1 if event1["data"]["ok"] is False else event2
+    assert failed_event["data"]["reason"] == "conflict"
+
+    # The file itself ended up with exactly one writer's content, never a
+    # mix of both and never silently reverted.
+    assert (repo / "README.md").read_text() in ("from_a\n", "from_b\n")
+
+
+@pytest.mark.asyncio
 async def test_git_status_with_no_known_cwd_reports_not_a_repo_rather_than_crashing(
     running_daemon, phone_token
 ):
@@ -2452,6 +2673,31 @@ async def test_set_observe_entrypoints_action_updates_the_adapter_and_persists_t
 
 
 @pytest.mark.asyncio
+async def test_set_observe_entrypoints_action_rejects_a_bare_string_instead_of_a_list(
+    running_daemon, phone_token
+):
+    """code-review finding (P2): a bare string instead of a list must be
+    rejected outright, not passed to frozenset() - frozenset() happily
+    iterates a str's individual characters instead of raising, which would
+    silently corrupt the configured entrypoint set (e.g. "claude-desktop"
+    becoming the single-character set {'c','l','a',...}) rather than
+    failing loudly."""
+    daemon, port, _fake_clients = running_daemon
+    original = daemon.observe_adapter.get_required_entrypoints()
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "set_observe_entrypoints", "entrypoints": "claude-desktop"})
+
+        event = await phone.next_event()
+        assert event["type"] == "observe_settings"
+        # Unchanged - the malformed payload never reached frozenset().
+        assert daemon.observe_adapter.get_required_entrypoints() == original
+        assert set(event["data"]["selected_entrypoints"]) == original
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
 async def test_get_auto_approve_settings_action_reports_the_current_global_policy(running_daemon, phone_token):
     daemon, port, _fake_clients = running_daemon
     phone = await _FakePhone.connect(port, phone_token)
@@ -2623,6 +2869,60 @@ async def test_set_cli_settings_rejects_a_dynamic_linker_injection_env_key(runni
         assert daemon.config.cli_env == {}
     finally:
         await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_set_cli_settings_rejects_a_non_dict_cli_env_instead_of_crashing(running_daemon, phone_token):
+    """code-review finding (P2): cli_env had no shape check before
+    `dict(cli_env)`, which raises ValueError uncaught for a list (or other
+    non-dict-shaped) payload - dropping the whole action with no
+    confirm-back event at all, unlike every other rejection path in this
+    method. A malformed cli_env must be rejected the same
+    reject-but-still-confirm-back way an invalid cli_path already is."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "set_cli_settings", "cli_env": ["not", "a", "dict"]})
+
+        confirm = await phone.next_event()
+        assert confirm["type"] == "cli_settings"  # confirm-back still fires
+        assert confirm["data"]["cli_env"] == {}
+        assert daemon.config.cli_env == {}
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_a_cli_env_secret_never_appears_in_scrubbed_action_logging(running_daemon, phone_token, monkeypatch, caplog):
+    """code-review finding (P3): _ACTION_KEYS_NEVER_LOGGED only redacted
+    "token" - a secret placed in cli_env via set_cli_settings (misuse, but
+    possible) could otherwise get logged in full at ERROR level if dispatch
+    later raises for an unrelated reason. Forces that failure path directly
+    via monkeypatching save_config to raise, then asserts the secret value
+    never appears in the logged (scrubbed) action."""
+    import logging
+
+    from companion import daemon as daemon_module
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated dispatch failure")
+
+    monkeypatch.setattr(daemon_module, "save_config", boom)
+
+    _daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        with caplog.at_level(logging.ERROR, logger="companion.daemon"):
+            await phone.send_action(
+                {"kind": "set_cli_settings", "cli_env": {"SOME_SECRET": "s3cr3t-value"}}
+            )
+            await asyncio.sleep(0.2)  # let the dispatch task's exception logger run
+    finally:
+        await phone.close()
+
+    logged_text = caplog.text
+    assert "s3cr3t-value" not in logged_text
+    assert "[redacted]" in logged_text
 
 
 # --- U2: account-settings actions and custom-token setup ---

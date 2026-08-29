@@ -126,7 +126,12 @@ _VALID_AGENTS = frozenset({"claude_code", "codex"})
 # whole action on any dispatch failure, which would otherwise print it even
 # though it was never yet written to self.config (and so isn't caught by
 # _redact_secrets, which only knows about already-configured values).
-_ACTION_KEYS_NEVER_LOGGED = ("token",)
+#
+# code-review finding: `cli_env` (set_cli_settings) is included too - a
+# secret placed there by misuse could otherwise get logged in full at ERROR
+# level if dispatch later raises for an unrelated reason, the same exposure
+# `token` above exists to close.
+_ACTION_KEYS_NEVER_LOGGED = ("token", "cli_env")
 
 
 def _scrub_action_for_logging(action: dict[str, Any]) -> dict[str, Any]:
@@ -316,6 +321,17 @@ class CompanionDaemon:
         # unrelated and there's no reason to block one on the other.
         self._session_registry_lock = asyncio.Lock()
         self._recents_lock = asyncio.Lock()
+        # code-review finding (P1): write_session_file's own read-compare-
+        # write conflict check (git_status.py) is race-safe only *within*
+        # one call - nothing serializes two concurrently-dispatched saves
+        # for the same (session_id, path), so each can pass its own check
+        # against the same pre-write content and one silently overwrites
+        # the other. (session_id, path) -> asyncio.Lock, created lazily via
+        # _write_session_file_lock_for below and never removed - the same
+        # per-key-forever tradeoff session_registry.py's own lack of
+        # pruning already accepts, and one lock per distinct edited file
+        # this daemon has ever seen is not a real memory concern.
+        self._write_session_file_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
     def stop(self) -> None:
         """Request a graceful stop. `run()` returns once the current
@@ -946,6 +962,19 @@ class CompanionDaemon:
         if entrypoints is None:
             logger.warning("set_observe_entrypoints action missing entrypoints")
             return
+        # code-review finding: a bare string (or any non-list-of-strings
+        # payload) must be rejected outright, not passed to frozenset() -
+        # frozenset() happily iterates a str's individual characters
+        # instead of raising, which would silently corrupt the configured
+        # entrypoint set rather than failing loudly. Reject-and-confirm-back
+        # matches this file's own convention elsewhere (e.g.
+        # _handle_set_active_account) for an invalid phone-supplied value.
+        if not isinstance(entrypoints, list) or not all(isinstance(e, str) for e in entrypoints):
+            logger.warning(
+                "rejected set_observe_entrypoints %r: expected a list of strings", entrypoints
+            )
+            await self._handle_get_observe_settings(ws)
+            return
         chosen = frozenset(entrypoints)
         self.observe_adapter.set_required_entrypoints(chosen)
         self.config.observe_entrypoints = sorted(chosen)
@@ -1027,11 +1056,23 @@ class CompanionDaemon:
                     cli_path,
                 )
         if cli_env is not None:
-            dangerous = _DANGEROUS_CLI_ENV_KEYS.intersection(cli_env)
-            if not dangerous:
-                self.config.cli_env = dict(cli_env)
+            # code-review finding: cli_env must be dict-shaped (with str
+            # keys/values, matching ClaudeAgentOptions.env's own typing)
+            # before `dict(cli_env)` ever runs - a list or other non-dict
+            # payload can raise ValueError/TypeError there uncaught,
+            # dropping this whole action with no confirm-back event at all
+            # (unlike every other rejection path in this method, which logs
+            # and still falls through to the confirm-back below).
+            if not isinstance(cli_env, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in cli_env.items()
+            ):
+                logger.warning("rejected set_cli_settings cli_env %r: expected a dict of str to str", cli_env)
             else:
-                logger.warning("rejected set_cli_settings cli_env: disallowed key(s) %r", sorted(dangerous))
+                dangerous = _DANGEROUS_CLI_ENV_KEYS.intersection(cli_env)
+                if not dangerous:
+                    self.config.cli_env = dict(cli_env)
+                else:
+                    logger.warning("rejected set_cli_settings cli_env: disallowed key(s) %r", sorted(dangerous))
         await asyncio.to_thread(save_config, self.config_path, self.config)
         await self._handle_get_cli_settings(ws)  # confirm back with the (possibly-unchanged) state
 
@@ -1243,9 +1284,17 @@ class CompanionDaemon:
         if cwd is None:
             adapter.emit_custom(session_id, "write_session_file", path=path, ok=False, reason="no_cwd")
             return
-        result = await asyncio.to_thread(
-            git_status.write_session_file, cwd, path, previous_content, new_content
-        )
+        # code-review finding (P1): serializes concurrent dispatch of the
+        # same (session_id, path) - see this lock's own docstring in
+        # __init__ - so the second of two near-simultaneous saves sees the
+        # first one's already-written content in its own read-compare-write
+        # check (and correctly reports "conflict") instead of both racing
+        # past that check against the same stale content.
+        lock = self._write_session_file_locks.setdefault((session_id, path), asyncio.Lock())
+        async with lock:
+            result = await asyncio.to_thread(
+                git_status.write_session_file, cwd, path, previous_content, new_content
+            )
         adapter.emit_custom(session_id, "write_session_file", path=path, **result.to_dict())
 
     async def _handle_session_digest(self, adapter, session_id: str) -> None:

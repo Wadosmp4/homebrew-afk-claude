@@ -224,7 +224,22 @@ def _connect(path: str) -> sqlite3.Connection:
     existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(config)")}
     for name in _CONFIG_FIELDS:
         if name not in existing_columns:
-            conn.execute(f"ALTER TABLE config ADD COLUMN {name} {_column_type(name)}")
+            try:
+                conn.execute(f"ALTER TABLE config ADD COLUMN {name} {_column_type(name)}")
+            except sqlite3.OperationalError as exc:
+                # code-review finding (P2): two processes racing this same
+                # forward-migration check can both see "column doesn't
+                # exist yet" (the PRAGMA table_info snapshot above is not
+                # itself locked against a concurrent ALTER) and both
+                # attempt the ADD COLUMN - the loser hits SQLite's
+                # "duplicate column name" OperationalError. That's a
+                # harmless no-op from this process's own point of view
+                # (someone else already added the column it wanted), not a
+                # real failure - only re-raise if the error is something
+                # else entirely, so a genuine schema problem still surfaces
+                # loudly instead of being masked by this handler.
+                if "duplicate column name" not in str(exc):
+                    raise
     return conn
 
 
@@ -292,6 +307,16 @@ def load_config(path: str = DEFAULT_SESSION_REGISTRY_PATH) -> CompanionConfig:
         row = conn.execute(f"SELECT {_CONFIG_COLUMNS} FROM config WHERE id = 1").fetchone()
         if row is not None:
             conn.commit()
+            # code-review finding (P0-equivalent): this existing-row fast
+            # path - the one every daemon startup actually hits - never
+            # called _chmod_if_exists, unlike save_config and the migration
+            # branch below, which both do. Without this, a db file whose
+            # permissions were ever loosened outside this module's own
+            # write paths (a backup/restore, `cp -p`, a manual edit) stays
+            # loosely permissioned indefinitely - every subsequent
+            # load_config call would just keep reading from it as-is.
+            _chmod_if_exists(path)
+            _chmod_if_exists(path + "-journal")
             return _row_to_config(row)
 
         if not os.path.exists(DEFAULT_CONFIG_PATH):

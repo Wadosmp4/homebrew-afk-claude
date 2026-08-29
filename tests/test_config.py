@@ -273,6 +273,94 @@ def test_a_leftover_journal_sidecar_is_also_chmodded_after_a_write(tmp_path):
     assert not os.path.exists(path + "-journal")
 
 
+def test_load_config_chmods_the_db_on_the_existing_row_fast_path(tmp_path):
+    """code-review finding (P0-equivalent): load_config's existing-row
+    fast path - the one every daemon startup actually hits - must chmod the
+    db back to owner-only-readable even if its permissions were loosened
+    by something outside this module's own write paths (a backup/restore,
+    `cp -p`, a manual edit), not just leave it as found."""
+    path = str(tmp_path / "session_registry.db")
+    save_config(path, CompanionConfig(relay_url="ws://x/ws/companion", device_token="t"))
+
+    # Loosen the permissions to simulate an externally-touched file.
+    os.chmod(path, 0o644)
+    assert stat.S_IMODE(os.stat(path).st_mode) != (stat.S_IRUSR | stat.S_IWUSR)
+
+    load_config(path)  # existing-row fast path, not the migration branch
+
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    assert mode == stat.S_IRUSR | stat.S_IWUSR
+
+
+# --- Duplicate-column ALTER race (P2) ---------------------------------------
+
+
+def test_two_concurrent_connects_racing_a_forward_migration_do_not_raise(tmp_path, monkeypatch):
+    """Two processes (simulated here as two threads) racing _connect()'s
+    forward-migration ALTER TABLE ADD COLUMN for the same missing column
+    can both see "column doesn't exist yet" - the loser must treat SQLite's
+    "duplicate column name" error as a harmless no-op (someone else already
+    added it), not crash."""
+    path = str(tmp_path / "session_registry.db")
+
+    # Pre-create the table with every column except one, simulating an
+    # on-disk db from before that field existed - exactly the scenario
+    # _connect's own forward-migration loop exists for.
+    missing_field = "codex_personal_api_key"
+    present_fields = [f for f in config_module._CONFIG_FIELDS if f != missing_field]
+    columns_ddl = ", ".join(f"{name} {config_module._column_type(name)}" for name in present_fields)
+    setup_conn = sqlite3.connect(path)
+    setup_conn.execute(f"CREATE TABLE config (id INTEGER PRIMARY KEY CHECK (id = 1), {columns_ddl})")
+    setup_conn.commit()
+    setup_conn.close()
+
+    # Force both threads' ALTER TABLE calls to line up at (almost) the same
+    # instant, so one genuinely races the other's already-committed change
+    # instead of just happening to run sequentially. sqlite3.Connection is
+    # an immutable C type (can't monkeypatch its `execute` directly), so a
+    # thin subclass plugged in via sqlite3.connect's own `factory` param -
+    # itself reached through a patched `sqlite3.connect`, since config.py
+    # calls that as a plain module-level function - does the same job.
+    barrier = threading.Barrier(2)
+    real_connect = sqlite3.connect
+
+    class _BarrierConnection(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            if f"ALTER TABLE config ADD COLUMN {missing_field}" in sql:
+                barrier.wait(timeout=5)
+            return super().execute(sql, *args, **kwargs)
+
+    def patched_connect(*args, **kwargs):
+        kwargs.setdefault("factory", _BarrierConnection)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", patched_connect)
+
+    errors: list[Exception] = []
+
+    def worker():
+        try:
+            conn = config_module._connect(path)
+            conn.close()
+        except Exception as exc:  # pragma: no cover - only fires on a genuine race bug
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+
+    # And the column really is there afterwards - the race didn't silently
+    # skip adding it altogether.
+    conn = sqlite3.connect(path)
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(config)")}
+    conn.close()
+    assert missing_field in existing_columns
+
+
 def test_load_configs_own_default_parameter_points_at_the_shared_session_registry_path():
     """R5/KTD2: load_config's `path` default is a literal default-argument
     expression (`path: str = DEFAULT_SESSION_REGISTRY_PATH`), matching the

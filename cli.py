@@ -47,6 +47,7 @@ import argparse
 import getpass
 import json
 import socket
+import sqlite3
 import sys
 import time
 import urllib.error
@@ -236,9 +237,14 @@ def _print_phone_pairing_code(relay_url: str, device_token: str) -> None:
 
 
 def _pairing_code(args: argparse.Namespace) -> None:
+    # code-review finding: load_config's SQLite backing store can raise
+    # sqlite3.Error (a corrupted or locked db file) - this and the other two
+    # load_config call sites below all catch it alongside the pre-existing
+    # (OSError, ValueError, TypeError) trio, so a corrupted db produces this
+    # same friendly "run setup first" message instead of a raw traceback.
     try:
         config = load_config(args.config_path)
-    except (OSError, ValueError, TypeError) as exc:
+    except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
         print(f"Could not read config at {args.config_path}: {exc}")
         print("Run `afk-claude-companion setup` first.")
         return
@@ -263,7 +269,7 @@ def _token_set(args: argparse.Namespace) -> None:
 
     try:
         config = load_config(args.config_path)
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, sqlite3.Error):
         print(f"No existing config at {args.config_path} - run `afk-claude-companion setup` first.")
         sys.exit(1)
 
@@ -283,7 +289,7 @@ def _setup(args: argparse.Namespace) -> None:
     first Mac ever. See this module's docstring."""
     try:
         config = load_config(args.config_path)
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, sqlite3.Error):
         config = None
 
     if config is not None:

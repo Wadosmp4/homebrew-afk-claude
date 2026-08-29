@@ -137,6 +137,23 @@ def test_estimate_clamps_at_1_0():
     assert estimator.estimate("five_hour") == 1.0
 
 
+def test_task_totals_dict_does_not_grow_past_its_bound():
+    """code-review finding (P3): on a long-lived daemon process, every
+    distinct task_id ever seen must not get a permanent entry - the dict
+    is capped, evicting the oldest entries once it grows past the bound."""
+    estimator = RateLimitEstimator()
+    cap = estimator._MAX_TRACKED_TASKS
+
+    for i in range(cap + 250):
+        estimator.record_task_usage(f"task-{i}", {"total_tokens": 10})
+
+    assert len(estimator._task_totals) <= cap
+    # The oldest tasks are the ones evicted, not an arbitrary subset - the
+    # most recently seen task must still be tracked.
+    assert f"task-{cap + 249}" in estimator._task_totals
+    assert "task-0" not in estimator._task_totals
+
+
 def test_each_rate_limit_type_calibrates_independently():
     estimator = RateLimitEstimator()
     estimator.record_real_reading("five_hour", 0.40)

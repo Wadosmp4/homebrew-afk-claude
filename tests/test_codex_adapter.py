@@ -812,3 +812,160 @@ async def test_set_session_sandbox_emits_a_session_sandbox_event(adapter):
     event = await asyncio.wait_for(events.__anext__(), timeout=1)
     assert event.type == "session_sandbox"
     assert event.data["sandbox"] == "full_access"
+
+
+# --- Code-review fixes (2026-08 audit) ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_connect_raises_when_a_session_id_is_already_connected(adapter):
+    """P1 fix: unlike SDKAdapter.connect() (which raises ValueError if
+    session_id in self._sessions), this previously just overwrote the
+    dict entry outright - orphaning the previous session's client/thread
+    (never closed) and leaking its stream_task if one was in flight."""
+    await adapter.connect("s1", cwd="/repo")
+
+    with pytest.raises(ValueError):
+        await adapter.connect("s1", cwd="/repo")
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_arriving_while_a_turn_is_still_starting_is_not_missed(adapter):
+    """P2 fix: session.current_turn wasn't reassigned until after
+    `await session.thread.turn(...)` resolved in send_message(), so a
+    Cancel tapped while that call was still in flight saw the previous
+    (already-finished or None) current_turn and missed the newly-starting
+    turn entirely."""
+    await adapter.connect("s1", cwd="/repo")
+    thread = adapter._test_clients["latest"].threads[0]
+
+    turn_started = asyncio.Event()
+    release_turn = asyncio.Event()
+    real_turn = thread.turn
+
+    async def slow_turn(*args, **kwargs):
+        turn_started.set()
+        await release_turn.wait()
+        return await real_turn(*args, **kwargs)
+
+    thread.turn = slow_turn
+
+    send_task = asyncio.create_task(adapter.send_message("s1", "hello"))
+    await asyncio.wait_for(turn_started.wait(), timeout=1)
+
+    # Cancel tapped while thread.turn() is still in flight, before
+    # session.current_turn is ever assigned to the newly-starting turn.
+    await adapter.interrupt("s1")
+
+    release_turn.set()
+    await asyncio.wait_for(send_task, timeout=1)
+
+    turn_handle = thread.turns[0]
+    assert turn_handle.interrupted is True
+
+
+@pytest.mark.asyncio
+async def test_disconnect_does_not_hang_past_the_timeout_when_interrupt_and_close_hang(adapter, monkeypatch):
+    """P2 fix: current_turn.interrupt()/client.close() had no bound at
+    all, unlike sdk_adapter.py's consistently-bounded live-control
+    requests - an unresponsive subprocess against either call used to hang
+    disconnect() (and therefore disconnect_all() at daemon shutdown)
+    indefinitely."""
+    from companion.adapters import codex_adapter as codex_adapter_module
+
+    monkeypatch.setattr(codex_adapter_module, "_DISCONNECT_CALL_TIMEOUT_SECONDS", 0.05)
+
+    await adapter.connect("s1", cwd="/repo")
+    await adapter.send_message("s1", "hello")
+
+    client = adapter._test_clients["latest"]
+    turn_handle = client.threads[0].turns[0]
+
+    hang_forever = asyncio.Event()
+
+    async def hanging_interrupt():
+        await hang_forever.wait()
+
+    async def hanging_close():
+        await hang_forever.wait()
+
+    turn_handle.interrupt = hanging_interrupt
+    client.close = hanging_close
+
+    await asyncio.wait_for(adapter.disconnect("s1"), timeout=1)
+
+    assert adapter.is_active("s1") is None
+
+
+@pytest.mark.asyncio
+async def test_disconnect_all_cleans_up_multiple_sessions_including_one_with_an_in_flight_turn(monkeypatch):
+    """P1 gap (also called out by a prior review): disconnect_all() had
+    zero test coverage at all."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    created_clients: list[FakeCodexClient] = []
+
+    def factory():
+        client = FakeCodexClient()
+        created_clients.append(client)
+        return client
+
+    a = CodexAdapter(client_factory=factory)
+    await a.connect("s1", cwd="/repo1")
+    await a.connect("s2", cwd="/repo2")
+    await a.connect("s3", cwd="/repo3")
+
+    # s2 has an in-flight turn (and therefore a live stream_task) at the
+    # moment of shutdown.
+    await a.send_message("s2", "hello")
+
+    assert set(a.discover_sessions()) == {"s1", "s2", "s3"}
+
+    await a.disconnect_all()
+
+    assert a.discover_sessions() == []
+    for client in created_clients:
+        assert client.closed is True
+    turn_handle = created_clients[1].threads[0].turns[0]
+    assert turn_handle.interrupted is True
+    for session_id in ("s1", "s2", "s3"):
+        assert a.is_active(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_a_turn_error_mid_subagent_produces_a_synthetic_error_tool_result_for_the_still_open_item(adapter):
+    """P2 fix (prior review, previously unapplied): Codex's own 'Task'
+    tool-call aliasing deliberately doesn't emit a task_update, so if a
+    Codex turn errors between a subagent's start and completion
+    notifications, nothing else was ever emitting the compensating
+    tool_result - the mobile transcript showed a permanently 'running'
+    bubble with no cancel affordance."""
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+    await adapter.send_message("s1", "investigate the failing test")
+    await events.__anext__()  # user_message
+
+    turn_handle = adapter._test_clients["latest"].threads[0].turns[0]
+    started_item = _collab_spawn_item(CollabAgentToolCallStatus.in_progress)
+    turn_handle.push(
+        ItemStartedNotification(item=ThreadItem(started_item), startedAtMs=0, threadId="t1", turnId="turn-1")
+    )
+    tool_call_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert tool_call_event.type == "tool_call"
+    assert tool_call_event.data["tool"] == "Task"
+
+    turn_handle.push(
+        ErrorNotification(error=TurnError(message="rate limited"), threadId="t1", turnId="turn-1", willRetry=False)
+    )
+
+    # The synthetic tool_result must be forwarded *before* "error" -
+    # subscribe() stops yielding anything for this session as soon as it
+    # sees a typed "error" event, so emitting the closing tool_result
+    # afterward would queue it somewhere no live subscriber ever sees it.
+    synthetic_result = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert synthetic_result.type == "tool_result"
+    assert synthetic_result.data["tool_use_id"] == "item-4"
+    assert synthetic_result.data["is_error"] is True
+
+    error_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert error_event.type == "error"

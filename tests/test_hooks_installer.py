@@ -1,6 +1,9 @@
 import json
+import os
 
-from companion.hooks_installer import HOOK_EVENTS, install_hooks, uninstall_hooks
+import pytest
+
+from companion.hooks_installer import HOOK_EVENTS, _save_settings, install_hooks, uninstall_hooks
 
 
 def test_install_creates_settings_file_with_all_hook_events(tmp_path):
@@ -62,3 +65,50 @@ def test_uninstall_removes_only_our_entries(tmp_path):
     for event in HOOK_EVENTS:
         if event != "SessionStart":
             assert event not in settings["hooks"]
+
+
+# --- Code review fix: _save_settings writes atomically (temp file + rename)
+# instead of truncating the target file in place, so a crash mid-write can't
+# leave `.claude/settings.json` corrupt for other tooling to read. ----------
+
+
+def test_save_settings_writes_valid_complete_json(tmp_path):
+    settings_path = str(tmp_path / "settings.json")
+    _save_settings(settings_path, {"hooks": {"SessionStart": []}})
+
+    assert json.loads((tmp_path / "settings.json").read_text()) == {"hooks": {"SessionStart": []}}
+
+
+def test_save_settings_leaves_no_tmp_file_behind_on_success(tmp_path):
+    settings_path = str(tmp_path / "settings.json")
+    _save_settings(settings_path, {"a": 1})
+
+    assert not os.path.exists(settings_path + ".tmp")
+    assert os.path.exists(settings_path)
+
+
+def test_save_settings_does_not_touch_original_if_the_write_fails(tmp_path, monkeypatch):
+    """Simulates a crash partway through writing the new content: the
+    original file must be left completely untouched (not truncated), since
+    the write happens to a `.tmp` sibling that's only ever renamed onto the
+    real target after it's fully written."""
+    settings_path = tmp_path / "settings.json"
+    original = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo original"}]}]}}
+    settings_path.write_text(json.dumps(original))
+
+    real_dump = json.dump
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated crash mid-write")
+
+    monkeypatch.setattr(json, "dump", _boom)
+
+    with pytest.raises(RuntimeError):
+        _save_settings(str(settings_path), {"hooks": {"SessionStart": []}})
+
+    monkeypatch.setattr(json, "dump", real_dump)
+
+    # The original target is untouched - still valid, still the old content
+    # - because the write happened to a `.tmp` sibling that never got
+    # renamed onto it.
+    assert json.loads(settings_path.read_text()) == original

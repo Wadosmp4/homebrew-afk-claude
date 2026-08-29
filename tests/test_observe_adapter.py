@@ -1320,3 +1320,176 @@ async def test_a_full_claude_budget_does_not_starve_codex_discovery(tmp_path):
         assert codex_session_id in a.discover_sessions()
     finally:
         await a.stop()
+
+
+# --- Code-review fixes (2026-08 audit) ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_watch_loop_survives_an_exception_mid_scan_and_keeps_discovering_later(tmp_path, monkeypatch):
+    """P1 fix: _watch_projects_dir previously had no exception handling at
+    all, unlike every other background loop in this codebase (read_loop,
+    _drive_turn, _tail_file). Any unexpected error (a transient OSError, a
+    weird filename, a disk hiccup) killed the task silently and
+    permanently - no new sessions would ever be discovered again until a
+    full daemon restart, with no log line to explain why."""
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    project_dir = projects_dir / "my-repo"
+    project_dir.mkdir()
+
+    a = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        socket_path=_short_socket_path(),
+        watch_poll_interval=FAST_POLL,
+        tail_poll_interval=FAST_POLL,
+    )
+
+    real_list = a._list_candidate_transcripts
+    calls = {"n": 0}
+
+    def flaky_list():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("disk hiccup")
+        return real_list()
+
+    monkeypatch.setattr(a, "_list_candidate_transcripts", flaky_list)
+
+    await a.start()
+    try:
+        await _wait_until(lambda: calls["n"] >= 1)
+        # The loop must still be alive after that first failing pass - a
+        # transcript created afterward is still discovered on a later poll.
+        (project_dir / "session-after-error.jsonl").touch()
+        await _wait_until(lambda: "session-after-error" in a.discover_sessions())
+        assert not a._watch_task.done()
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_ended_sessions_no_longer_count_toward_the_watched_cap(tmp_path):
+    """P1 fix: _watched_count_for_agent previously counted every session
+    ever created for an agent, ended or not, turning max_watched_sessions
+    into a lifetime cap per agent instead of a concurrent-session cap -
+    once enough terminal sessions had ever finished for an agent, every
+    subsequent real session for that agent was silently skipped forever."""
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    project_dir = projects_dir / "my-repo"
+    project_dir.mkdir()
+    (project_dir / "session-a.jsonl").touch()
+
+    socket_path = _short_socket_path()
+    a = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        socket_path=socket_path,
+        watch_poll_interval=FAST_POLL,
+        tail_poll_interval=FAST_POLL,
+        max_watched_sessions=1,
+    )
+    await a.start()
+    try:
+        await _wait_until(lambda: "session-a" in a.discover_sessions())
+
+        # End it the same way a real terminal session closing does.
+        await _send_hook_async(socket_path, "SessionEnd", {"session_id": "session-a"})
+        await _wait_until(lambda: a.is_active("session-a") is False)
+
+        # A fresh session should now fit within the same cap of 1 - the
+        # already-ended one must not still be occupying the budget.
+        (project_dir / "session-b.jsonl").touch()
+        await _wait_until(lambda: "session-b" in a.discover_sessions())
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_session_end_denies_a_pending_permission_request_instead_of_hanging_forever(adapter, tmp_path):
+    """P2 fix: a pending permission-request Future was never resolved when
+    the session it belonged to ended, unlike SDKAdapter/CodexAdapter's own
+    disconnect paths (both explicitly walk pending requests and deny them
+    before tearing down). A PermissionRequest hook call blocking on `await
+    future` was left permanently suspended if the observed session ended
+    before the phone answered, leaking the real CLI's hook script forever."""
+    project_dir = tmp_path / "projects" / "my-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-end-pending.jsonl"
+    transcript.touch()
+    await _wait_until(lambda: "session-end-pending" in adapter.discover_sessions())
+    events = adapter.subscribe("session-end-pending")
+    await events.__anext__()  # session_started
+
+    hook_task = asyncio.create_task(
+        _send_hook_async(
+            adapter.socket_path,
+            "PermissionRequest",
+            {"session_id": "session-end-pending", "tool_use_id": "tool-9", "tool_name": "Bash", "tool_input": {}},
+        )
+    )
+    permission_event = await events.__anext__()
+    assert permission_event.type == "permission_request"
+
+    await _send_hook_async(adapter.socket_path, "SessionEnd", {"session_id": "session-end-pending"})
+
+    response = await asyncio.wait_for(hook_task, timeout=2)
+    assert response["permissionDecision"] == "deny"
+
+
+@pytest.mark.asyncio
+async def test_adapter_stop_denies_any_still_pending_permission_request(tmp_path):
+    """Same P2 fix as the session-end case above, for the other trigger
+    named in the audit: the whole adapter shutting down (daemon stop)
+    while a permission request is still unanswered must not leave it
+    hanging either."""
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    project_dir = projects_dir / "my-repo"
+    project_dir.mkdir()
+    (project_dir / "session-stop-pending.jsonl").touch()
+
+    socket_path = _short_socket_path()
+    a = ObserveAdapter(
+        projects_dir=str(projects_dir),
+        socket_path=socket_path,
+        watch_poll_interval=FAST_POLL,
+        tail_poll_interval=FAST_POLL,
+    )
+    await a.start()
+    await _wait_until(lambda: "session-stop-pending" in a.discover_sessions())
+    events = a.subscribe("session-stop-pending")
+    await events.__anext__()  # session_started
+
+    hook_task = asyncio.create_task(
+        _send_hook_async(
+            socket_path,
+            "PermissionRequest",
+            {"session_id": "session-stop-pending", "tool_use_id": "tool-9", "tool_name": "Bash", "tool_input": {}},
+        )
+    )
+    permission_event = await events.__anext__()
+    assert permission_event.type == "permission_request"
+
+    await a.stop()
+
+    response = await asyncio.wait_for(hook_task, timeout=2)
+    assert response["permissionDecision"] == "deny"
+
+
+@pytest.mark.asyncio
+async def test_a_dispatch_hook_failure_is_logged_and_still_returns_the_fallback_response(adapter, monkeypatch, caplog):
+    """P3 fix: _handle_hook_connection previously wrapped _dispatch_hook in
+    only try/finally - a failure inside it sent the hook script a bare {}
+    (no permissionDecision, same as today) but then propagated unhandled
+    with no application-level log line at all."""
+    async def boom(payload):
+        raise RuntimeError("dispatch exploded")
+
+    monkeypatch.setattr(adapter, "_dispatch_hook", boom)
+    caplog.set_level("ERROR")
+
+    response = await _send_hook_async(adapter.socket_path, "SessionStart", {"session_id": "whatever"})
+
+    assert response == {}
+    assert "dispatch exploded" in caplog.text

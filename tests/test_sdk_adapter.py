@@ -1380,3 +1380,89 @@ async def test_client_crash_emits_error_event_not_silence(adapter):
     error_event = await events.__anext__()
     assert error_event.type == "error"
     assert "subprocess died" in error_event.data["message"]
+
+
+# --- Code-review fixes (2026-08 audit) ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_client_crash_marks_the_session_ended_and_a_reconnect_then_succeeds(adapter):
+    """P1 fix: only the normal-completion path used to call
+    self.end("completed") - the crash (except Exception) branch just
+    emitted an error event and left `_ended` False forever, so is_active()
+    reported True forever, the session stayed in _sessions, and any
+    reconnect attempt for that session_id hit connect()'s "already
+    connected" guard, permanently blocking recovery until a full daemon
+    restart."""
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    client.push(RuntimeError("subprocess died"))  # simulate the SDK stream blowing up
+    await events.__anext__()  # error
+
+    assert adapter.is_active("s1") is False
+
+    # A later reconnect for the same session_id must succeed rather than
+    # raising "session already connected".
+    await adapter.connect("s1")
+    assert adapter.is_active("s1") is True
+
+
+@pytest.mark.asyncio
+async def test_connect_with_no_cli_env_never_shares_state_between_sessions(adapter):
+    """P3 fix: cli_env's parameter default used to be a mutable {}
+    literal - created once at function-definition time and shared across
+    every call that omits it. Latent (daemon.py's own callers always pass
+    an explicit fresh dict) but a landmine for any future/test caller that
+    doesn't."""
+    await adapter.connect("s1")
+    client1 = adapter._test_clients["latest"]
+    client1.options.env["LEAKED"] = "yes"
+
+    await adapter.connect("s2")
+    client2 = adapter._test_clients["latest"]
+
+    assert "LEAKED" not in client2.options.env
+
+
+@pytest.mark.asyncio
+async def test_connect_backs_out_cleanly_when_a_racing_disconnect_pops_the_session_mid_client_connect():
+    """P3 fix (narrow race): connect() inserted into _sessions before
+    awaiting client.connect(), unguarded - if disconnect() ran in that
+    window and popped the entry, connect() used to still finish anyway,
+    creating an untracked, never-cancelled reader_task nothing would ever
+    await or cancel. daemon.py's own unordered per-action
+    asyncio.create_task dispatch is exactly what makes this reachable in
+    practice (a fast End Session racing a still-in-flight start_session)."""
+    connect_started = asyncio.Event()
+    release_connect = asyncio.Event()
+    created_clients = []
+
+    class SlowConnectClient(FakeSDKClient):
+        async def connect(self, prompt=None) -> None:
+            connect_started.set()
+            await release_connect.wait()
+            await super().connect(prompt)
+
+    def factory(options):
+        client = SlowConnectClient(options)
+        created_clients.append(client)
+        return client
+
+    a = SDKAdapter(client_factory=factory)
+    connect_task = asyncio.create_task(a.connect("s1"))
+    await asyncio.wait_for(connect_started.wait(), timeout=1)
+
+    await a.disconnect("s1")
+    assert a.discover_sessions() == []
+
+    release_connect.set()
+    await asyncio.wait_for(connect_task, timeout=1)
+
+    # connect() must have backed out rather than resurrecting the session
+    # disconnect() already tore down.
+    assert a.discover_sessions() == []
+    assert a.is_active("s1") is None
+    assert created_clients[0].disconnected is True
