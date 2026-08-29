@@ -7,7 +7,7 @@ import subprocess
 
 import pytest
 
-from companion.git_status import get_diff, get_status
+from companion.git_status import get_diff, get_file_content, get_status, write_session_file
 
 
 def _git(cwd, *args) -> None:
@@ -115,3 +115,174 @@ def test_diff_for_a_binary_file_reports_binary_without_a_text_diff(repo):
     assert diff.is_git_repo is True
     assert diff.is_binary is True
     assert diff.diff is None
+
+
+# --- get_file_content (Quick-Edit Changed Files plan, U1) -------------------
+
+
+def test_get_file_content_for_a_real_changed_file_returns_its_exact_current_content(repo):
+    (repo / "committed.txt").write_text("changed content\n")
+
+    result = get_file_content(str(repo), "committed.txt")
+
+    assert result.ok is True
+    assert result.content == "changed content\n"
+    assert result.reason is None
+
+
+def test_get_file_content_matches_a_changed_files_relative_path_against_git_status(repo):
+    """Covers KTD1: regression-guards the absolute-vs-relative bug found in
+    doc review - a real changed file, addressed the normal way a mobile
+    client would (a cwd-relative path), must be readable."""
+    nested = repo / "src" / "app.py"
+    nested.parent.mkdir()
+    nested.write_text("print('new')\n")
+    _git(repo, "add", "src/app.py")
+
+    result = get_file_content(str(repo), "src/app.py")
+
+    assert result.ok is True
+    assert result.content == "print('new')\n"
+
+
+def test_get_file_content_rejects_a_path_traversal_attempt_before_reading_anything(repo):
+    outside_secret = repo.parent / "secret.txt"
+    outside_secret.write_text("do not read me\n")
+
+    result = get_file_content(str(repo), "../secret.txt")
+
+    assert result.ok is False
+    assert result.reason == "path_escape"
+    assert result.content is None
+
+
+def test_get_file_content_rejects_a_real_file_git_status_does_not_report_as_changed(repo):
+    (repo / "untouched.txt").write_text("never modified\n")
+    _git(repo, "add", "untouched.txt")
+    _git(repo, "commit", "-q", "-m", "add untouched.txt")
+
+    result = get_file_content(str(repo), "untouched.txt")
+
+    assert result.ok is False
+    assert result.reason == "not_changed"
+    assert result.content is None
+
+
+def test_get_file_content_flags_a_binary_changed_file_instead_of_returning_content(repo):
+    (repo / "image.png").write_bytes(bytes([0x89, 0x50, 0x4E, 0x47, 0x00, 0x01, 0x02, 0x03]))
+
+    result = get_file_content(str(repo), "image.png")
+
+    assert result.ok is False
+    assert result.reason == "binary"
+    assert result.content is None
+
+
+def test_get_file_content_rejects_a_file_git_status_reports_as_deleted(repo):
+    (repo / "to_delete.txt").write_text("bye\n")
+    _git(repo, "add", "to_delete.txt")
+    _git(repo, "commit", "-q", "-m", "add to_delete.txt")
+    (repo / "to_delete.txt").unlink()
+
+    result = get_file_content(str(repo), "to_delete.txt")
+
+    assert result.ok is False
+    assert result.reason == "deleted"
+    assert result.content is None
+
+
+# --- write_session_file (Quick-Edit Changed Files plan, U2) -----------------
+
+
+def test_write_session_file_succeeds_when_on_disk_content_matches_previous_content(repo):
+    (repo / "committed.txt").write_text("changed\n")
+
+    result = write_session_file(str(repo), "committed.txt", previous_content="changed\n", new_content="fixed\n")
+
+    assert result.ok is True
+    assert result.reason is None
+    assert (repo / "committed.txt").read_text() == "fixed\n"
+
+
+def test_write_session_file_rejects_a_conflict_and_leaves_the_file_untouched(repo):
+    (repo / "committed.txt").write_text("changed on disk\n")
+
+    result = write_session_file(
+        str(repo), "committed.txt", previous_content="stale fetched content\n", new_content="fixed\n"
+    )
+
+    assert result.ok is False
+    assert result.reason == "conflict"
+    assert (repo / "committed.txt").read_text() == "changed on disk\n"
+
+
+def test_write_session_file_rejects_a_path_traversal_attempt_without_touching_the_file(repo):
+    outside_secret = repo.parent / "secret.txt"
+    outside_secret.write_text("original\n")
+
+    result = write_session_file(
+        str(repo), "../secret.txt", previous_content="original\n", new_content="overwritten\n"
+    )
+
+    assert result.ok is False
+    assert result.reason == "path_escape"
+    assert outside_secret.read_text() == "original\n"
+
+
+def test_write_session_file_rejects_a_file_not_reported_as_changed_without_touching_it(repo):
+    (repo / "untouched.txt").write_text("never modified\n")
+    _git(repo, "add", "untouched.txt")
+    _git(repo, "commit", "-q", "-m", "add untouched.txt")
+
+    result = write_session_file(
+        str(repo), "untouched.txt", previous_content="never modified\n", new_content="sneaky edit\n"
+    )
+
+    assert result.ok is False
+    assert result.reason == "not_changed"
+    assert (repo / "untouched.txt").read_text() == "never modified\n"
+
+
+def test_get_file_content_reports_read_failed_for_a_non_utf8_file_instead_of_crashing(repo):
+    """code-review finding (P1): a changed file with non-UTF-8 bytes but no
+    NUL byte isn't caught by get_diff's binary heuristic (which looks for
+    "Binary files" / a NUL byte in the diff output), so it reaches the
+    `open(..., encoding="utf-8")` read - which must raise UnicodeDecodeError
+    caught here (not left to propagate uncaught) and reported the same way
+    any other unreadable file is."""
+    target = repo / "latin1.txt"
+    # 0xe9 is 'é' in latin-1 but not a valid UTF-8 continuation byte on its
+    # own - and contains no NUL byte, so get_diff's binary heuristic won't
+    # flag it.
+    target.write_bytes(b"caf\xe9\n")
+    _git(repo, "add", "latin1.txt")
+
+    result = get_file_content(str(repo), "latin1.txt")
+
+    assert result.ok is False
+    assert result.reason == "read_failed"
+    assert result.content is None
+
+
+def test_write_session_file_reports_read_failed_for_a_non_utf8_file_instead_of_crashing(repo):
+    target = repo / "latin1.txt"
+    target.write_bytes(b"caf\xe9\n")
+    _git(repo, "add", "latin1.txt")
+
+    result = write_session_file(str(repo), "latin1.txt", previous_content="anything", new_content="new")
+
+    assert result.ok is False
+    assert result.reason == "read_failed"
+
+
+def test_write_session_file_rejects_a_deleted_file_without_recreating_it(repo):
+    (repo / "to_delete.txt").write_text("bye\n")
+    _git(repo, "add", "to_delete.txt")
+    _git(repo, "commit", "-q", "-m", "add to_delete.txt")
+    (repo / "to_delete.txt").unlink()
+
+    result = write_session_file(str(repo), "to_delete.txt", previous_content="bye\n", new_content="resurrected\n")
+
+    assert result.ok is False
+    assert result.reason == "deleted"
+    assert not (repo / "to_delete.txt").exists()

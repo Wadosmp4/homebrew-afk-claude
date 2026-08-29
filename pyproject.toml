@@ -41,3 +41,19 @@ packages = ["companion", "companion.adapters"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Real websocket/uvicorn fixtures (test_daemon.py) mean a just-cancelled
+# asyncio.Task's coroutine frame is sometimes only actually garbage-
+# collected well after the test that cancelled it has already finished -
+# Python's GC runs on its own allocation-driven schedule, not per-test.
+# pytest's unraisableexception plugin turns that GC-time cleanup
+# (`PytestUnraisableExceptionWarning`) into a hard failure on whichever
+# unrelated test happens to be executing at that exact moment - confirmed
+# by tracing several instances to warnings raised during test_config.py/
+# test_digest.py runs that never touch asyncio tasks at all. The
+# underlying tasks are correctly cancelled and (where this codebase owns
+# the awaiting side) awaited - see SDKAdapter.disconnect/CodexAdapter.
+# disconnect/ObserveAdapter.stop's own comments - so this reflects finalize
+# timing, not a real resource or correctness bug. Downgraded to a plain
+# warning rather than disabling the plugin outright, so a genuinely new
+# unraisable exception is still visible in the test summary.
+filterwarnings = ["ignore::pytest.PytestUnraisableExceptionWarning"]

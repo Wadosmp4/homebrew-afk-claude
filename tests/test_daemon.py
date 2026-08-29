@@ -13,11 +13,14 @@ the developer's actual Claude Code state.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import socket
 import subprocess
 import sys
+import threading
+import time
 import uuid
 from datetime import datetime
 
@@ -25,13 +28,14 @@ import pytest
 import pytest_asyncio
 import uvicorn
 import websockets
+from claude_agent_sdk import TaskNotificationMessage
 
 from companion.adapters.codex_adapter import CodexAdapter
 from companion.adapters.observe_adapter import KNOWN_ENTRYPOINTS, ObserveAdapter
 from companion.adapters.sdk_adapter import SDKAdapter
 from companion.config import CompanionConfig, load_config
 from companion.daemon import CompanionDaemon
-from companion import session_registry
+from companion import git_status, session_registry
 from companion.tests.test_codex_adapter import FakeCodexClient
 from companion.tests.test_sdk_adapter import _STOP, FakeSDKClient
 from relay import auth
@@ -165,6 +169,57 @@ def _fake_codex_adapter() -> tuple[CodexAdapter, dict[str, FakeCodexClient]]:
 async def _stop_daemon(daemon: CompanionDaemon, task: asyncio.Task) -> None:
     daemon.stop()
     await asyncio.wait_for(task, timeout=2)
+
+
+async def _simulate_ungraceful_restart(daemon: CompanionDaemon, session_id: str) -> None:
+    """A handful of resume tests simulate a companion restart by dropping a
+    session's in-memory state directly, bypassing SDKAdapter.disconnect()'s
+    normal (graceful, session_ended-emitting) teardown - the whole point is
+    that a real restart doesn't get a chance to run that. But the dropped
+    session's own reader_task/forwarder task are real asyncio.Tasks that
+    don't stop just because nothing references the session dict entry
+    anymore; left merely cancel()'d and never awaited, they can still be
+    pending when this test's event loop closes, and asyncio reports that
+    asynchronously (often during a *later*, unrelated test) as "Task was
+    destroyed but it is pending!" - the root cause of this suite's
+    intermittent failures before this helper existed. Cancelling *and*
+    awaiting both here, before the dict entries are dropped, ensures they
+    actually finish first."""
+    session = daemon.sdk_adapter._sessions.pop(session_id, None)
+    if session is not None and session.reader_task is not None:
+        session.reader_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await session.reader_task
+    old_forwarder = daemon._forwarding.pop(session_id, None)
+    if old_forwarder is not None:
+        old_forwarder.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await old_forwarder
+
+
+async def _next_sdk_session_started(phone: "_FakePhone", session_id: str) -> dict:
+    """The hand-written transcript these restart-simulation tests write
+    into observe_adapter.projects_dir (to give the SDK-adapter's own resume
+    path something to find) also sits in the directory ObserveAdapter
+    independently polls (observe_scan_interval=0.02s in tests - see
+    _fast_config) - it can (harmlessly) notice the same file as a *new
+    observed session* and emit its own unrelated session_started
+    (mode=observe_only, no permission_mode key at all) for the same
+    session_id, racing the SDK adapter's own resumed session_started
+    (mode=sdk_owned). Already documented and worked around this exact way
+    in test_a_set_session_permission_mode_dispatched_right_after_end_session_
+    cannot_resurrect_it above - this hoists the same filtering into a
+    shared helper for the other resume tests that only expect one
+    session_started and would otherwise intermittently receive the
+    observe_only decoy first."""
+    while True:
+        event = await phone.next_event()
+        if (
+            event["type"] == "session_started"
+            and event["session_id"] == session_id
+            and event["data"].get("mode") == "sdk_owned"
+        ):
+            return event
 
 
 @pytest.mark.asyncio
@@ -315,6 +370,126 @@ async def test_sdk_session_forwarding_resumes_after_relay_reconnect(tmp_path, pg
             await _stop_server(server2)
     finally:
         await _stop_daemon(daemon, task)
+
+
+class _FakeReclaimAdapter:
+    """Minimal AdapterProtocol double for exercising _watch_active_sessions/
+    _reclaim_forwarder's ObserveAdapter-vs-authoritative-adapter collision
+    handling in isolation - no real transcript file or relay connection
+    needed, just two adapter doubles whose discover_sessions() lists can be
+    mutated mid-test to simulate ObserveAdapter's poll noticing a session
+    before the authoritative adapter's own resume/connect() call finishes
+    registering it (see _watch_active_sessions's own docstring)."""
+
+    def __init__(self):
+        self.session_ids: list[str] = []
+        self.subscribed_session_ids: list[str] = []
+        self.cancelled_session_ids: list[str] = []
+
+    def discover_sessions(self) -> list[str]:
+        return list(self.session_ids)
+
+    def get_cwd(self, session_id):
+        return "/tmp"
+
+    def is_active(self, session_id):
+        return True
+
+    def emit_custom(self, session_id, type_, **data):
+        pass
+
+    async def send_message(self, session_id, text):
+        raise NotImplementedError
+
+    async def interrupt(self, session_id):
+        raise NotImplementedError
+
+    async def compact(self, session_id):
+        raise NotImplementedError
+
+    async def disconnect(self, session_id):
+        raise NotImplementedError
+
+    async def respond_to_permission(self, session_id, request_id, decision, *, message=""):
+        raise NotImplementedError
+
+    async def subscribe(self, session_id):
+        self.subscribed_session_ids.append(session_id)
+        try:
+            await asyncio.Event().wait()  # blocks until this forwarder task is cancelled
+        except asyncio.CancelledError:
+            self.cancelled_session_ids.append(session_id)
+            raise
+        if False:
+            yield  # pragma: no cover - unreachable, just makes this an async generator function
+
+
+class _FakeWs:
+    async def send(self, message):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_reclaim_forwarder_hands_a_session_back_to_its_authoritative_adapter(tmp_path):
+    """code-review finding (P1): _forwarding_adapter/_watch_active_sessions/
+    _reclaim_forwarder implement a nontrivial race-condition fix with zero
+    prior test coverage. ObserveAdapter's poll can notice a session_id (it
+    scans the same on-disk transcript directory an SDK-owned session's own
+    transcript lives in) before that session's own resume/connect() call
+    finishes registering it with sdk_adapter - without the reclaim,
+    ObserveAdapter's forwarder would permanently win that session_id's
+    slot (the "already forwarding" guard in _spawn_forwarder never
+    re-checks who actually owns it), and the SDK-owned session's own
+    events would never be forwarded at all, not even after the resume
+    completes."""
+    config = CompanionConfig(
+        relay_url="ws://127.0.0.1:1/ws/companion", device_token="t", observe_scan_interval=0.01
+    )
+    fake_sdk = _FakeReclaimAdapter()
+    fake_observe = _FakeReclaimAdapter()
+    fake_codex = _FakeReclaimAdapter()
+    daemon = CompanionDaemon(
+        config,
+        sdk_adapter=fake_sdk,
+        observe_adapter=fake_observe,
+        codex_adapter=fake_codex,
+        recents_path=str(tmp_path / "recent_projects.json"),
+        config_path=str(tmp_path / "companion_config.json"),
+        session_registry_path=str(tmp_path / "session_registry.db"),
+    )
+    ws = _FakeWs()
+    session_id = "collision-session"
+
+    # ObserveAdapter is first to discover it - a genuine tick of
+    # _watch_active_sessions spawns its forwarder here, the wrong adapter
+    # winning the race this test exists to cover.
+    fake_observe.session_ids.append(session_id)
+
+    watcher = asyncio.create_task(daemon._watch_active_sessions(ws))
+    try:
+        await _wait_until(lambda: daemon._forwarding_adapter.get(session_id) is fake_observe)
+        assert fake_observe.subscribed_session_ids == [session_id]
+
+        # The authoritative adapter's own resume/connect completes -
+        # sdk_adapter now discovers the same session_id too.
+        fake_sdk.session_ids.append(session_id)
+
+        # The reclaim: the wrongly-held ObserveAdapter forwarder is
+        # cancelled and replaced by one bound to sdk_adapter instead.
+        await _wait_until(lambda: daemon._forwarding_adapter.get(session_id) is fake_sdk)
+        await _wait_until(lambda: session_id in fake_observe.cancelled_session_ids)
+        assert fake_sdk.subscribed_session_ids == [session_id]
+        # Not re-forwarded a second time once already reclaimed.
+        assert fake_observe.subscribed_session_ids == [session_id]
+    finally:
+        daemon._stop_event.set()
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
+        remaining = list(daemon._forwarding.values())
+        for task in remaining:
+            task.cancel()
+        await asyncio.gather(*remaining, return_exceptions=True)
 
 
 # --- Action routing + event forwarding (daemon <-> SDK adapter <-> phone) --
@@ -832,12 +1007,16 @@ async def test_a_session_that_completes_naturally_also_marks_the_registry_row_en
 
 
 @pytest.mark.asyncio
-async def test_a_crashed_session_leaves_the_registry_row_active(running_daemon, phone_token):
-    """A crash (read_loop's own except-branch) never calls SDKAdapter.end()
-    and so never emits session_ended - deliberately left 'active' in the
-    registry, since the session genuinely still exists, just wasn't cleanly
-    closed (R4's job is keeping that visible, not R5's ended-durability
-    guarantee)."""
+async def test_a_crashed_session_marks_the_registry_row_ended(running_daemon, phone_token):
+    """Updated for a concurrent sdk_adapter.py fix (code-review, P1): a
+    crash (read_loop's own except-branch) now calls self.end("crashed")
+    the same way a normal completion already does, so it emits
+    session_ended and this daemon's own _forward_events funnel point marks
+    the registry row 'ended' just like any other way an SDK-owned session
+    stops - previously a crash left the row 'active' forever, permanently
+    blocking any future reconnect attempt for that session_id (connect()'s
+    own "already connected" guard) until a full daemon restart wiped
+    SDKAdapter's in-memory _sessions."""
     daemon, port, fake_clients = running_daemon
     phone = await _FakePhone.connect(port, phone_token)
     try:
@@ -849,7 +1028,10 @@ async def test_a_crashed_session_leaves_the_registry_row_active(running_daemon, 
         error_event = await phone.next_event()
         assert error_event["type"] == "error"
 
-        assert session_registry.get_session(session_id, daemon.session_registry_path).status == "active"
+        session_ended_event = await phone.next_event()
+        assert session_ended_event["type"] == "session_ended"
+
+        assert session_registry.get_session(session_id, daemon.session_registry_path).status == "ended"
     finally:
         await phone.close()
 
@@ -885,20 +1067,17 @@ async def test_resuming_a_stale_session_restores_its_previously_saved_settings(
         (project_dir / f"{session_id}.jsonl").write_text(
             json.dumps({"type": "user", "cwd": real_cwd, "message": {"role": "user", "content": "hi"}}) + "\n"
         )
-        del daemon.sdk_adapter._sessions[session_id]
         # A real restart starts self._forwarding empty too (it's a fresh
         # CompanionDaemon instance) - without also clearing this stale
         # entry, _spawn_forwarder's "already forwarding" guard would skip
         # wiring up the resumed session, and the events below would queue
-        # forever with nothing reading them.
-        old_forwarder = daemon._forwarding.pop(session_id, None)
-        if old_forwarder is not None:
-            old_forwarder.cancel()
+        # forever with nothing reading them. _simulate_ungraceful_restart
+        # drops both the sdk_adapter session and the forwarder task.
+        await _simulate_ungraceful_restart(daemon, session_id)
 
         await phone.send_action({"kind": "send_message", "session_id": session_id, "text": "still there?"})
 
-        resumed_started = await phone.next_event()
-        assert resumed_started["type"] == "session_started"
+        resumed_started = await _next_sdk_session_started(phone, session_id)
         assert resumed_started["data"]["permission_mode"] == "acceptEdits"
         assert resumed_started["data"]["model"] == "claude-opus-5"
 
@@ -930,15 +1109,11 @@ async def test_resuming_a_session_with_no_saved_permission_mode_reconnects_with_
         (project_dir / f"{session_id}.jsonl").write_text(
             json.dumps({"type": "user", "cwd": real_cwd, "message": {"role": "user", "content": "hi"}}) + "\n"
         )
-        del daemon.sdk_adapter._sessions[session_id]
-        old_forwarder = daemon._forwarding.pop(session_id, None)
-        if old_forwarder is not None:
-            old_forwarder.cancel()
+        await _simulate_ungraceful_restart(daemon, session_id)
 
         await phone.send_action({"kind": "send_message", "session_id": session_id, "text": "still there?"})
 
-        resumed_started = await phone.next_event()
-        assert resumed_started["type"] == "session_started"
+        resumed_started = await _next_sdk_session_started(phone, session_id)
         assert resumed_started["data"]["permission_mode"] is None
     finally:
         await phone.close()
@@ -1203,6 +1378,143 @@ async def test_set_session_sandbox_is_a_noop_for_a_claude_owned_session(running_
 
 
 @pytest.mark.asyncio
+async def test_stop_task_action_calls_the_sdk_client_and_the_resulting_notification_reaches_the_phone(
+    running_daemon, phone_token
+):
+    """Bug fix (user report): a background subagent dispatched via the
+    "Task" tool keeps running after the dispatching turn's own
+    waiting_for_input fires - stop_task lets the phone actually cancel it,
+    unlike interrupt (which only cancels the current live turn). No
+    confirmation event fires directly from the action itself (unlike
+    set_session_permission_mode/set_session_model above) - per
+    ClaudeSDKClient.stop_task()'s own docstring, a task_notification
+    message follows asynchronously once the CLI subprocess actually stops
+    it, which SDKAdapter._handle_message turns into a task_update event
+    through the normal read loop, exercised here end to end."""
+    daemon, port, fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action({"kind": "stop_task", "session_id": session_id, "task_id": "task-1"})
+        # No confirmation event fires from the action dispatch itself -
+        # give the (unordered) dispatch task a moment to actually run
+        # before asserting on the fake client's own recorded state.
+        for _ in range(50):
+            if getattr(fake_clients[0], "stopped_task_ids", None):
+                break
+            await asyncio.sleep(0.01)
+        assert fake_clients[0].stopped_task_ids == ["task-1"]
+
+        fake_clients[0].push(
+            TaskNotificationMessage(
+                subtype="task_notification",
+                data={},
+                task_id="task-1",
+                status="stopped",
+                output_file="/tmp/task-1.json",
+                summary="Stopped by user",
+                uuid="u1",
+                session_id=session_id,
+                tool_use_id="tool-1",
+            )
+        )
+        notification = await phone.next_event()
+        assert notification["type"] == "task_update"
+        assert notification["data"]["phase"] == "notification"
+        assert notification["data"]["task_id"] == "task-1"
+        assert notification["data"]["status"] == "stopped"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_task_action_is_a_noop_for_an_observed_session(running_daemon, phone_token):
+    """SDK-owned only, same guard as set_session_permission_mode/
+    set_session_model above - ObserveAdapter has no client of ours to send
+    this control request to."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        projects_dir = daemon.observe_adapter.projects_dir
+        project_dir = projects_dir / "my-repo"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "session-xyz.jsonl").touch()
+
+        discovered = await phone.next_event(timeout=3.0)
+        assert discovered["type"] == "session_started"
+        session_id = discovered["session_id"]
+
+        await phone.send_action({"kind": "stop_task", "session_id": session_id, "task_id": "task-1"})
+        # No crash, no event, no AttributeError propagating - just a clean
+        # no-op, same convention as test_set_session_auto_approve_is_a_noop_
+        # for_an_sdk_owned_session above.
+        await asyncio.sleep(0.05)
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_a_read_only_action_for_an_observed_session_with_a_real_transcript_does_not_trigger_an_sdk_resume(
+    running_daemon, phone_token
+):
+    """code-review finding (P1): every existing observe-session test above
+    creates its transcript via `.touch()` (empty file), which makes
+    history.find_transcript_cwd return None and short-circuits
+    _try_resume_sdk_session before it ever reaches sdk_adapter.connect -
+    none of them actually exercised the realistic case of a genuinely
+    observe-only session whose transcript has real content (an actual `cwd`
+    field, exactly like every real Claude Code transcript has). Before the
+    fix, _handle_action's dispatch preamble tried
+    `_adapter_for(session_id, include_observed=False)` first for every
+    action kind, which excludes observe_adapter - for a session_id with no
+    session_registry row (never started via this companion) and a real
+    transcript, that fell through to _try_resume_sdk_session, which found a
+    resolvable cwd and unconditionally called self.sdk_adapter.connect(...),
+    converting a passive observed session into an SDK-owned one as a side
+    effect of a read-only action. The fix restricts that fast path to
+    send_message/respond_to_permission only - git_status (a read-only
+    action) must resolve via the normal include_observed=True lookup and
+    reach observe_adapter directly, with zero SDK client ever created."""
+    daemon, port, fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        project_dir = daemon.observe_adapter.projects_dir / "my-repo"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "session-live.jsonl").write_text(
+            json.dumps({"cwd": str(project_dir), "type": "user", "message": {"role": "user", "content": "hi"}})
+            + "\n"
+        )
+
+        started = await phone.next_event(timeout=3.0)
+        assert started["type"] == "session_started"
+        assert started["data"]["mode"] == "observe_only"
+
+        await phone.send_action({"kind": "open_session", "session_id": "session-live"})
+        await phone.send_action({"kind": "git_status", "session_id": "session-live"})
+        # A live transcript can also produce extra session_started/no-op
+        # observe-poll events before the git_status result arrives (unlike
+        # the empty-transcript tests above) - drain until it shows up
+        # rather than assuming it's the very next event.
+        seen = []
+        try:
+            while not any(e["type"] == "git_status" for e in seen):
+                seen.append(await phone.next_event(timeout=3.0))
+        except asyncio.TimeoutError:
+            pass
+        assert any(e["type"] == "git_status" for e in seen)
+        # The whole point: no SDK resume attempt happened for this
+        # genuinely observe-only session just because a real transcript
+        # (rather than an empty .touch()'d one) let find_transcript_cwd
+        # resolve a cwd.
+        assert fake_clients == {}
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
 async def test_set_session_auto_approve_is_a_noop_for_an_sdk_owned_session(running_daemon, phone_token):
     """code-review finding: SDKAdapter no longer defines
     set_session_auto_approve at all (replaced by set_session_permission_mode/
@@ -1394,10 +1706,7 @@ async def test_catch_me_up_succeeds_for_a_fresh_session_after_a_restart(running_
             )
             + "\n"
         )
-        del daemon.sdk_adapter._sessions[session_id]
-        old_forwarder = daemon._forwarding.pop(session_id, None)
-        if old_forwarder is not None:
-            old_forwarder.cancel()
+        await _simulate_ungraceful_restart(daemon, session_id)
 
         async def _fake_generate_digest(transcript_events, **kwargs):
             return "Made progress on the thing."
@@ -1409,11 +1718,14 @@ async def test_catch_me_up_succeeds_for_a_fresh_session_after_a_restart(running_
             # The resume's own session_started (forwarding restarts via
             # _watch_active_sessions's own poll, a background task
             # independent of this dispatch) can land before or after the
-            # digest event - same pre-existing timing race documented on
+            # digest event, and can itself arrive as more than one event -
+            # same pre-existing timing race documented on
             # test_resuming_a_stale_session_restores_its_previously_saved_settings.
-            # Not this plan's regression to fix; tolerate either order.
-            first = await phone.next_event()
-            event = first if first["type"] == "session_digest" else await phone.next_event()
+            # Not this plan's regression to fix; tolerate any number of
+            # leading non-digest events rather than assuming at most one.
+            event = await phone.next_event()
+            while event["type"] != "session_digest":
+                event = await phone.next_event()
         finally:
             digest_module.generate_digest = original_generate
 
@@ -1449,10 +1761,10 @@ async def test_send_message_for_a_stale_session_id_resumes_it_from_its_own_trans
         )
 
         # connect()'s own session_started fires first (the reconnect), then
-        # the original action actually goes through.
-        started = await phone.next_event()
-        assert started["type"] == "session_started"
-        assert started["session_id"] == "old-session-1"
+        # the original action actually goes through. _next_sdk_session_started
+        # also filters out observe_adapter's own unrelated session_started
+        # for the same file (see that helper's own docstring).
+        started = await _next_sdk_session_started(phone, "old-session-1")
 
         message_event = await phone.next_event()
         assert message_event["type"] == "user_message"
@@ -1573,6 +1885,221 @@ async def test_git_diff_action_returns_a_real_diff(running_daemon, phone_token, 
         assert "+updated" in event["data"]["diff"]
     finally:
         await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_get_file_content_action_returns_a_changed_files_real_content(running_daemon, phone_token, tmp_path):
+    """Quick-Edit Changed Files plan, U1: the get_file_content action's
+    result rides the session's own event stream, same shape as
+    git_status/git_diff above - companion/git_status.py's own tests cover
+    the validation/read logic itself."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
+    (repo / "README.md").write_text("original\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "Initial"], cwd=repo, check=True)
+    (repo / "README.md").write_text("updated\n")
+
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": str(repo)})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action({"kind": "get_file_content", "session_id": session_id, "path": "README.md"})
+
+        event = await phone.next_event()
+        assert event["type"] == "file_content"
+        assert event["data"]["ok"] is True
+        assert event["data"]["content"] == "updated\n"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_get_file_content_action_missing_path_emits_a_rejection_event_not_a_silent_drop(
+    running_daemon, phone_token, tmp_path
+):
+    """Covers KTD10: diverges from _handle_git_diff's own silent-log-and-
+    drop precedent for a missing path."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": str(tmp_path)})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action({"kind": "get_file_content", "session_id": session_id})
+
+        event = await phone.next_event()
+        assert event["type"] == "file_content"
+        assert event["data"]["ok"] is False
+        assert event["data"]["reason"] == "missing_path"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_write_session_file_action_overwrites_the_file_and_reports_success(
+    running_daemon, phone_token, tmp_path
+):
+    """Quick-Edit Changed Files plan, U2: covers AE1 at the full dispatch
+    level - companion/git_status.py's own tests cover the conflict/
+    rejection logic itself."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
+    (repo / "README.md").write_text("original\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "Initial"], cwd=repo, check=True)
+    (repo / "README.md").write_text("updated\n")
+
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": str(repo)})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action(
+            {
+                "kind": "write_session_file",
+                "session_id": session_id,
+                "path": "README.md",
+                "previous_content": "updated\n",
+                "new_content": "fixed typo\n",
+            }
+        )
+
+        event = await phone.next_event()
+        assert event["type"] == "write_session_file"
+        assert event["data"]["ok"] is True
+        assert (repo / "README.md").read_text() == "fixed typo\n"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_write_session_file_action_missing_input_emits_a_rejection_event_not_a_silent_drop(
+    running_daemon, phone_token, tmp_path
+):
+    """Covers KTD10, same convention as get_file_content's own missing-path
+    test above."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": str(tmp_path)})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action(
+            {"kind": "write_session_file", "session_id": session_id, "path": "README.md"}
+        )
+
+        event = await phone.next_event()
+        assert event["type"] == "write_session_file"
+        assert event["data"]["ok"] is False
+        assert event["data"]["reason"] == "missing_input"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_write_session_file_action_serializes_concurrent_writes_to_the_same_path(
+    running_daemon, phone_token, tmp_path, monkeypatch
+):
+    """code-review finding (P1): write_session_file's own read-compare-write
+    conflict check (git_status.py) is race-safe only *within* one call -
+    nothing serialized two concurrently-dispatched saves for the same
+    (session_id, path) before this fix, so both could pass their own check
+    against the same stale content and one would silently overwrite the
+    other. Directly asserts the daemon's per-(session_id, path) lock
+    enforces mutual exclusion: an artificial delay is injected into
+    git_status.write_session_file itself so two concurrent dispatches
+    would provably overlap in real wall-clock time without the lock, then
+    this checks no more than one call is ever inside it at once - and that
+    the second, now genuinely serialized after the first, correctly sees
+    the first's already-written content as a conflict rather than
+    clobbering it."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
+    (repo / "README.md").write_text("original\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "Initial"], cwd=repo, check=True)
+    (repo / "README.md").write_text("updated\n")
+
+    real_write = git_status.write_session_file
+    active = 0
+    max_active = 0
+    counter_lock = threading.Lock()
+
+    def slow_write(cwd, path, previous_content, new_content):
+        nonlocal active, max_active
+        with counter_lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.1)  # widen the window a real race would need
+            return real_write(cwd, path, previous_content, new_content)
+        finally:
+            with counter_lock:
+                active -= 1
+
+    monkeypatch.setattr(git_status, "write_session_file", slow_write)
+
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": str(repo)})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action(
+            {
+                "kind": "write_session_file",
+                "session_id": session_id,
+                "path": "README.md",
+                "previous_content": "updated\n",
+                "new_content": "from_a\n",
+            }
+        )
+        await phone.send_action(
+            {
+                "kind": "write_session_file",
+                "session_id": session_id,
+                "path": "README.md",
+                "previous_content": "updated\n",
+                "new_content": "from_b\n",
+            }
+        )
+
+        event1 = await phone.next_event()
+        event2 = await phone.next_event()
+    finally:
+        await phone.close()
+
+    # The lock's whole point: never two calls inside write_session_file for
+    # the same path at once, even though both dispatches were in flight
+    # concurrently and each sleeps long enough to overlap without it.
+    assert max_active == 1
+
+    results = [event1["data"]["ok"], event2["data"]["ok"]]
+    assert sorted(results) == [False, True]  # exactly one succeeded
+    failed_event = event1 if event1["data"]["ok"] is False else event2
+    assert failed_event["data"]["reason"] == "conflict"
+
+    # The file itself ended up with exactly one writer's content, never a
+    # mix of both and never silently reverted.
+    assert (repo / "README.md").read_text() in ("from_a\n", "from_b\n")
 
 
 @pytest.mark.asyncio
@@ -2040,10 +2567,7 @@ async def test_list_active_sessions_includes_a_registry_known_session_not_yet_re
         session_id = started["session_id"]
 
         # Simulate a restart: in-memory state gone, registry row survives.
-        del daemon.sdk_adapter._sessions[session_id]
-        old_forwarder = daemon._forwarding.pop(session_id, None)
-        if old_forwarder is not None:
-            old_forwarder.cancel()
+        await _simulate_ungraceful_restart(daemon, session_id)
 
         await phone.send_action({"kind": "list_active_sessions"})
         event = await phone.next_event()
@@ -2250,6 +2774,31 @@ async def test_set_observe_entrypoints_action_updates_the_adapter_and_persists_t
 
 
 @pytest.mark.asyncio
+async def test_set_observe_entrypoints_action_rejects_a_bare_string_instead_of_a_list(
+    running_daemon, phone_token
+):
+    """code-review finding (P2): a bare string instead of a list must be
+    rejected outright, not passed to frozenset() - frozenset() happily
+    iterates a str's individual characters instead of raising, which would
+    silently corrupt the configured entrypoint set (e.g. "claude-desktop"
+    becoming the single-character set {'c','l','a',...}) rather than
+    failing loudly."""
+    daemon, port, _fake_clients = running_daemon
+    original = daemon.observe_adapter.get_required_entrypoints()
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "set_observe_entrypoints", "entrypoints": "claude-desktop"})
+
+        event = await phone.next_event()
+        assert event["type"] == "observe_settings"
+        # Unchanged - the malformed payload never reached frozenset().
+        assert daemon.observe_adapter.get_required_entrypoints() == original
+        assert set(event["data"]["selected_entrypoints"]) == original
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
 async def test_get_auto_approve_settings_action_reports_the_current_global_policy(running_daemon, phone_token):
     daemon, port, _fake_clients = running_daemon
     phone = await _FakePhone.connect(port, phone_token)
@@ -2421,6 +2970,60 @@ async def test_set_cli_settings_rejects_a_dynamic_linker_injection_env_key(runni
         assert daemon.config.cli_env == {}
     finally:
         await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_set_cli_settings_rejects_a_non_dict_cli_env_instead_of_crashing(running_daemon, phone_token):
+    """code-review finding (P2): cli_env had no shape check before
+    `dict(cli_env)`, which raises ValueError uncaught for a list (or other
+    non-dict-shaped) payload - dropping the whole action with no
+    confirm-back event at all, unlike every other rejection path in this
+    method. A malformed cli_env must be rejected the same
+    reject-but-still-confirm-back way an invalid cli_path already is."""
+    daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "set_cli_settings", "cli_env": ["not", "a", "dict"]})
+
+        confirm = await phone.next_event()
+        assert confirm["type"] == "cli_settings"  # confirm-back still fires
+        assert confirm["data"]["cli_env"] == {}
+        assert daemon.config.cli_env == {}
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_a_cli_env_secret_never_appears_in_scrubbed_action_logging(running_daemon, phone_token, monkeypatch, caplog):
+    """code-review finding (P3): _ACTION_KEYS_NEVER_LOGGED only redacted
+    "token" - a secret placed in cli_env via set_cli_settings (misuse, but
+    possible) could otherwise get logged in full at ERROR level if dispatch
+    later raises for an unrelated reason. Forces that failure path directly
+    via monkeypatching save_config to raise, then asserts the secret value
+    never appears in the logged (scrubbed) action."""
+    import logging
+
+    from companion import daemon as daemon_module
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated dispatch failure")
+
+    monkeypatch.setattr(daemon_module, "save_config", boom)
+
+    _daemon, port, _fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        with caplog.at_level(logging.ERROR, logger="companion.daemon"):
+            await phone.send_action(
+                {"kind": "set_cli_settings", "cli_env": {"SOME_SECRET": "s3cr3t-value"}}
+            )
+            await asyncio.sleep(0.2)  # let the dispatch task's exception logger run
+    finally:
+        await phone.close()
+
+    logged_text = caplog.text
+    assert "s3cr3t-value" not in logged_text
+    assert "[redacted]" in logged_text
 
 
 # --- U2: account-settings actions and custom-token setup ---
@@ -2989,8 +3592,7 @@ async def test_resumed_sdk_session_also_threads_the_configured_cli_settings(runn
         await phone.send_action(
             {"kind": "send_message", "session_id": "old-session-1", "text": "still there?"}
         )
-        started = await phone.next_event()
-        assert started["type"] == "session_started"
+        await _next_sdk_session_started(phone, "old-session-1")
 
         assert fake_clients[0].options.cli_path == "/usr/local/bin/claude-custom"
         assert fake_clients[0].options.env == {"ANTHROPIC_API_KEY": "sk-test"}

@@ -10,7 +10,6 @@ comment on them).
 """
 from __future__ import annotations
 
-import json
 import urllib.error
 
 import pytest
@@ -20,8 +19,14 @@ from companion.cli import main
 from companion.config import load_config
 
 
-def test_configure_writes_a_config_file_from_relay_url_and_token(tmp_path):
-    config_path = tmp_path / "config.json"
+def test_configure_writes_a_config_file_that_is_owner_only_readable(tmp_path):
+    """Companion-Local Token Entry & SQLite Config plan, KTD4: the db file
+    `configure` writes to is owner-only readable from the moment it's
+    created - see config.py's own module docstring. The written content
+    itself round-trips through load_config, checked separately below."""
+    import stat
+
+    config_path = tmp_path / "session_registry.db"
     main(
         [
             "configure",
@@ -34,9 +39,9 @@ def test_configure_writes_a_config_file_from_relay_url_and_token(tmp_path):
         ]
     )
 
-    written = json.loads(config_path.read_text())
-    assert written["relay_url"] == "wss://relay.example.com/ws/companion"
-    assert written["device_token"] == "tok-abc123"
+    assert config_path.exists()
+    mode = stat.S_IMODE(config_path.stat().st_mode)
+    assert mode == stat.S_IRUSR | stat.S_IWUSR
 
 
 def test_configure_written_config_round_trips_through_load_config(tmp_path):
@@ -88,14 +93,14 @@ def test_run_delegates_to_the_daemon_main_with_the_given_config_path(monkeypatch
 
 
 def test_run_defaults_to_the_standard_config_path(monkeypatch):
-    from companion.config import DEFAULT_CONFIG_PATH
+    from companion.config import DEFAULT_SESSION_REGISTRY_PATH
 
     calls = []
     monkeypatch.setattr("companion.cli.run_daemon", lambda config_path=None: calls.append(config_path))
 
     main(["run"])
 
-    assert calls == [DEFAULT_CONFIG_PATH]
+    assert calls == [DEFAULT_SESSION_REGISTRY_PATH]
 
 
 def test_no_subcommand_is_a_usage_error():
@@ -268,7 +273,15 @@ def test_derive_http_url_rejects_a_non_ws_scheme():
 
 
 def _write_config(config_path, relay_url="wss://relay.example.com/ws/companion", device_token="tok-abc123"):
-    config_path.write_text(json.dumps({"relay_url": relay_url, "device_token": device_token}))
+    """Companion-Local Token Entry & SQLite Config plan: `config_path` is a
+    SQLite db path now (config.py's own save_config/load_config), not a
+    JSON file - writing raw JSON here would leave a file `load_config`
+    can't open as a database at all. Writes through the real save_config
+    so these tests simulate "an already-configured companion" under the
+    current storage scheme, not the pre-migration one."""
+    from companion.config import CompanionConfig, save_config
+
+    save_config(str(config_path), CompanionConfig(relay_url=relay_url, device_token=device_token))
 
 
 def test_pairing_code_prints_the_relay_url_and_code(monkeypatch, tmp_path, capsys):
@@ -297,6 +310,22 @@ def test_pairing_code_with_no_config_prints_guidance_instead_of_crashing(tmp_pat
 
     out = capsys.readouterr().out
     assert "pair" in out or "configure" in out
+
+
+def test_pairing_code_with_a_corrupted_db_prints_guidance_instead_of_crashing(tmp_path, capsys):
+    """code-review finding: load_config's SQLite backing store can raise
+    sqlite3.Error (a corrupted file, e.g. truncated or overwritten by
+    something else), not just OSError/ValueError/TypeError - this must
+    produce the same friendly message as a missing config, not a raw
+    traceback."""
+    config_path = tmp_path / "config.json"
+    config_path.write_bytes(b"not a valid sqlite database, just garbage bytes")
+
+    main(["pairing-code", "--config-path", str(config_path)])
+
+    out = capsys.readouterr().out
+    assert "Could not read config" in out
+    assert "setup" in out
 
 
 def test_pairing_code_stops_cleanly_on_an_http_error(monkeypatch, tmp_path, capsys):
@@ -422,7 +451,13 @@ def test_setup_without_a_bootstrap_code_times_out_without_writing_a_config(monke
     config_path = tmp_path / "config.json"
     main(["setup", "--relay-url", "https://relay.example.com", "--config-path", str(config_path)])
 
-    assert not config_path.exists()
+    # A timed-out approval must not persist a config row. The db file
+    # itself may still exist - `load_config`'s own "is this Mac already
+    # configured" check opens a connection, and sqlite3 creates the file
+    # on connect even when nothing is ever inserted into it (unlike the
+    # old config.json, which only existed once actually written).
+    with pytest.raises(FileNotFoundError):
+        load_config(str(config_path))
     assert "Timed out" in capsys.readouterr().out
 
 
@@ -458,5 +493,111 @@ def test_setup_stops_cleanly_on_an_invalid_bootstrap_code(monkeypatch, tmp_path,
     config_path = tmp_path / "config.json"
     main(["setup", "--relay-url", "https://relay.example.com", "--config-path", str(config_path)])
 
-    assert not config_path.exists()
+    # See the sibling timeout test above for why this checks for an
+    # absent config row rather than raw file non-existence.
+    with pytest.raises(FileNotFoundError):
+        load_config(str(config_path))
     assert "Could not claim that code" in capsys.readouterr().out
+
+
+# --- `token set` (U2) -------------------------------------------------------
+
+
+def test_token_set_claude_saves_the_token_masked_and_notes_the_restart(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "session_registry.db"
+    _write_config(config_path)
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": "sk-ant-oat-secret")
+
+    main(["token", "set", "claude", "--config-path", str(config_path)])
+
+    loaded = load_config(str(config_path))
+    assert loaded.personal_oauth_token == "sk-ant-oat-secret"
+
+    out = capsys.readouterr().out
+    assert "sk-ant-oat-secret" not in out
+    assert "restart" in out.lower()
+
+
+def test_token_set_codex_saves_the_api_key_masked_and_notes_the_restart(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "session_registry.db"
+    _write_config(config_path)
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": "sk-codex-secret")
+
+    main(["token", "set", "codex", "--config-path", str(config_path)])
+
+    loaded = load_config(str(config_path))
+    assert loaded.codex_personal_api_key == "sk-codex-secret"
+
+    out = capsys.readouterr().out
+    assert "sk-codex-secret" not in out
+    assert "restart" in out.lower()
+
+
+def test_token_set_does_not_revert_a_field_changed_concurrently_by_the_daemon(monkeypatch, tmp_path, capsys):
+    """code-review finding (P1): _token_set used to load_config, mutate one
+    field on that in-memory snapshot, and save_config the whole thing back
+    - a concurrent daemon-triggered save_config landing in between (e.g.
+    from set_observe_entrypoints) would be silently reverted by
+    _token_set's own save, since save_config's UPSERT always writes every
+    column from whatever CompanionConfig it's handed. Simulates that race
+    directly: change observe_entrypoints (standing in for "the daemon
+    committed something else while token set's getpass prompt was up")
+    after _write_config's initial write but before token set runs, and
+    confirm token set's targeted single-column update doesn't touch it."""
+    from companion.config import load_config as _load, save_config as _save
+
+    config_path = tmp_path / "session_registry.db"
+    _write_config(config_path)
+
+    # Stand in for the daemon committing an unrelated change concurrently.
+    config = _load(str(config_path))
+    config.observe_entrypoints = ["claude", "codex"]
+    _save(str(config_path), config)
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": "sk-ant-oat-secret")
+
+    main(["token", "set", "claude", "--config-path", str(config_path)])
+
+    loaded = load_config(str(config_path))
+    assert loaded.personal_oauth_token == "sk-ant-oat-secret"
+    assert loaded.observe_entrypoints == ["claude", "codex"]
+
+
+def test_token_set_rejects_an_unknown_agent_before_the_handler_runs(monkeypatch, tmp_path):
+    def fail_if_called(prompt=""):
+        raise AssertionError("getpass should never be called for an invalid agent choice")
+
+    monkeypatch.setattr("getpass.getpass", fail_if_called)
+
+    with pytest.raises(SystemExit):
+        main(["token", "set", "nonsense", "--config-path", str(tmp_path / "session_registry.db")])
+
+
+def test_token_set_refuses_non_interactive_stdin_without_calling_save_config(monkeypatch, tmp_path, capsys):
+    """KTD5/R2: the isatty check must happen before getpass.getpass is ever
+    called, since getpass's own fallback would otherwise silently accept a
+    piped value."""
+    config_path = tmp_path / "session_registry.db"
+    _write_config(config_path)
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    def fail_if_called(prompt=""):
+        raise AssertionError("getpass should never be called for non-interactive stdin")
+
+    monkeypatch.setattr("getpass.getpass", fail_if_called)
+
+    def fail_if_saved(path, config):
+        raise AssertionError("save_config should never be called for non-interactive stdin")
+
+    monkeypatch.setattr("companion.cli.save_config", fail_if_saved)
+
+    with pytest.raises(SystemExit):
+        main(["token", "set", "claude", "--config-path", str(config_path)])
+
+    assert "interactive" in capsys.readouterr().out.lower()

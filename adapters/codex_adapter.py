@@ -30,10 +30,29 @@ that reshaped scope versus the plan's original assumption:
 
 `compact` IS implemented for real (`AsyncThread.compact()` exists on the
 real SDK) - no reason to leave working functionality unsupported.
+
+Subagent visibility (user-reported: Codex sessions showed no equivalent of
+Claude's "Running subagent" indicator at all, and Cancel had nothing to
+reach): a `collabAgentToolCall` item with `tool == CollabAgentTool.
+spawn_agent` is Codex's own subagent-dispatch primitive - mapped onto the
+same `tool_call`/`tool_result` shape as `commandExecution` etc., using the
+literal tool name `"Task"` so mobile's existing Claude-authored rendering
+(mobile/lib/toolDescriptions.ts) picks it up with no Codex-specific mobile
+code. Unlike claude_agent_sdk's Task tool, there is no SDK-level
+`stop_task`-equivalent to cancel *just* the subagent - see
+_is_spawn_subagent_call's own docstring for the other CollabAgentTool
+values this deliberately excludes. The existing plain `interrupt()`
+(already sent by the phone's Cancel button whenever a turn is active) is
+the only cancellation path; since a `collabAgentToolCall` item is a normal
+child item of the same turn, not a claude_agent_sdk-style detached
+background process, interrupting the turn also stops it - there is no
+known equivalent of Claude's "subagent outlives the turn" scenario to
+cover here.
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncIterator
 from typing import Any, Callable, Optional
@@ -52,6 +71,32 @@ ClientFactory = Callable[[], Any]
 # equivalent coverage, not an exhaustive mapping of Codex's full item set.
 _TOOL_ITEM_TYPES = ("commandExecution", "mcpToolCall", "fileChange")
 
+# Code-review fix (P2): matches sdk_adapter.py's own
+# _LIVE_CONTROL_REQUEST_TIMEOUT_SECONDS pattern - disconnect()'s calls
+# into the Codex SDK (current_turn.interrupt()/client.close()) had no
+# bound at all, unlike every one of sdk_adapter.py's own live-control
+# requests. An unresponsive subprocess on either call would hang
+# disconnect() (and therefore disconnect_all() at daemon shutdown)
+# indefinitely. Defined locally rather than importing sdk_adapter's own
+# constant - these two adapter modules otherwise share no runtime
+# coupling, and the value itself is the only thing worth mirroring.
+_DISCONNECT_CALL_TIMEOUT_SECONDS = 10.0
+
+
+def _is_spawn_subagent_call(item: Any) -> bool:
+    """A `collabAgentToolCall` item's own `tool` field distinguishes actually
+    spawning a new subagent (`spawnAgent`) from the other multi-agent
+    management calls on an *already-running* one (`sendInput`/`resumeAgent`/
+    `wait`/`closeAgent`) - only the former is a new "Running subagent" the
+    phone hasn't seen yet; the others are follow-up management calls on it,
+    not additional dispatches, and mapping them the same way would show a
+    fresh "Running subagent" bubble for what's really one ongoing subagent's
+    lifecycle. See _handle_notification's own comment for why this is kept
+    separate from _TOOL_ITEM_TYPES's generic type-only dispatch."""
+    from openai_codex.generated.v2_all import CollabAgentTool
+
+    return getattr(item, "type", None) == "collabAgentToolCall" and getattr(item, "tool", None) == CollabAgentTool.spawn_agent
+
 
 def _tool_name_for_item(item: Any) -> str:
     item_type = getattr(item, "type", None)
@@ -61,6 +106,12 @@ def _tool_name_for_item(item: Any) -> str:
         return getattr(item, "tool", "McpTool")
     if item_type == "fileChange":
         return "ApplyPatch"
+    if _is_spawn_subagent_call(item):
+        # "Task" (not a Codex-native name) deliberately matches
+        # claude_agent_sdk's own Task-tool dispatch verbatim - mobile/lib/
+        # toolDescriptions.ts already renders tool: "Task" as "Running
+        # subagent" with zero Codex-specific mobile code needed.
+        return "Task"
     return item_type or "unknown"
 
 
@@ -72,6 +123,10 @@ def _tool_input_for_item(item: Any) -> dict[str, Any]:
         return {"arguments": getattr(item, "arguments", None)}
     if item_type == "fileChange":
         return {"changes": [str(change) for change in getattr(item, "changes", [])]}
+    if _is_spawn_subagent_call(item):
+        # toolDescriptions.ts's Task case reads description ?? prompt -
+        # Codex's own spawn call only ever carries `prompt`.
+        return {"prompt": getattr(item, "prompt", None) or ""}
     return {}
 
 
@@ -109,6 +164,8 @@ def _tool_result_for_item(item: Any) -> tuple[str, bool]:
         return str(getattr(item, "result", "")), is_error
     if item_type == "fileChange":
         return f"{len(getattr(item, 'changes', []))} file(s) changed", is_error
+    if _is_spawn_subagent_call(item):
+        return ("Subagent failed" if is_error else "Subagent finished"), is_error
     return "", is_error
 
 
@@ -150,6 +207,15 @@ class CodexAdapter:
         uncaught out of connect() - fails closed at daemon.py's existing
         start_session outer exception handler, no new handling needed in
         this adapter."""
+        # Code-review fix (P1): unlike SDKAdapter.connect() (which raises
+        # if session_id is already connected), this used to just overwrite
+        # the dict entry outright - orphaning the previous session's
+        # client/thread (never closed) and leaking its stream_task if a
+        # turn was still in flight (never cancelled). Same guard
+        # SDKAdapter's own connect() uses.
+        if session_id in self._sessions:
+            raise ValueError(f"session already connected: {session_id}")
+
         from openai_codex import ApprovalMode, AsyncCodex
 
         client = self._client_factory() if self._client_factory is not None else AsyncCodex()
@@ -216,15 +282,34 @@ class CodexAdapter:
         # exactly one stream task is ever tracked per session.
         if session.stream_task is not None and not session.stream_task.done():
             session.stream_task.cancel()
+        # Code-review fix (P2): `session.current_turn` isn't reassigned
+        # until after `await session.thread.turn(...)` resolves below -
+        # `turn_starting` records "a new turn is in the process of
+        # starting" for the whole window that await is in flight, so
+        # interrupt() (which runs concurrently, dispatched by daemon.py as
+        # its own unordered asyncio.create_task) has something to check
+        # instead of seeing only the previous (already-finished, or None)
+        # current_turn and missing the newly-starting turn entirely.
+        session.turn_starting = True
         try:
             turn_handle = await session.thread.turn(
                 TextInput(text=text), model=session.model, sandbox=session.sandbox
             )
         except Exception as exc:
+            session.turn_starting = False
             logger.warning("Codex turn failed to start for session %s: %s", session_id, exc)
             session.emit("error", message=str(exc))
             return
         session.current_turn = turn_handle
+        session.turn_starting = False
+        if session.interrupt_requested:
+            # A Cancel arrived while the turn above was still starting
+            # (turn_starting was True) - it couldn't reach this turn then,
+            # since current_turn didn't point to it yet, so it recorded
+            # the request instead of silently missing it. Honor it now
+            # that the turn handle actually exists.
+            session.interrupt_requested = False
+            await turn_handle.interrupt()
         session.stream_task = asyncio.create_task(self._drive_turn(session, turn_handle))
 
     async def interrupt(self, session_id: str) -> None:
@@ -238,6 +323,15 @@ class CodexAdapter:
         # already_won_the_race exists to pin.
         session = self._sessions.get(session_id)
         if session is None:
+            return
+        if session.turn_starting:
+            # See send_message's own comment on turn_starting: current_turn
+            # is guaranteed stale (either None, or the previous, already-
+            # finished turn) for the whole window a new turn is still being
+            # set up - touching it here would either no-op or interrupt the
+            # wrong turn. Record the request instead; send_message honors
+            # it the instant the real turn handle exists.
+            session.interrupt_requested = True
             return
         if session.current_turn is not None:
             await session.current_turn.interrupt()
@@ -256,20 +350,45 @@ class CodexAdapter:
             return
         if session.current_turn is not None:
             try:
-                await session.current_turn.interrupt()
+                await asyncio.wait_for(
+                    session.current_turn.interrupt(), timeout=_DISCONNECT_CALL_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "interrupting Codex turn on disconnect timed out for session_id=%r - giving up and proceeding with cleanup",
+                    session_id,
+                )
             except Exception:
                 logger.exception("failed to interrupt Codex turn on disconnect for session_id=%r", session_id)
         if session.stream_task is not None:
             session.stream_task.cancel()
+            # cancel() only schedules cancellation - without awaiting it,
+            # this task can still be pending when the caller (or a test's
+            # event loop) tears down, which asyncio reports as "Task was
+            # destroyed but it is pending!".
+            with contextlib.suppress(asyncio.CancelledError):
+                await session.stream_task
         # Code-review fix: close() must not skip session.end() - the
         # session is already popped from self._sessions above, so if close()
         # raises here, nothing else will ever emit session_ended, stranding
         # any forwarder/subscriber blocked on session.events.get().
         try:
-            await session.client.close()
+            await asyncio.wait_for(session.client.close(), timeout=_DISCONNECT_CALL_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "closing Codex client on disconnect timed out for session_id=%r - giving up and proceeding with cleanup",
+                session_id,
+            )
         except Exception:
             logger.exception("failed to close Codex client on disconnect for session_id=%r", session_id)
         session.end("disconnected")
+
+    async def disconnect_all(self) -> None:
+        """Mirrors SDKAdapter.disconnect_all() - see its own docstring for
+        why daemon shutdown needs this rather than letting active sessions'
+        stream_tasks leak."""
+        for session_id in self.discover_sessions():
+            await self.disconnect(session_id)
 
     async def respond_to_permission(
         self, session_id: str, request_id: str, decision: str, *, message: str = ""
@@ -368,16 +487,53 @@ class CodexAdapter:
         task (send_message returns as soon as the turn starts, not once it
         finishes) so the phone sees tool calls/results as they happen."""
         seen_item_ids: set[str] = set()
+        # Code-review fix (P2, prior review, previously unapplied):
+        # `open_item_ids` tracks any tool-call item (including a
+        # collabAgentToolCall/spawnAgent "Task" dispatch) that's been
+        # started but not yet completed. Codex's own Task-tool aliasing
+        # deliberately doesn't emit a claude_agent_sdk-style task_update
+        # (see module docstring) - the mobile transcript's "Running
+        # subagent" bubble (or any other still-open tool_call) is only
+        # ever cleared by this adapter's own tool_result event. If the
+        # turn errors (either the stream itself crashing below, or Codex
+        # reporting ErrorNotification - see _handle_notification) before a
+        # still-open item's own ItemCompletedNotification ever arrives,
+        # nothing else would ever emit that closing tool_result, leaving
+        # the phone showing a permanently "running" bubble with no cancel
+        # affordance.
+        open_item_ids: set[str] = set()
         try:
             async for notification in turn_handle.stream():
-                await self._handle_notification(session, notification, seen_item_ids)
+                await self._handle_notification(session, notification, seen_item_ids, open_item_ids)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning("Codex turn stream crashed for session %s: %s", session.session_id, exc)
+            # Order matters: subscribe() stops forwarding this session's
+            # events entirely as soon as it yields one typed "error" (see
+            # its own docstring) - emitting the synthetic tool_result(s)
+            # first means they still reach a live subscriber; emitting
+            # them after "error" would queue them somewhere nothing is
+            # listening to any more.
+            self._emit_synthetic_errors_for_open_items(session, open_item_ids)
             session.emit("error", message=str(exc))
 
-    async def _handle_notification(self, session: "_CodexSession", notification: Any, seen_item_ids: set[str]) -> None:
+    @staticmethod
+    def _emit_synthetic_errors_for_open_items(session: "_CodexSession", open_item_ids: set[str]) -> None:
+        """See _drive_turn's own comment on `open_item_ids` for why this
+        exists. Emits one synthetic is_error tool_result per still-open
+        item_id, same (tool_use_id, content, is_error) shape every other
+        tool_result emission in this adapter already uses (see
+        _tool_result_for_item)."""
+        for item_id in sorted(open_item_ids):
+            session.emit(
+                "tool_result", tool_use_id=item_id, content="Turn ended before this finished", is_error=True
+            )
+        open_item_ids.clear()
+
+    async def _handle_notification(
+        self, session: "_CodexSession", notification: Any, seen_item_ids: set[str], open_item_ids: set[str]
+    ) -> None:
         from openai_codex.models import (
             ErrorNotification,
             ItemCompletedNotification,
@@ -400,8 +556,18 @@ class CodexAdapter:
             item = notification.item.root if hasattr(notification.item, "root") else notification.item
             item_type = getattr(item, "type", None)
             item_id = getattr(item, "id", None)
-            if item_type in _TOOL_ITEM_TYPES and item_id not in seen_item_ids:
+            # `or _is_spawn_subagent_call(item)`: a `collabAgentToolCall`
+            # item's own type isn't in _TOOL_ITEM_TYPES (it isn't an
+            # ordinary command/MCP/file-change tool), but a spawnAgent call
+            # specifically should still render as "Running subagent" -
+            # mirroring claude_agent_sdk's own Task-tool dispatch (see
+            # mobile/lib/toolDescriptions.ts) so the phone shows the same
+            # thing, and Cancel's existing interrupt() has something visible
+            # to be canceling.
+            if (item_type in _TOOL_ITEM_TYPES or _is_spawn_subagent_call(item)) and item_id not in seen_item_ids:
                 seen_item_ids.add(item_id)
+                if item_id is not None:
+                    open_item_ids.add(item_id)
                 session.emit(
                     "tool_call",
                     tool_use_id=item_id,
@@ -414,7 +580,8 @@ class CodexAdapter:
             item = notification.item.root if hasattr(notification.item, "root") else notification.item
             item_type = getattr(item, "type", None)
             item_id = getattr(item, "id", None)
-            if item_type in _TOOL_ITEM_TYPES:
+            if item_type in _TOOL_ITEM_TYPES or _is_spawn_subagent_call(item):
+                open_item_ids.discard(item_id)
                 content, is_error = _tool_result_for_item(item)
                 session.emit("tool_result", tool_use_id=item_id, content=content, is_error=is_error)
             elif item_type == "agentMessage":
@@ -422,6 +589,15 @@ class CodexAdapter:
             return
 
         if isinstance(notification, ErrorNotification):
+            # Code-review fix (P2): see _drive_turn's own comment on
+            # open_item_ids - an ErrorNotification is Codex's own in-band
+            # "this turn failed" signal, same real-world trigger the
+            # module docstring describes ("if a Codex turn errors between
+            # a subagent's start and completion notifications"), not only
+            # a hard stream crash. Emitted *before* "error" below - see
+            # _drive_turn's except-branch comment on why the order matters
+            # (subscribe() stops forwarding once it yields an "error").
+            self._emit_synthetic_errors_for_open_items(session, open_item_ids)
             session.emit("error", message=getattr(notification.error, "message", "Codex turn failed"))
             return
 
@@ -438,6 +614,14 @@ class _CodexSession:
         self.sandbox: Optional[Any] = None
         self.current_turn: Optional[Any] = None
         self.stream_task: Optional[asyncio.Task] = None
+        # Code-review fix (P2): see send_message/interrupt's own comments -
+        # `turn_starting` covers the window between dispatching
+        # `thread.turn(...)` and it actually resolving into `current_turn`;
+        # `interrupt_requested` records a Cancel that arrived during that
+        # window, so it can be honored the instant the turn handle exists
+        # instead of being silently missed.
+        self.turn_starting = False
+        self.interrupt_requested = False
         self._ended = False
 
     def emit(self, type_: str, **data: Any) -> Event:

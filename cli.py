@@ -31,6 +31,11 @@ Five subcommands:
   once this companion already has its own device token (from `setup`,
   `pair`, or `configure`) - authenticates the relay's POST
   /pairing/register itself instead of requiring a raw curl call.
+- `token set <claude|codex>` - interactively set this Mac's own personal
+  Claude/Codex token with masked input (`getpass`), stored locally with
+  zero network transit. Refuses to run with piped/non-interactive stdin
+  rather than silently accepting a plaintext value. A running companion
+  needs restarting to pick up the change.
 
 Only stdlib (`urllib`) for the HTTP calls these need - deliberately not
 adding `httpx`/`requests` as a dependency just for this, since every
@@ -39,15 +44,24 @@ dependency here is one more entry in the Homebrew formula's resource list.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import socket
+import sqlite3
 import sys
 import time
 import urllib.error
 import urllib.request
 from typing import Optional, Sequence
 
-from .config import CompanionConfig, DEFAULT_CONFIG_PATH, DEFAULT_RELAY_URL, load_config, save_config
+from .config import (
+    CompanionConfig,
+    DEFAULT_RELAY_URL,
+    DEFAULT_SESSION_REGISTRY_PATH,
+    load_config,
+    save_config,
+    update_config_field,
+)
 from .daemon import main as run_daemon
 
 DEFAULT_PAIR_TIMEOUT_SECONDS = 300.0  # matches the relay's own PAIRING_CODE_TTL_SECONDS
@@ -230,9 +244,14 @@ def _print_phone_pairing_code(relay_url: str, device_token: str) -> None:
 
 
 def _pairing_code(args: argparse.Namespace) -> None:
+    # code-review finding: load_config's SQLite backing store can raise
+    # sqlite3.Error (a corrupted or locked db file) - this and the other two
+    # load_config call sites below all catch it alongside the pre-existing
+    # (OSError, ValueError, TypeError) trio, so a corrupted db produces this
+    # same friendly "run setup first" message instead of a raw traceback.
     try:
         config = load_config(args.config_path)
-    except (OSError, ValueError, TypeError) as exc:
+    except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
         print(f"Could not read config at {args.config_path}: {exc}")
         print("Run `afk-claude-companion setup` first.")
         return
@@ -241,13 +260,46 @@ def _pairing_code(args: argparse.Namespace) -> None:
     _print_phone_pairing_code(relay_url, config.device_token)
 
 
+def _token_set(args: argparse.Namespace) -> None:
+    """Companion-Local Token Entry & SQLite Config plan (R1, R2, R10; KTD5,
+    KTD8): sets `personal_oauth_token`/`codex_personal_api_key` locally,
+    with masked input and zero network transit. The stdin-isatty check
+    happens before `getpass.getpass()` is ever called (KTD5) - `getpass`'s
+    own fallback silently accepts a piped value instead of refusing, which
+    could land a token in shell history or script output (R2)."""
+    if not sys.stdin.isatty():
+        print("`token set` requires an interactive terminal - refusing to read a piped or redirected value.")
+        sys.exit(1)
+
+    label = "Claude" if args.agent == "claude" else "Codex"
+    token = getpass.getpass(f"Enter your personal {label} token (input hidden): ").strip()
+
+    try:
+        load_config(args.config_path)
+    except (OSError, ValueError, TypeError, sqlite3.Error):
+        print(f"No existing config at {args.config_path} - run `afk-claude-companion setup` first.")
+        sys.exit(1)
+
+    # code-review finding (P1): the load-mutate-save pattern this used to
+    # follow (load the whole config, set one field on the in-memory
+    # dataclass, save the whole thing back) races a concurrent daemon-
+    # triggered save_config - whichever save lands second would silently
+    # revert every field the other one just changed. A targeted single-
+    # column UPDATE can't clobber a concurrent change to a different
+    # field, because it never touches any column but this one.
+    field = "personal_oauth_token" if args.agent == "claude" else "codex_personal_api_key"
+    update_config_field(args.config_path, **{field: token})
+    print(f"{label} personal token saved locally.")
+    print("A running companion won't pick this up until it's restarted (`afk-claude-companion run`).")
+
+
 def _setup(args: argparse.Namespace) -> None:
     """The one command for any Mac, in any state - already configured,
     an additional Mac joining a phone that's already paired, or the very
     first Mac ever. See this module's docstring."""
     try:
         config = load_config(args.config_path)
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, sqlite3.Error):
         config = None
 
     if config is not None:
@@ -301,8 +353,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="Start the companion daemon")
     run_parser.add_argument(
         "--config-path",
-        default=DEFAULT_CONFIG_PATH,
-        help=f"Path to the companion config file (default: {DEFAULT_CONFIG_PATH})",
+        default=DEFAULT_SESSION_REGISTRY_PATH,
+        help=f"Path to the companion config file (default: {DEFAULT_SESSION_REGISTRY_PATH})",
     )
     run_parser.set_defaults(func=_run)
 
@@ -320,8 +372,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     setup_parser.add_argument(
         "--config-path",
-        default=DEFAULT_CONFIG_PATH,
-        help=f"Path to the companion config file (default: {DEFAULT_CONFIG_PATH})",
+        default=DEFAULT_SESSION_REGISTRY_PATH,
+        help=f"Path to the companion config file (default: {DEFAULT_SESSION_REGISTRY_PATH})",
     )
     setup_parser.set_defaults(func=_setup)
 
@@ -343,8 +395,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pair_parser.add_argument(
         "--config-path",
-        default=DEFAULT_CONFIG_PATH,
-        help=f"Where to write the resulting config (default: {DEFAULT_CONFIG_PATH})",
+        default=DEFAULT_SESSION_REGISTRY_PATH,
+        help=f"Where to write the resulting config (default: {DEFAULT_SESSION_REGISTRY_PATH})",
     )
     pair_parser.set_defaults(func=_pair)
 
@@ -361,8 +413,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     configure_parser.add_argument(
         "--config-path",
-        default=DEFAULT_CONFIG_PATH,
-        help=f"Where to write the resulting config (default: {DEFAULT_CONFIG_PATH})",
+        default=DEFAULT_SESSION_REGISTRY_PATH,
+        help=f"Where to write the resulting config (default: {DEFAULT_SESSION_REGISTRY_PATH})",
     )
     configure_parser.set_defaults(func=_configure)
 
@@ -372,10 +424,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pairing_code_parser.add_argument(
         "--config-path",
-        default=DEFAULT_CONFIG_PATH,
-        help=f"Path to the companion config file (default: {DEFAULT_CONFIG_PATH})",
+        default=DEFAULT_SESSION_REGISTRY_PATH,
+        help=f"Path to the companion config file (default: {DEFAULT_SESSION_REGISTRY_PATH})",
     )
     pairing_code_parser.set_defaults(func=_pairing_code)
+
+    token_parser = subparsers.add_parser("token", help="Manage this Mac's personal Claude/Codex tokens")
+    token_subparsers = token_parser.add_subparsers(dest="token_command", required=True)
+    token_set_parser = token_subparsers.add_parser(
+        "set", help="Interactively set a personal token for an agent, stored locally with zero network transit"
+    )
+    token_set_parser.add_argument("agent", choices=["claude", "codex"], help="Which agent's personal token to set")
+    token_set_parser.add_argument(
+        "--config-path",
+        default=DEFAULT_SESSION_REGISTRY_PATH,
+        help=f"Path to the companion config file (default: {DEFAULT_SESSION_REGISTRY_PATH})",
+    )
+    token_set_parser.set_defaults(func=_token_set)
 
     return parser
 

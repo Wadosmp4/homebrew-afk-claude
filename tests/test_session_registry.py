@@ -7,6 +7,7 @@ from __future__ import annotations
 import sqlite3
 
 from companion.session_registry import (
+    ensure_table_columns,
     get_session,
     list_known_sessions,
     mark_session_ended,
@@ -226,3 +227,52 @@ def test_an_existing_database_with_the_old_schema_gains_permission_mode_without_
     finally:
         conn.close()
     assert ("old-session", "/tmp/pre-existing") in rows
+
+
+# --- ensure_table_columns (code-review finding, P2) --------------------------
+
+
+def test_ensure_table_columns_adds_only_missing_columns(tmp_path):
+    path = str(tmp_path / "t.db")
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, existing TEXT)")
+        ensure_table_columns(conn, "t", {"existing": "TEXT", "new_col": "TEXT"})
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(t)")}
+        assert columns == {"id", "existing", "new_col"}
+    finally:
+        conn.close()
+
+
+def test_ensure_table_columns_tolerates_a_concurrent_duplicate_column_race(tmp_path):
+    """Shared with config.py, which originally had this exact tolerance
+    for two processes racing the same forward-migration check - now
+    exercised once, for both callers, here."""
+    path = str(tmp_path / "t.db")
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        # Simulates a second process's ALTER TABLE having already landed
+        # between this connection's own PRAGMA table_info snapshot and its
+        # ALTER TABLE attempt.
+        conn.execute("ALTER TABLE t ADD COLUMN new_col TEXT")
+
+        ensure_table_columns(conn, "t", {"new_col": "TEXT"})  # must not raise
+
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(t)")}
+        assert columns == {"id", "new_col"}
+    finally:
+        conn.close()
+
+
+def test_ensure_table_columns_reraises_a_genuine_non_duplicate_error(tmp_path):
+    path = str(tmp_path / "t.db")
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        import pytest
+
+        with pytest.raises(sqlite3.OperationalError, match="near"):
+            ensure_table_columns(conn, "t", {"bad col name": "not a real type ("})
+    finally:
+        conn.close()

@@ -258,6 +258,33 @@ def test_a_plain_allowlisted_command_with_ordinary_arguments_still_auto_approves
     assert is_auto_approvable("Bash", {"command": "pytest -v tests/test_foo.py"}) is True
 
 
+# --- Security fix: redirection (`>`/`>>`) turns an allowlisted read-only
+# command into an arbitrary-file-write primitive, e.g. `git show
+# HEAD:some_file > ~/.ssh/authorized_keys` - must fall through to the normal
+# approval prompt, not auto-approve. ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git show HEAD:some_file > ~/.ssh/authorized_keys",
+        "git log > /tmp/out.txt",
+        "git diff HEAD >> ~/.bashrc",
+        "pytest > /tmp/out.txt",
+        "git status >~/.ssh/authorized_keys",
+    ],
+)
+def test_a_redirection_disqualifies_an_otherwise_allowlisted_command(command):
+    assert is_auto_approvable("Bash", {"command": command}) is False
+
+
+def test_the_same_command_without_redirection_is_still_approvable():
+    """Confirms the redirection guard doesn't just make everything fail -
+    stripping the `>` back out restores auto-approval."""
+    assert is_auto_approvable("Bash", {"command": "git show HEAD:some_file"}) is True
+    assert is_auto_approvable("Bash", {"command": "git log"}) is True
+
+
 # --- Code review fix: rm's GNU long-form flags -----------------------------
 
 

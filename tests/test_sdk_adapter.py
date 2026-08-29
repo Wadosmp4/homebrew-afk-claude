@@ -21,6 +21,10 @@ from claude_agent_sdk import (
     RateLimitEvent,
     RateLimitInfo,
     ResultMessage,
+    TaskNotificationMessage,
+    TaskProgressMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
@@ -78,6 +82,16 @@ class FakeSDKClient:
         if self.disconnected:
             raise CLIConnectionError("client is disconnected")
         self.model = model
+
+    async def stop_task(self, task_id: str) -> None:
+        # Same disconnected-client contract as set_permission_mode/set_model
+        # above - mirrors the real ClaudeSDKClient.stop_task() raising
+        # CLIConnectionError against an already-disconnected client, per its
+        # own docstring ("only works with streaming mode").
+        if self.disconnected:
+            raise CLIConnectionError("client is disconnected")
+        self.stopped_task_ids = getattr(self, "stopped_task_ids", [])
+        self.stopped_task_ids.append(task_id)
 
 
 _STOP = object()
@@ -520,6 +534,110 @@ async def test_rate_limit_event_is_emitted_when_the_cli_reports_one(adapter):
     assert rate_limit_event.data["resets_at"] == 1700000000
 
 
+# --- Bug fix (user report): rate_limit_estimate between real readings ----
+
+
+def _rate_limit_event(rate_limit_type: str, utilization: float, session_id: str = "s1") -> RateLimitEvent:
+    return RateLimitEvent(
+        rate_limit_info=RateLimitInfo(status="allowed", rate_limit_type=rate_limit_type, utilization=utilization),
+        uuid="rl",
+        session_id=session_id,
+    )
+
+
+def _result_message(model_usage: dict) -> ResultMessage:
+    return ResultMessage(
+        subtype="success",
+        duration_ms=10,
+        duration_api_ms=8,
+        is_error=False,
+        num_turns=1,
+        session_id="s1",
+        model_usage=model_usage,
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_rate_limit_estimate_is_emitted_with_only_one_real_reading(adapter):
+    """Nothing to calibrate a slope from yet - see
+    RateLimitEstimator.estimate's own docstring for why this is None, not
+    a guessed zero."""
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    client.push(_rate_limit_event("five_hour", 0.40))
+    rate_limit_event = await events.__anext__()
+    assert rate_limit_event.type == "rate_limit"
+
+    client.push(_result_message({"m": {"inputTokens": 1000, "outputTokens": 0, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}}))
+    waiting_event = await events.__anext__()
+    assert waiting_event.type == "waiting_for_input"
+    # No rate_limit_estimate follows - nothing calibrated yet.
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(events.__anext__(), timeout=0.05)
+
+
+@pytest.mark.asyncio
+async def test_a_second_turn_after_two_real_readings_emits_a_calibrated_estimate(adapter):
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    client.push(_rate_limit_event("five_hour", 0.40))
+    await events.__anext__()  # rate_limit
+    client.push(_result_message({"m": {"inputTokens": 1000, "outputTokens": 0, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}}))
+    await events.__anext__()  # waiting_for_input (no estimate yet - uncalibrated)
+    client.push(_rate_limit_event("five_hour", 0.50))
+    await events.__anext__()  # rate_limit - now calibrated: 10,000 tokens/1.0
+
+    client.push(_result_message({"m": {"inputTokens": 500, "outputTokens": 0, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}}))
+    await events.__anext__()  # waiting_for_input
+    estimate_event = await events.__anext__()
+    assert estimate_event.type == "rate_limit_estimate"
+    assert estimate_event.data["rate_limit_type"] == "five_hour"
+    assert estimate_event.data["utilization"] == pytest.approx(0.55)
+
+
+@pytest.mark.asyncio
+async def test_a_background_task_notification_also_contributes_to_the_estimate(adapter):
+    """Bug fix (user report): this is the actual case reported - a
+    dispatched subagent's own token usage must count toward the estimate
+    the same way a main-session turn's does."""
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    client.push(_rate_limit_event("five_hour", 0.40))
+    await events.__anext__()  # rate_limit
+    client.push(_result_message({"m": {"inputTokens": 1000, "outputTokens": 0, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}}))
+    await events.__anext__()  # waiting_for_input
+    client.push(_rate_limit_event("five_hour", 0.50))
+    await events.__anext__()  # rate_limit - calibrated: 10,000 tokens/1.0
+
+    client.push(
+        TaskNotificationMessage(
+            subtype="task_notification",
+            data={},
+            task_id="task-1",
+            status="completed",
+            output_file="/tmp/x.json",
+            summary="done",
+            uuid="u1",
+            session_id="s1",
+            usage={"total_tokens": 500, "tool_uses": 2, "duration_ms": 1000},
+        )
+    )
+    task_event = await events.__anext__()
+    assert task_event.type == "task_update"
+    estimate_event = await events.__anext__()
+    assert estimate_event.type == "rate_limit_estimate"
+    assert estimate_event.data["utilization"] == pytest.approx(0.55)
+
+
 @pytest.mark.asyncio
 async def test_compact_sends_slash_compact_without_a_user_message_event(adapter):
     """Unlike send_message, compact must not show up as a fake chat bubble
@@ -576,6 +694,143 @@ async def test_send_message_then_assistant_reply_then_waiting_for_input(adapter)
     )
     lifecycle_event = await events.__anext__()
     assert lifecycle_event.type == "waiting_for_input"
+
+
+# --- Bug fix (user report): background-Task lifecycle -> task_update -----
+# A subagent dispatched via the "Task" tool keeps running after the
+# dispatching turn's own ResultMessage/waiting_for_input fires - these four
+# claude_agent_sdk.SystemMessage subclasses are the CLI's own lifecycle
+# reporting for that subagent, independent of the turn that dispatched it.
+
+
+@pytest.mark.asyncio
+async def test_task_started_message_produces_a_task_update_event(adapter):
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    client.push(
+        TaskStartedMessage(
+            subtype="task_started",
+            data={},
+            task_id="task-1",
+            description="Running code review",
+            uuid="u1",
+            session_id="s1",
+            tool_use_id="tool-1",
+        )
+    )
+    event = await events.__anext__()
+    assert event.type == "task_update"
+    assert event.data["phase"] == "started"
+    assert event.data["task_id"] == "task-1"
+    assert event.data["description"] == "Running code review"
+    assert event.data["tool_use_id"] == "tool-1"
+
+
+@pytest.mark.asyncio
+async def test_task_progress_message_produces_a_task_update_event(adapter):
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    client.push(
+        TaskProgressMessage(
+            subtype="task_progress",
+            data={},
+            task_id="task-1",
+            description="Still reviewing",
+            usage={"total_tokens": 100, "tool_uses": 3, "duration_ms": 5000},
+            uuid="u2",
+            session_id="s1",
+            tool_use_id="tool-1",
+        )
+    )
+    event = await events.__anext__()
+    assert event.type == "task_update"
+    assert event.data["phase"] == "progress"
+    assert event.data["task_id"] == "task-1"
+    assert event.data["description"] == "Still reviewing"
+
+
+@pytest.mark.asyncio
+async def test_task_updated_message_forwards_status(adapter):
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    client.push(
+        TaskUpdatedMessage(subtype="task_updated", data={}, task_id="task-1", patch={}, status="running")
+    )
+    event = await events.__anext__()
+    assert event.type == "task_update"
+    assert event.data["phase"] == "updated"
+    assert event.data["task_id"] == "task-1"
+    assert event.data["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_task_notification_message_forwards_status_and_summary(adapter):
+    """The authoritative "this task is over" signal - stop_task()'s own
+    docstring says a stopped task always reports here with status
+    'stopped'; a naturally-finished one reports 'completed' or 'failed'."""
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    client.push(
+        TaskNotificationMessage(
+            subtype="task_notification",
+            data={},
+            task_id="task-1",
+            status="completed",
+            output_file="/tmp/task-1.json",
+            summary="Found 3 issues",
+            uuid="u3",
+            session_id="s1",
+            tool_use_id="tool-1",
+        )
+    )
+    event = await events.__anext__()
+    assert event.type == "task_update"
+    assert event.data["phase"] == "notification"
+    assert event.data["task_id"] == "task-1"
+    assert event.data["status"] == "completed"
+    assert event.data["summary"] == "Found 3 issues"
+
+
+# --- Bug fix (user report): stop_task() -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stop_task_calls_the_sdk_client_and_returns_true(adapter):
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+
+    assert await adapter.stop_task("s1", "task-1") is True
+    assert client.stopped_task_ids == ["task-1"]
+
+
+@pytest.mark.asyncio
+async def test_stop_task_for_unknown_session_returns_false_without_raising(adapter):
+    assert await adapter.stop_task("no-such-session", "task-1") is False
+
+
+@pytest.mark.asyncio
+async def test_stop_task_returns_false_when_a_racing_end_session_already_disconnected_the_client(adapter, caplog):
+    """Same race as set_session_permission_mode's own test above - a
+    concurrently-dispatched End Session can disconnect this session's
+    client before this control request reaches it."""
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    client.disconnected = True
+
+    with caplog.at_level(logging.INFO):
+        assert await adapter.stop_task("s1", "task-1") is False
 
 
 @pytest.mark.asyncio
@@ -1149,3 +1404,89 @@ async def test_client_crash_emits_error_event_not_silence(adapter):
     error_event = await events.__anext__()
     assert error_event.type == "error"
     assert "subprocess died" in error_event.data["message"]
+
+
+# --- Code-review fixes (2026-08 audit) ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_client_crash_marks_the_session_ended_and_a_reconnect_then_succeeds(adapter):
+    """P1 fix: only the normal-completion path used to call
+    self.end("completed") - the crash (except Exception) branch just
+    emitted an error event and left `_ended` False forever, so is_active()
+    reported True forever, the session stayed in _sessions, and any
+    reconnect attempt for that session_id hit connect()'s "already
+    connected" guard, permanently blocking recovery until a full daemon
+    restart."""
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    client.push(RuntimeError("subprocess died"))  # simulate the SDK stream blowing up
+    await events.__anext__()  # error
+
+    assert adapter.is_active("s1") is False
+
+    # A later reconnect for the same session_id must succeed rather than
+    # raising "session already connected".
+    await adapter.connect("s1")
+    assert adapter.is_active("s1") is True
+
+
+@pytest.mark.asyncio
+async def test_connect_with_no_cli_env_never_shares_state_between_sessions(adapter):
+    """P3 fix: cli_env's parameter default used to be a mutable {}
+    literal - created once at function-definition time and shared across
+    every call that omits it. Latent (daemon.py's own callers always pass
+    an explicit fresh dict) but a landmine for any future/test caller that
+    doesn't."""
+    await adapter.connect("s1")
+    client1 = adapter._test_clients["latest"]
+    client1.options.env["LEAKED"] = "yes"
+
+    await adapter.connect("s2")
+    client2 = adapter._test_clients["latest"]
+
+    assert "LEAKED" not in client2.options.env
+
+
+@pytest.mark.asyncio
+async def test_connect_backs_out_cleanly_when_a_racing_disconnect_pops_the_session_mid_client_connect():
+    """P3 fix (narrow race): connect() inserted into _sessions before
+    awaiting client.connect(), unguarded - if disconnect() ran in that
+    window and popped the entry, connect() used to still finish anyway,
+    creating an untracked, never-cancelled reader_task nothing would ever
+    await or cancel. daemon.py's own unordered per-action
+    asyncio.create_task dispatch is exactly what makes this reachable in
+    practice (a fast End Session racing a still-in-flight start_session)."""
+    connect_started = asyncio.Event()
+    release_connect = asyncio.Event()
+    created_clients = []
+
+    class SlowConnectClient(FakeSDKClient):
+        async def connect(self, prompt=None) -> None:
+            connect_started.set()
+            await release_connect.wait()
+            await super().connect(prompt)
+
+    def factory(options):
+        client = SlowConnectClient(options)
+        created_clients.append(client)
+        return client
+
+    a = SDKAdapter(client_factory=factory)
+    connect_task = asyncio.create_task(a.connect("s1"))
+    await asyncio.wait_for(connect_started.wait(), timeout=1)
+
+    await a.disconnect("s1")
+    assert a.discover_sessions() == []
+
+    release_connect.set()
+    await asyncio.wait_for(connect_task, timeout=1)
+
+    # connect() must have backed out rather than resurrecting the session
+    # disconnect() already tore down.
+    assert a.discover_sessions() == []
+    assert a.is_active("s1") is None
+    assert created_clients[0].disconnected is True

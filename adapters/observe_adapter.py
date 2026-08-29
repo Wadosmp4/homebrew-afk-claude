@@ -191,11 +191,33 @@ class ObserveAdapter:
         self._watch_task = asyncio.create_task(self._watch_projects_dir())
 
     async def stop(self) -> None:
+        # cancel() alone only *schedules* cancellation - without awaiting
+        # each task afterward, a still-pending one (a coroutine suspended
+        # on a queue/socket read) can outlive this daemon shutdown, leaked
+        # and later destroyed by the interpreter with no one left to await
+        # it (asyncio's own "Task was destroyed but it is pending!"
+        # warning, and - if it was itself waiting on a selector-registered
+        # fd - a "RuntimeError: Event loop is closed" from that coroutine's
+        # own cleanup running after the loop that owned it already closed).
         if self._watch_task is not None:
             self._watch_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._watch_task
+        # Code-review fix (P2): mirrors _ObserveSession.end()'s own
+        # deny-pending-before-teardown above (see its docstring) - a
+        # session that hasn't ended yet can still have a PermissionRequest
+        # hook call blocked on `await future` (_dispatch_hook) at the
+        # moment this whole adapter is shutting down; closing the socket
+        # out from under it would otherwise leave that hook script
+        # suspended forever with no answer ever coming back.
         for session in self._sessions.values():
-            if session.tail_task is not None:
-                session.tail_task.cancel()
+            for request_id in list(session.pending):
+                session.resolve_permission(request_id, "deny", "Companion shutting down before this was answered")
+        tail_tasks = [session.tail_task for session in self._sessions.values() if session.tail_task is not None]
+        for task in tail_tasks:
+            task.cancel()
+        if tail_tasks:
+            await asyncio.gather(*tail_tasks, return_exceptions=True)
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -332,9 +354,23 @@ class ObserveAdapter:
         check) - "codex" counts only real Codex sessions; any other value
         counts everything else (a hooks-created session's `agent` is
         always None per _get_or_create's own comment, and must still count
-        toward Claude's budget, not escape capping entirely)."""
+        toward Claude's budget, not escape capping entirely).
+
+        Code-review fix: only sessions still open count against the
+        budget - an already-`_ended` `_ObserveSession` is never evicted
+        from `_sessions` (is_active/get_cwd/etc. still need to answer
+        "existed and ended" for it), but without this exclusion here that
+        meant max_watched_sessions became a *lifetime* cap per agent
+        (every session ever created, ended or not) instead of the
+        concurrent-session cap it's meant to be: once enough terminal
+        sessions had ever finished for an agent, every subsequent real
+        session for that agent was silently skipped forever."""
         is_codex = agent == "codex"
-        return sum(1 for s in self._sessions.values() if (s.agent == "codex") == is_codex)
+        return sum(
+            1
+            for s in self._sessions.values()
+            if not s._ended and (s.agent == "codex") == is_codex
+        )
 
     def get_agent(self, session_id: str) -> Optional[str]:
         """Code-review fix: exposes a session's real agent to callers
@@ -358,50 +394,64 @@ class ObserveAdapter:
 
     async def _watch_projects_dir(self) -> None:
         while True:
-            is_initial_scan = not self._initial_scan_done
-            # Real usage points this at ~/.claude/projects, which can hold
-            # hundreds of transcripts across every project ever touched -
-            # the glob itself, and the per-file stat + up-to-64KB
-            # entrypoint scan below, are synchronous filesystem I/O that
-            # would otherwise block every other coroutine (message
-            # handling, other sessions' tail loops) for the duration of
-            # one poll tick. Offloaded to a thread rather than run inline.
-            #
-            # U6: candidates now come from two independently-globbed roots
-            # - ~/.claude/projects (agent "claude") and ~/.codex/sessions
-            # (agent "codex", one directory level deeper for the
-            # YYYY/MM/DD nesting) - run through the same discover/dedup/
-            # cap/stale/tail pipeline below, just tagged by source.
-            candidates = await asyncio.to_thread(self._list_candidate_transcripts)
-            for path, agent in candidates:
-                if path in self._known_transcripts:
-                    continue
-                # Marked known unconditionally (even when skipped below) so
-                # a huge/stale real projects_dir doesn't re-stat every file
-                # on every poll forever - a skipped file stays skipped until
-                # the next daemon restart, which is an acceptable trade-off
-                # for a personal-use app.
-                self._known_transcripts.add(path)
-                # Code-review fix: capped per-agent (not against one shared
-                # total) so a burst of transcripts from one root can't
-                # permanently consume the whole budget and starve the
-                # other's discovery until the next restart - each agent
-                # gets the same _max_watched_sessions ceiling an existing
-                # Claude-only user already had, rather than splitting it.
-                agent_count = self._watched_count_for_agent(agent)
-                if agent_count >= self._max_watched_sessions:
-                    logger.info(
-                        "not watching %s: already watching %d %s sessions (max %d)",
-                        path, agent_count, agent, self._max_watched_sessions,
+            try:
+                is_initial_scan = not self._initial_scan_done
+                # Real usage points this at ~/.claude/projects, which can hold
+                # hundreds of transcripts across every project ever touched -
+                # the glob itself, and the per-file stat + up-to-64KB
+                # entrypoint scan below, are synchronous filesystem I/O that
+                # would otherwise block every other coroutine (message
+                # handling, other sessions' tail loops) for the duration of
+                # one poll tick. Offloaded to a thread rather than run inline.
+                #
+                # U6: candidates now come from two independently-globbed roots
+                # - ~/.claude/projects (agent "claude") and ~/.codex/sessions
+                # (agent "codex", one directory level deeper for the
+                # YYYY/MM/DD nesting) - run through the same discover/dedup/
+                # cap/stale/tail pipeline below, just tagged by source.
+                candidates = await asyncio.to_thread(self._list_candidate_transcripts)
+                for path, agent in candidates:
+                    if path in self._known_transcripts:
+                        continue
+                    # Marked known unconditionally (even when skipped below) so
+                    # a huge/stale real projects_dir doesn't re-stat every file
+                    # on every poll forever - a skipped file stays skipped until
+                    # the next daemon restart, which is an acceptable trade-off
+                    # for a personal-use app.
+                    self._known_transcripts.add(path)
+                    # Code-review fix: capped per-agent (not against one shared
+                    # total) so a burst of transcripts from one root can't
+                    # permanently consume the whole budget and starve the
+                    # other's discovery until the next restart - each agent
+                    # gets the same _max_watched_sessions ceiling an existing
+                    # Claude-only user already had, rather than splitting it.
+                    agent_count = self._watched_count_for_agent(agent)
+                    if agent_count >= self._max_watched_sessions:
+                        logger.info(
+                            "not watching %s: already watching %d %s sessions (max %d)",
+                            path, agent_count, agent, self._max_watched_sessions,
+                        )
+                        continue
+                    skip_reason = await asyncio.to_thread(
+                        self._check_transcript_eligibility, path, agent
                     )
-                    continue
-                skip_reason = await asyncio.to_thread(
-                    self._check_transcript_eligibility, path, agent
-                )
-                if skip_reason is not None:
-                    continue
-                self._start_watching_transcript(path, agent, skip_existing_content=is_initial_scan)
-            self._initial_scan_done = True
+                    if skip_reason is not None:
+                        continue
+                    self._start_watching_transcript(path, agent, skip_existing_content=is_initial_scan)
+                self._initial_scan_done = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover - defensive, mirrors read_loop/_drive_turn/_tail_file's own crash handling
+                # Code-review fix (P1): every other background loop in this
+                # codebase (read_loop, _drive_turn, _tail_file) wraps its
+                # body in `except Exception` - this one didn't, so a
+                # transient OSError, a weird filename, or a disk hiccup
+                # killed session discovery silently and permanently: no new
+                # sessions would ever be found again until a full daemon
+                # restart, with no log line to explain why. Caught and
+                # logged here instead, same as its sibling loops, so the
+                # loop survives and keeps polling.
+                logger.warning("session discovery scan failed, will retry next poll: %s", exc)
             await asyncio.sleep(self._watch_poll_interval)
 
     def _list_candidate_transcripts(self) -> list[tuple[Path, str]]:
@@ -660,6 +710,15 @@ class ObserveAdapter:
 
         try:
             response = await self._dispatch_hook(payload)
+        except Exception:
+            # Code-review fix (P3): previously only try/finally here - a
+            # failure inside _dispatch_hook propagated unhandled with no
+            # application-level log line, and the hook script still only
+            # ever got the bare `{}` fallback the `finally` below already
+            # sends (no permissionDecision). Logging this doesn't change
+            # that response behavior at all - it just makes an otherwise
+            # silent failure visible.
+            logger.exception("hook dispatch failed for payload %r", payload)
         finally:
             writer.write(json.dumps(response).encode("utf-8") + b"\n")
             with contextlib.suppress(Exception):
@@ -889,6 +948,15 @@ class _ObserveSession:
         if self._ended:
             return
         self._ended = True
+        # Code-review fix (P2): mirrors SDKAdapter.disconnect()/
+        # CodexAdapter.disconnect()'s own deny-pending-before-teardown -
+        # without this, a PermissionRequest hook call still blocked on
+        # `await future` (_dispatch_hook) when this session ends (a
+        # SessionEnd hook, or the observed CLI process itself exiting)
+        # was left permanently suspended, leaking the hook script's own
+        # process/connection forever with no answer ever coming back.
+        for request_id in list(self.pending):
+            self.resolve_permission(request_id, "deny", "Session ended before this was answered")
         self.emit("session_ended", reason=reason)
 
     def resolve_permission(self, request_id: str, decision: str, message: str = "") -> None:
