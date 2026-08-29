@@ -121,6 +121,31 @@ _VALID_CODEX_ACCOUNTS = frozenset({"vscode", "personal"})
 # byte-for-byte unchanged from before this field existed.
 _VALID_AGENTS = frozenset({"claude_code", "codex"})
 
+# code-review finding (P1): the post-restart SDK-resume fast path below
+# (`_adapter_for(session_id, include_observed=False)` before ever trying
+# `_try_resume_sdk_session`) previously applied to every action kind on
+# every session_id, not just the narrow "just restarted, an SDK session's
+# in-memory state was wiped" race it was built for. A session_id that was
+# never SDK-owned at all (a real, ordinary observed session - e.g. a
+# `claude` CLI session running directly in a terminal) has no
+# session_registry row and no prior sdk_adapter history, so
+# `_try_resume_sdk_session` had nothing to distinguish it from a genuinely
+# resumable one - any action, including a read-only one like git_status,
+# could trigger a real SDK resume attempt as a side effect, converting a
+# passive observed session into an SDK-owned one and risking a resume
+# against a transcript a separate terminal process is actively using.
+# Restricting the fast path to the two action kinds that actually need a
+# live, resumed SDK connection to do anything meaningful - starting a new
+# turn, or answering a pending permission prompt mid-turn - means every
+# other action kind resolves via the normal include_observed=True lookup
+# first, so an already-known observed session's git_status/interrupt/
+# end_session/etc. just reaches observe_adapter (a no-op there for the
+# write-shaped ones) exactly as it did before this diff, with no resume
+# side effect. The restart race this fast path exists for only matters for
+# these two kinds anyway - nothing else needs a *live* SDK client to have
+# an effect.
+_RESUME_WORTHY_ACTION_KINDS = frozenset({"send_message", "respond_to_permission"})
+
 # KTD4: set_personal_account_token's raw pasted token rides straight in the
 # action dict - _handle_action's generic exception logger (below) logs the
 # whole action on any dispatch failure, which would otherwise print it even
@@ -628,16 +653,34 @@ class CompanionDaemon:
             await self._handle_compose_digest(ws, action.get("session_summaries"))
             return
 
+        # code-review finding (P2): everything past this point used to stay
+        # inline in this one method, alongside every other action-kind
+        # branch above - splitting the session-scoped actions (the largest
+        # single cohesive group: turn control, git/file access, and the
+        # various set_session_* live-config actions) into their own
+        # dispatcher gives this growing set of actions a dedicated place to
+        # land instead of adding yet another branch to an already-long
+        # do-everything router.
+        await self._dispatch_session_scoped_action(ws, kind, action)
+
+    async def _dispatch_session_scoped_action(
+        self, ws: "websockets.WebSocketClientProtocol", kind: Optional[str], action: dict[str, Any]
+    ) -> None:
         session_id = action.get("session_id")
         if not session_id:
             logger.warning("action missing session_id: %r", action)
             return
 
-        adapter = self._adapter_for(session_id, include_observed=False)
-        if adapter is None:
-            adapter = await self._try_resume_sdk_session(session_id)
-        if adapter is None:
+        if kind in _RESUME_WORTHY_ACTION_KINDS:
+            adapter = self._adapter_for(session_id, include_observed=False)
+            if adapter is None:
+                adapter = await self._try_resume_sdk_session(session_id)
+            if adapter is None:
+                adapter = self._adapter_for(session_id)
+        else:
             adapter = self._adapter_for(session_id)
+            if adapter is None:
+                adapter = await self._try_resume_sdk_session(session_id)
         if adapter is None:
             logger.warning("action for unknown session_id=%r: %r", session_id, action)
             # fix(review): discovered via real-device testing - previously

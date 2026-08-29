@@ -12,7 +12,7 @@ import time
 import pytest
 
 import companion.config as config_module
-from companion.config import CompanionConfig, load_config, save_config
+from companion.config import CompanionConfig, load_config, save_config, update_config_field
 
 
 def test_save_then_load_roundtrips_every_field(tmp_path):
@@ -214,6 +214,52 @@ def test_two_concurrent_load_config_calls_racing_the_first_migration_produce_exa
     rows = conn.execute("SELECT id FROM config").fetchall()
     conn.close()
     assert rows == [(1,)]
+
+
+# --- update_config_field (code-review finding, P1) --------------------------
+
+
+def test_update_config_field_sets_only_the_named_column(tmp_path):
+    path = str(tmp_path / "session_registry.db")
+    save_config(
+        path,
+        CompanionConfig(relay_url="ws://x/ws/companion", device_token="t", observe_entrypoints=["claude"]),
+    )
+
+    update_config_field(path, personal_oauth_token="sk-ant-oat-new")
+
+    loaded = load_config(path)
+    assert loaded.personal_oauth_token == "sk-ant-oat-new"
+    # Every other field survives untouched - the whole point versus
+    # save_config's full-row upsert.
+    assert loaded.relay_url == "ws://x/ws/companion"
+    assert loaded.device_token == "t"
+    assert loaded.observe_entrypoints == ["claude"]
+
+
+def test_update_config_field_does_not_clobber_a_concurrent_change_to_a_different_field(tmp_path):
+    """The exact race the finding describes: two independent single-field
+    updates for different columns, in either order, must both survive -
+    neither one reads or rewrites a column it wasn't asked to touch."""
+    path = str(tmp_path / "session_registry.db")
+    save_config(path, CompanionConfig(relay_url="ws://x/ws/companion", device_token="t"))
+
+    update_config_field(path, personal_oauth_token="sk-ant-oat-a")
+    update_config_field(path, observe_entrypoints=["claude", "codex"])
+
+    loaded = load_config(path)
+    assert loaded.personal_oauth_token == "sk-ant-oat-a"
+    assert loaded.observe_entrypoints == ["claude", "codex"]
+
+
+def test_update_config_field_is_owner_only_readable(tmp_path):
+    path = str(tmp_path / "session_registry.db")
+    save_config(path, CompanionConfig(relay_url="ws://x/ws/companion", device_token="t"))
+
+    update_config_field(path, personal_oauth_token="sk-ant-oat-new")
+
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    assert mode == stat.S_IRUSR | stat.S_IWUSR
 
 
 # --- Permissions (KTD4) -----------------------------------------------------

@@ -43,7 +43,7 @@ import stat
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
-from .session_registry import DEFAULT_SESSION_REGISTRY_PATH
+from .session_registry import DEFAULT_SESSION_REGISTRY_PATH, ensure_table_columns
 
 # Legacy JSON location (pre-migration) - see this module's own docstring
 # and load_config's migration branch. Not read or written by save_config
@@ -212,34 +212,20 @@ def _connect(path: str) -> sqlite3.Connection:
     session_registry.py leaves at SQLite's factory default), a synthetic
     single-row primary key (`id INTEGER PRIMARY KEY CHECK (id = 1)` - no
     natural key like session_registry's own `session_id` exists for a
-    single config row), and the same PRAGMA table_info + ALTER TABLE ADD
-    COLUMN forward-migration check for a field added after this table
-    already existed on some earlier run."""
+    single config row).
+
+    code-review finding (P2): the forward-migration column check itself
+    (PRAGMA table_info + per-missing-column ALTER TABLE, including
+    tolerating a concurrent duplicate-column race) is shared with
+    session_registry.py via ensure_table_columns rather than hand-
+    duplicated here - see that function's own docstring for why."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA secure_delete = ON")
     conn.execute("PRAGMA journal_mode = DELETE")
     columns_ddl = ", ".join(f"{name} {_column_type(name)}" for name in _CONFIG_FIELDS)
     conn.execute(f"CREATE TABLE IF NOT EXISTS config (id INTEGER PRIMARY KEY CHECK (id = 1), {columns_ddl})")
-    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(config)")}
-    for name in _CONFIG_FIELDS:
-        if name not in existing_columns:
-            try:
-                conn.execute(f"ALTER TABLE config ADD COLUMN {name} {_column_type(name)}")
-            except sqlite3.OperationalError as exc:
-                # code-review finding (P2): two processes racing this same
-                # forward-migration check can both see "column doesn't
-                # exist yet" (the PRAGMA table_info snapshot above is not
-                # itself locked against a concurrent ALTER) and both
-                # attempt the ADD COLUMN - the loser hits SQLite's
-                # "duplicate column name" OperationalError. That's a
-                # harmless no-op from this process's own point of view
-                # (someone else already added the column it wanted), not a
-                # real failure - only re-raise if the error is something
-                # else entirely, so a genuine schema problem still surfaces
-                # loudly instead of being masked by this handler.
-                if "duplicate column name" not in str(exc):
-                    raise
+    ensure_table_columns(conn, "config", {name: _column_type(name) for name in _CONFIG_FIELDS})
     return conn
 
 
@@ -272,6 +258,29 @@ def save_config(path: str, config: CompanionConfig) -> None:
     migrated_path = DEFAULT_CONFIG_PATH + ".migrated"
     if os.path.exists(migrated_path):
         os.remove(migrated_path)
+
+
+def update_config_field(path: str, **fields: Any) -> None:
+    """code-review finding (P1): a load_config -> mutate one in-memory
+    field -> save_config round trip is a lost-update race against any
+    other process doing the same thing concurrently (e.g. this CLI's own
+    `token set` racing the running daemon's own save_config calls) -
+    save_config's UPSERT always writes every column from whatever
+    CompanionConfig snapshot it's handed, so the loser's save silently
+    reverts every field the winner just changed, not just the one field
+    the loser actually cared about. This does a single-column, read-free
+    SQL UPDATE for exactly the named field(s) instead - two concurrent
+    calls updating different fields can never clobber each other's
+    change, because neither one ever touches a column it wasn't asked to
+    set. Raises the same way save_config does if the row doesn't exist
+    yet (a caller that needs to distinguish that case, like `token set`,
+    should call load_config first purely as an existence check)."""
+    set_clause = ", ".join(f"{name} = ?" for name in fields)
+    values = tuple(_to_column_value(name, value) for name, value in fields.items())
+    with contextlib.closing(_connect(path)) as conn, conn:
+        conn.execute(f"UPDATE config SET {set_clause} WHERE id = 1", values)
+    _chmod_if_exists(path)
+    _chmod_if_exists(path + "-journal")
 
 
 def load_config(path: str = DEFAULT_SESSION_REGISTRY_PATH) -> CompanionConfig:

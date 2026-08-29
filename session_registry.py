@@ -52,6 +52,35 @@ class SessionRecord:
     updated_at: str
 
 
+def ensure_table_columns(conn: sqlite3.Connection, table: str, column_ddl_by_name: dict[str, str]) -> None:
+    """code-review finding (P2): config.py's own _connect() had hand-copied
+    this exact PRAGMA table_info + per-missing-column ALTER TABLE shape
+    rather than sharing it with this module's original - any future change
+    to "how this companion migrates a SQLite table it owns" (a smarter
+    migration, a bug fix, a switch to WAL mode) had to be applied by hand
+    in two places to stay in sync. Both modules' own CREATE TABLE IF NOT
+    EXISTS statements already establish the table itself; this only adds
+    whichever of `column_ddl_by_name`'s columns don't exist on it yet.
+
+    Tolerates a concurrent duplicate-column race the same way config.py's
+    own fix already did: two processes racing this same forward-migration
+    check can both see a column as missing (the PRAGMA table_info snapshot
+    isn't itself locked against a concurrent ALTER) and both attempt to
+    add it - the loser's ALTER TABLE hits SQLite's "duplicate column name"
+    OperationalError, which is a harmless no-op from its own point of view
+    (someone else already added the column it wanted), not a real failure.
+    Only that specific error is swallowed - anything else still surfaces
+    loudly instead of being masked here."""
+    existing_columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, ddl in column_ddl_by_name.items():
+        if name not in existing_columns:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc):
+                    raise
+
+
 def _connect(path: str) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     conn = sqlite3.connect(path)
@@ -82,9 +111,7 @@ def _connect(path: str) -> sqlite3.Connection:
     # require translating an old row's auto_approve/llm_judge into an
     # equivalent permission_mode: a session resuming under the old system
     # just loses that setting.
-    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
-    if "permission_mode" not in existing_columns:
-        conn.execute("ALTER TABLE sessions ADD COLUMN permission_mode TEXT")
+    ensure_table_columns(conn, "sessions", {"permission_mode": "TEXT"})
     return conn
 
 

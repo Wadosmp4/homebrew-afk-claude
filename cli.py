@@ -54,7 +54,14 @@ import urllib.error
 import urllib.request
 from typing import Optional, Sequence
 
-from .config import CompanionConfig, DEFAULT_RELAY_URL, DEFAULT_SESSION_REGISTRY_PATH, load_config, save_config
+from .config import (
+    CompanionConfig,
+    DEFAULT_RELAY_URL,
+    DEFAULT_SESSION_REGISTRY_PATH,
+    load_config,
+    save_config,
+    update_config_field,
+)
 from .daemon import main as run_daemon
 
 DEFAULT_PAIR_TIMEOUT_SECONDS = 300.0  # matches the relay's own PAIRING_CODE_TTL_SECONDS
@@ -268,17 +275,20 @@ def _token_set(args: argparse.Namespace) -> None:
     token = getpass.getpass(f"Enter your personal {label} token (input hidden): ").strip()
 
     try:
-        config = load_config(args.config_path)
+        load_config(args.config_path)
     except (OSError, ValueError, TypeError, sqlite3.Error):
         print(f"No existing config at {args.config_path} - run `afk-claude-companion setup` first.")
         sys.exit(1)
 
-    if args.agent == "claude":
-        config.personal_oauth_token = token
-    else:
-        config.codex_personal_api_key = token
-
-    save_config(args.config_path, config)
+    # code-review finding (P1): the load-mutate-save pattern this used to
+    # follow (load the whole config, set one field on the in-memory
+    # dataclass, save the whole thing back) races a concurrent daemon-
+    # triggered save_config - whichever save lands second would silently
+    # revert every field the other one just changed. A targeted single-
+    # column UPDATE can't clobber a concurrent change to a different
+    # field, because it never touches any column but this one.
+    field = "personal_oauth_token" if args.agent == "claude" else "codex_personal_api_key"
+    update_config_field(args.config_path, **{field: token})
     print(f"{label} personal token saved locally.")
     print("A running companion won't pick this up until it's restarted (`afk-claude-companion run`).")
 

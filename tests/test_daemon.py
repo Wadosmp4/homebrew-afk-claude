@@ -1414,6 +1414,64 @@ async def test_stop_task_action_is_a_noop_for_an_observed_session(running_daemon
 
 
 @pytest.mark.asyncio
+async def test_a_read_only_action_for_an_observed_session_with_a_real_transcript_does_not_trigger_an_sdk_resume(
+    running_daemon, phone_token
+):
+    """code-review finding (P1): every existing observe-session test above
+    creates its transcript via `.touch()` (empty file), which makes
+    history.find_transcript_cwd return None and short-circuits
+    _try_resume_sdk_session before it ever reaches sdk_adapter.connect -
+    none of them actually exercised the realistic case of a genuinely
+    observe-only session whose transcript has real content (an actual `cwd`
+    field, exactly like every real Claude Code transcript has). Before the
+    fix, _handle_action's dispatch preamble tried
+    `_adapter_for(session_id, include_observed=False)` first for every
+    action kind, which excludes observe_adapter - for a session_id with no
+    session_registry row (never started via this companion) and a real
+    transcript, that fell through to _try_resume_sdk_session, which found a
+    resolvable cwd and unconditionally called self.sdk_adapter.connect(...),
+    converting a passive observed session into an SDK-owned one as a side
+    effect of a read-only action. The fix restricts that fast path to
+    send_message/respond_to_permission only - git_status (a read-only
+    action) must resolve via the normal include_observed=True lookup and
+    reach observe_adapter directly, with zero SDK client ever created."""
+    daemon, port, fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        project_dir = daemon.observe_adapter.projects_dir / "my-repo"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "session-live.jsonl").write_text(
+            json.dumps({"cwd": str(project_dir), "type": "user", "message": {"role": "user", "content": "hi"}})
+            + "\n"
+        )
+
+        started = await phone.next_event(timeout=3.0)
+        assert started["type"] == "session_started"
+        assert started["data"]["mode"] == "observe_only"
+
+        await phone.send_action({"kind": "open_session", "session_id": "session-live"})
+        await phone.send_action({"kind": "git_status", "session_id": "session-live"})
+        # A live transcript can also produce extra session_started/no-op
+        # observe-poll events before the git_status result arrives (unlike
+        # the empty-transcript tests above) - drain until it shows up
+        # rather than assuming it's the very next event.
+        seen = []
+        try:
+            while not any(e["type"] == "git_status" for e in seen):
+                seen.append(await phone.next_event(timeout=3.0))
+        except asyncio.TimeoutError:
+            pass
+        assert any(e["type"] == "git_status" for e in seen)
+        # The whole point: no SDK resume attempt happened for this
+        # genuinely observe-only session just because a real transcript
+        # (rather than an empty .touch()'d one) let find_transcript_cwd
+        # resolve a cwd.
+        assert fake_clients == {}
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
 async def test_set_session_auto_approve_is_a_noop_for_an_sdk_owned_session(running_daemon, phone_token):
     """code-review finding: SDKAdapter no longer defines
     set_session_auto_approve at all (replaced by set_session_permission_mode/

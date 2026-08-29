@@ -537,6 +537,37 @@ def test_token_set_codex_saves_the_api_key_masked_and_notes_the_restart(monkeypa
     assert "restart" in out.lower()
 
 
+def test_token_set_does_not_revert_a_field_changed_concurrently_by_the_daemon(monkeypatch, tmp_path, capsys):
+    """code-review finding (P1): _token_set used to load_config, mutate one
+    field on that in-memory snapshot, and save_config the whole thing back
+    - a concurrent daemon-triggered save_config landing in between (e.g.
+    from set_observe_entrypoints) would be silently reverted by
+    _token_set's own save, since save_config's UPSERT always writes every
+    column from whatever CompanionConfig it's handed. Simulates that race
+    directly: change observe_entrypoints (standing in for "the daemon
+    committed something else while token set's getpass prompt was up")
+    after _write_config's initial write but before token set runs, and
+    confirm token set's targeted single-column update doesn't touch it."""
+    from companion.config import load_config as _load, save_config as _save
+
+    config_path = tmp_path / "session_registry.db"
+    _write_config(config_path)
+
+    # Stand in for the daemon committing an unrelated change concurrently.
+    config = _load(str(config_path))
+    config.observe_entrypoints = ["claude", "codex"]
+    _save(str(config_path), config)
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": "sk-ant-oat-secret")
+
+    main(["token", "set", "claude", "--config-path", str(config_path)])
+
+    loaded = load_config(str(config_path))
+    assert loaded.personal_oauth_token == "sk-ant-oat-secret"
+    assert loaded.observe_entrypoints == ["claude", "codex"]
+
+
 def test_token_set_rejects_an_unknown_agent_before_the_handler_runs(monkeypatch, tmp_path):
     def fail_if_called(prompt=""):
         raise AssertionError("getpass should never be called for an invalid agent choice")
