@@ -82,6 +82,16 @@ _TOOL_ITEM_TYPES = ("commandExecution", "mcpToolCall", "fileChange")
 # coupling, and the value itself is the only thing worth mirroring.
 _DISCONNECT_CALL_TIMEOUT_SECONDS = 10.0
 
+# Multi-Agent Adapter plan (009), U1: Codex's own AccountRateLimitsUpdated
+# snapshot has no CLI-computed "approaching" concept the way Claude's own
+# allowed/allowed_warning/rejected tri-state does (claude_agent_sdk's CLI
+# decides that server-side and just tells this app the resulting status) -
+# these two thresholds synthesize the same vocabulary from Codex's raw
+# used_percent (a 0-100 int). A starting default per the plan's own KTD1,
+# tunable later; not derived from any documented Codex behavior.
+_RATE_LIMIT_REJECTED_USED_PERCENT = 100
+_RATE_LIMIT_APPROACHING_USED_PERCENT = 85
+
 
 def _is_spawn_subagent_call(item: Any) -> bool:
     """A `collabAgentToolCall` item's own `tool` field distinguishes actually
@@ -146,6 +156,21 @@ def _sandbox_from_wire(sandbox: Optional[str]) -> Optional[Any]:
     from openai_codex import Sandbox
 
     return Sandbox[sandbox] if sandbox is not None else None
+
+
+def _status_from_used_percent(used_percent: int, rate_limit_reached_type: Optional[Any]) -> str:
+    """Maps one Codex RateLimitWindow's raw used_percent (plus the
+    snapshot-level rate_limit_reached_type, which can report a hard stop
+    for reasons other than used_percent hitting 100 - e.g. workspace
+    credits depleted) onto the same RateLimitStatus vocabulary Claude
+    sessions already report ("allowed" | "allowed_warning" | "rejected" -
+    see claude_agent_sdk.types.RateLimitInfo). See the module-level
+    threshold constants' own comment for why these specific numbers."""
+    if rate_limit_reached_type is not None or used_percent >= _RATE_LIMIT_REJECTED_USED_PERCENT:
+        return "rejected"
+    if used_percent >= _RATE_LIMIT_APPROACHING_USED_PERCENT:
+        return "allowed_warning"
+    return "allowed"
 
 
 def _tool_result_for_item(item: Any) -> tuple[str, bool]:
@@ -270,6 +295,14 @@ class CodexAdapter:
             sandbox=sandbox,
             client_request_id=client_request_id,
         )
+        # U1: one long-lived background task per session (started here, not
+        # per-turn like stream_task) - AccountRateLimitsUpdatedNotification
+        # arrives on the client's *global* notification stream, independent
+        # of whatever turn is or isn't currently running, so this has to
+        # cover the session's entire lifetime rather than a single
+        # send_message() call. See _drain_account_notifications's own
+        # docstring for the private-attribute access path this depends on.
+        session.notification_task = asyncio.create_task(self._drain_account_notifications(session))
 
     async def send_message(self, session_id: str, text: str) -> None:
         from openai_codex import TextInput
@@ -368,6 +401,15 @@ class CodexAdapter:
             # destroyed but it is pending!".
             with contextlib.suppress(asyncio.CancelledError):
                 await session.stream_task
+        if session.notification_task is not None:
+            # Same cancel/await-in-suppress convention as stream_task
+            # directly above - this task otherwise loops forever (see its
+            # own docstring), so leaving it merely cancel()'d without
+            # awaiting it would hit the same "Task was destroyed but it is
+            # pending!" warning stream_task's own teardown exists to avoid.
+            session.notification_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await session.notification_task
         # Code-review fix: close() must not skip session.end() - the
         # session is already popped from self._sessions above, so if close()
         # raises here, nothing else will ever emit session_ended, stranding
@@ -503,7 +545,16 @@ class CodexAdapter:
         # affordance.
         open_item_ids: set[str] = set()
         try:
-            async for notification in turn_handle.stream():
+            async for raw_notification in turn_handle.stream():
+                # Code-review fix (P0): stream() yields the SDK's own
+                # Notification(method, payload) wrapper (see
+                # _drain_account_notifications's own docstring for the
+                # source citation) - _handle_notification's isinstance
+                # checks below need the unwrapped payload, the same
+                # hasattr-guarded unwrap already used there.
+                notification = (
+                    raw_notification.payload if hasattr(raw_notification, "payload") else raw_notification
+                )
                 await self._handle_notification(session, notification, seen_item_ids, open_item_ids)
         except asyncio.CancelledError:
             raise
@@ -517,6 +568,93 @@ class CodexAdapter:
             # listening to any more.
             self._emit_synthetic_errors_for_open_items(session, open_item_ids)
             session.emit("error", message=str(exc))
+
+    async def _drain_account_notifications(self, session: "_CodexSession") -> None:
+        """Multi-Agent Adapter plan (009), U1: consumes the client's
+        *global* notification stream (independent of any particular
+        turn/thread) for as long as the session lives, watching for
+        AccountRateLimitsUpdatedNotification - mirrors _drive_turn's own
+        task-loop shape, but this one is started once in connect() rather
+        than once per send_message(), since rate-limit snapshots can arrive
+        with no turn active at all.
+
+        `session.client._client.next_notification()` reaches AsyncCodex's
+        internal `_client` (an AsyncCodexClient) directly - AsyncCodex
+        itself exposes no public next_notification() method. This is a
+        documented stability risk (see the plan's own KTD1): an
+        undocumented private attribute of the real SDK, not part of its
+        public contract, that could change across openai-codex releases
+        with no deprecation warning.
+
+        Own-research finding (verified directly against the installed
+        openai-codex 0.147.0 source, not carried over from the plan's own
+        assumption): next_notification() returns the SDK's own
+        `Notification(method, payload)` wrapper dataclass
+        (openai_codex/client.py's MessageRouter.next_global_notification,
+        used identically by AsyncTurnHandle.stream() for turn-scoped
+        notifications) - not the raw typed payload directly. `.payload` is
+        unwrapped below using the same hasattr-guarded convention
+        _handle_notification's own ItemStartedNotification/
+        ItemCompletedNotification branches already use for ThreadItem's
+        analogous root-model wrapping, rather than assuming the attribute
+        is always present."""
+        from openai_codex.generated.v2_all import AccountRateLimitsUpdatedNotification
+
+        try:
+            while True:
+                notification = await session.client._client.next_notification()
+                payload = notification.payload if hasattr(notification, "payload") else notification
+                if isinstance(payload, AccountRateLimitsUpdatedNotification):
+                    self._emit_rate_limit_from_snapshot(session, payload.rate_limits)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Unlike _drive_turn's own stream crash handling, there's no
+            # in-flight turn state to reconcile here (no open tool-call
+            # items, no turn to mark errored) - this is a side-channel
+            # feed, not the turn's own result path. Logging and letting the
+            # task end is the same "don't crash the session over a
+            # secondary signal" posture set_session_model/set_session_sandbox
+            # already take for their own local-state-only failures.
+            logger.warning(
+                "Codex account-notification drain crashed for session %s: %s", session.session_id, exc
+            )
+
+    @staticmethod
+    def _emit_rate_limit_from_snapshot(session: "_CodexSession", snapshot: Any) -> None:
+        """KTD1: a RateLimitSnapshot carries up to two independent windows
+        (primary/secondary) with no Codex equivalent to Claude's own
+        window-identity strings ("five_hour"/"seven_day"/...) - "primary"/
+        "secondary" (the SDK's own field names) are used as rate_limit_type
+        instead. Mobile's RATE_LIMIT_LABEL falls back to the raw string for
+        anything it doesn't recognize (confirmed against
+        SessionDashboardScreen.tsx), so this doesn't break the existing
+        Usage Limits modal - it just shows an unlabeled window key until a
+        later unit gives Codex's windows their own labels.
+
+        utilization is normalized from Codex's 0-100 int used_percent to
+        the 0.0-1.0 fraction Claude's own rate_limit event already reports
+        (mobile renders `utilization * 100` directly) - confirmed against
+        SessionDashboardScreen.tsx's own rendering, not assumed from the
+        plan text alone.
+
+        overage_status/overage_resets_at/raw are Claude-specific (pay-as-
+        you-go overage, and the CLI's own raw wire dict) - Codex has no
+        equivalent for any of the three, so all stay None rather than
+        fabricating a value, matching sdk_adapter.py's own field shape."""
+        for rate_limit_type, window in (("primary", snapshot.primary), ("secondary", snapshot.secondary)):
+            if window is None:
+                continue
+            session.emit(
+                "rate_limit",
+                rate_limit_type=rate_limit_type,
+                status=_status_from_used_percent(window.used_percent, snapshot.rate_limit_reached_type),
+                utilization=window.used_percent / 100.0,
+                resets_at=window.resets_at,
+                overage_status=None,
+                overage_resets_at=None,
+                raw=None,
+            )
 
     @staticmethod
     def _emit_synthetic_errors_for_open_items(session: "_CodexSession", open_item_ids: set[str]) -> None:
@@ -598,6 +736,42 @@ class CodexAdapter:
             # _drive_turn's except-branch comment on why the order matters
             # (subscribe() stops forwarding once it yields an "error").
             self._emit_synthetic_errors_for_open_items(session, open_item_ids)
+            # U1: usage_limit_exceeded/session_budget_exceeded are Codex's
+            # own hard usage/budget rejections - alongside the existing
+            # generic "error" below (not instead of it, per KTD1), also
+            # emit "rate_limit" with a rejected status so the phone's
+            # existing Usage Limits modal (built for Claude's own rejected
+            # status) picks this up with no Codex-specific mobile code.
+            # context_window_exceeded is a per-turn context overflow, not a
+            # usage/quota condition - deliberately excluded (see the plan's
+            # own scope note), and codex_error_info is itself optional, so
+            # neither case reaches this block at all.
+            #
+            # codex_error_info.root: CodexErrorInfo is a RootModel wrapping
+            # either the plain CodexErrorInfoValue enum or one of several
+            # richer error-detail models - only the enum member form is
+            # ever one of the two rate-limit values, so comparing `root`
+            # directly (rather than assuming it's always the enum) is safe:
+            # `in` against richer model instances is simply False, never an
+            # exception.
+            codex_error_info = notification.error.codex_error_info
+            if codex_error_info is not None:
+                from openai_codex.generated.v2_all import CodexErrorInfoValue
+
+                if codex_error_info.root in (
+                    CodexErrorInfoValue.usage_limit_exceeded,
+                    CodexErrorInfoValue.session_budget_exceeded,
+                ):
+                    session.emit(
+                        "rate_limit",
+                        rate_limit_type=None,
+                        status="rejected",
+                        utilization=None,
+                        resets_at=None,
+                        overage_status=None,
+                        overage_resets_at=None,
+                        raw=None,
+                    )
             session.emit("error", message=getattr(notification.error, "message", "Codex turn failed"))
             return
 
@@ -614,6 +788,10 @@ class _CodexSession:
         self.sandbox: Optional[Any] = None
         self.current_turn: Optional[Any] = None
         self.stream_task: Optional[asyncio.Task] = None
+        # U1: distinct from stream_task - this one is started once in
+        # connect() and lives for the whole session, not per-turn. See
+        # _drain_account_notifications's own docstring.
+        self.notification_task: Optional[asyncio.Task] = None
         # Code-review fix (P2): see send_message/interrupt's own comments -
         # `turn_starting` covers the window between dispatching
         # `thread.turn(...)` and it actually resolving into `current_turn`;

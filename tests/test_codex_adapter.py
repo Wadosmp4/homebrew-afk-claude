@@ -15,6 +15,8 @@ import asyncio
 import pytest
 from openai_codex.generated.v2_all import (
     AgentMessageThreadItem,
+    CodexErrorInfo,
+    CodexErrorInfoValue,
     CollabAgentTool,
     CollabAgentToolCallStatus,
     CollabAgentToolCallThreadItem,
@@ -22,15 +24,20 @@ from openai_codex.generated.v2_all import (
     CommandExecutionThreadItem,
     McpToolCallStatus,
     McpToolCallThreadItem,
+    RateLimitReachedType,
+    RateLimitSnapshot,
+    RateLimitWindow,
     ThreadItem,
     Turn,
     TurnError,
     TurnStatus,
 )
 from openai_codex.models import (
+    AccountRateLimitsUpdatedNotification,
     ErrorNotification,
     ItemCompletedNotification,
     ItemStartedNotification,
+    Notification,
     TurnCompletedNotification,
 )
 
@@ -46,14 +53,27 @@ class FakeTurnHandle:
     """Stands in for AsyncTurnHandle - stream() is the real surface
     _drive_turn consumes; tests push notifications onto it directly,
     the same way test_sdk_adapter.py's FakeSDKClient.push feeds
-    receive_messages()."""
+    receive_messages().
+
+    Code-review fix: the real AsyncTurnHandle.stream() yields the SDK's own
+    Notification(method, payload) wrapper dataclass (see
+    openai_codex/api.py's stream(), which forwards next_turn_notification()'s
+    return value unchanged) - never the bare typed payload. push() wraps
+    whatever's given the same way, so tests exercise the real stream() shape
+    instead of one _drive_turn's isinstance checks could never see in
+    production."""
 
     def __init__(self):
         self._notifications: asyncio.Queue = asyncio.Queue()
         self.interrupted = False
 
     def push(self, notification) -> None:
-        self._notifications.put_nowait(notification)
+        wrapped = (
+            notification
+            if isinstance(notification, Notification)
+            else Notification(method=type(notification).__name__, payload=notification)
+        )
+        self._notifications.put_nowait(wrapped)
 
     def stop(self) -> None:
         self._notifications.put_nowait(_STOP)
@@ -94,6 +114,26 @@ class FakeThread:
             raise self.raise_on_compact
 
 
+class FakeGlobalNotificationStream:
+    """Stands in for AsyncCodexClient (AsyncCodex's own internal `_client`
+    attribute) - _drain_account_notifications reaches
+    session.client._client.next_notification() directly, since AsyncCodex
+    itself exposes no public method for it (see that method's own
+    docstring). Blocks forever when nothing has been pushed, the same way
+    the real SDK's next_notification() blocks on an empty global
+    notification queue - so a test that never calls push() sees the drain
+    task sit idle rather than erroring or busy-looping."""
+
+    def __init__(self):
+        self._notifications: asyncio.Queue = asyncio.Queue()
+
+    def push(self, notification) -> None:
+        self._notifications.put_nowait(notification)
+
+    async def next_notification(self):
+        return await self._notifications.get()
+
+
 class FakeCodexClient:
     """Stands in for AsyncCodex."""
 
@@ -105,6 +145,12 @@ class FakeCodexClient:
         self.close_calls = 0
         self.raise_on_thread_start: Exception | None = None
         self.raise_on_close: Exception | None = None
+        # Own research finding (verified against the installed openai-codex
+        # 0.147.0 source, not assumed from the plan text): AsyncCodex's own
+        # internal attribute really is named `_client` and really does
+        # expose an async next_notification() - see codex_adapter.py's
+        # _drain_account_notifications docstring for the full citation.
+        self._client = FakeGlobalNotificationStream()
 
     async def login_api_key(self, api_key: str) -> None:
         self.logged_in_with = api_key
@@ -929,6 +975,213 @@ async def test_disconnect_all_cleans_up_multiple_sessions_including_one_with_an_
     assert turn_handle.interrupted is True
     for session_id in ("s1", "s2", "s3"):
         assert a.is_active(session_id) is None
+
+
+# --- Multi-Agent Adapter plan (009), U1: rate-limit signal parity --------
+
+
+def _rate_limits_notification(
+    *, primary_used_percent: int, resets_at: int = 1700000000, rate_limit_reached_type=None
+) -> Notification:
+    """Builds the real wrapper shape next_notification() actually returns
+    (confirmed directly against the installed openai-codex 0.147.0 source -
+    see codex_adapter.py's _drain_account_notifications docstring): a
+    Notification(method, payload) dataclass, not the bare
+    AccountRateLimitsUpdatedNotification the plan's own text assumed."""
+    window = RateLimitWindow(usedPercent=primary_used_percent, resetsAt=resets_at)
+    snapshot = RateLimitSnapshot(primary=window, rateLimitReachedType=rate_limit_reached_type)
+    payload = AccountRateLimitsUpdatedNotification(rateLimits=snapshot)
+    return Notification(method="account/rate_limits_updated", payload=payload)
+
+
+@pytest.mark.asyncio
+async def test_an_approaching_used_percent_emits_a_rate_limit_event_with_allowed_warning_status(adapter):
+    """KTD1: used_percent >= 85 (with no rate_limit_reached_type) maps onto
+    the approaching-equivalent status Claude sessions call
+    "allowed_warning"."""
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    client = adapter._test_clients["latest"]
+    client._client.push(_rate_limits_notification(primary_used_percent=90))
+
+    rate_limit_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert rate_limit_event.type == "rate_limit"
+    assert rate_limit_event.data["rate_limit_type"] == "primary"
+    assert rate_limit_event.data["status"] == "allowed_warning"
+    assert rate_limit_event.data["utilization"] == 0.90
+    assert rate_limit_event.data["resets_at"] == 1700000000
+
+
+@pytest.mark.asyncio
+async def test_used_percent_at_100_emits_a_rate_limit_event_with_rejected_status(adapter):
+    """KTD1: used_percent >= 100 maps onto the hard-limit-equivalent status
+    Claude sessions call "rejected"."""
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    client = adapter._test_clients["latest"]
+    client._client.push(_rate_limits_notification(primary_used_percent=100))
+
+    rate_limit_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert rate_limit_event.type == "rate_limit"
+    assert rate_limit_event.data["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_a_rate_limit_reached_type_below_100_used_percent_still_emits_rejected_status(adapter):
+    """KTD1 explicitly also treats rate_limit_reached_type being set as a
+    hard-limit signal, independent of used_percent - Codex can report a
+    hard stop for reasons other than the percentage itself hitting 100
+    (e.g. workspace credits depleted)."""
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    client = adapter._test_clients["latest"]
+    client._client.push(
+        _rate_limits_notification(
+            primary_used_percent=40, rate_limit_reached_type=RateLimitReachedType.workspace_owner_credits_depleted
+        )
+    )
+
+    rate_limit_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert rate_limit_event.type == "rate_limit"
+    assert rate_limit_event.data["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_used_percent_below_the_approaching_threshold_reports_allowed(adapter):
+    """Below both thresholds (and no rate_limit_reached_type), status stays
+    "allowed" - a snapshot update still reaches the phone (so the dashboard
+    reflects the real reading, same as Claude's own non-transition
+    readings), it just doesn't offer a handoff."""
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    client = adapter._test_clients["latest"]
+    client._client.push(_rate_limits_notification(primary_used_percent=40))
+
+    rate_limit_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert rate_limit_event.type == "rate_limit"
+    assert rate_limit_event.data["status"] == "allowed"
+
+
+@pytest.mark.asyncio
+async def test_a_usage_limit_exceeded_error_notification_emits_both_rate_limit_and_error(adapter):
+    """R1's hard usage/budget-rejection case: alongside the existing generic
+    "error" event (not instead of it, per KTD1), a "rate_limit" event with
+    a rejected status is also emitted - the rate_limit event must arrive
+    first, since subscribe() stops forwarding this session's events once it
+    yields a typed "error" (see _drive_turn's own comment on that
+    ordering)."""
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+    await adapter.send_message("s1", "hello")
+    await events.__anext__()  # user_message
+
+    turn_handle = adapter._test_clients["latest"].threads[0].turns[0]
+    turn_handle.push(
+        ErrorNotification(
+            error=TurnError(
+                message="usage limit exceeded",
+                codexErrorInfo=CodexErrorInfo(CodexErrorInfoValue.usage_limit_exceeded),
+            ),
+            threadId="t1",
+            turnId="turn-1",
+            willRetry=False,
+        )
+    )
+
+    rate_limit_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert rate_limit_event.type == "rate_limit"
+    assert rate_limit_event.data["status"] == "rejected"
+
+    error_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert error_event.type == "error"
+    assert error_event.data["message"] == "usage limit exceeded"
+
+
+@pytest.mark.asyncio
+async def test_a_session_budget_exceeded_error_notification_also_emits_a_rate_limit_event(adapter):
+    """R1 names both usage_limit_exceeded and session_budget_exceeded as
+    triggers for the same rejected-equivalent rate_limit event."""
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+    await adapter.send_message("s1", "hello")
+    await events.__anext__()  # user_message
+
+    turn_handle = adapter._test_clients["latest"].threads[0].turns[0]
+    turn_handle.push(
+        ErrorNotification(
+            error=TurnError(
+                message="session budget exceeded",
+                codexErrorInfo=CodexErrorInfo(CodexErrorInfoValue.session_budget_exceeded),
+            ),
+            threadId="t1",
+            turnId="turn-1",
+            willRetry=False,
+        )
+    )
+
+    rate_limit_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert rate_limit_event.type == "rate_limit"
+    assert rate_limit_event.data["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_a_context_window_exceeded_error_notification_emits_no_rate_limit_event(adapter):
+    """Scope note: context_window_exceeded is a per-turn context overflow,
+    not a usage/quota condition - behavior must stay exactly as it is
+    today (only the existing generic "error" event, no new "rate_limit")."""
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+    await adapter.send_message("s1", "hello")
+    await events.__anext__()  # user_message
+
+    turn_handle = adapter._test_clients["latest"].threads[0].turns[0]
+    turn_handle.push(
+        ErrorNotification(
+            error=TurnError(
+                message="context window exceeded",
+                codexErrorInfo=CodexErrorInfo(CodexErrorInfoValue.context_window_exceeded),
+            ),
+            threadId="t1",
+            turnId="turn-1",
+            willRetry=False,
+        )
+    )
+
+    error_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert error_event.type == "error"
+    assert error_event.data["message"] == "context window exceeded"
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_the_notification_drain_task_cleanly(adapter):
+    """Matches stream_task's own existing teardown convention: the
+    notification-drain task loops forever (nothing ever completes it on
+    its own, unlike stream_task's turn-scoped stream), so disconnect() must
+    cancel and await it - not merely cancel() it and move on, which would
+    leave it pending past this test's own event-loop teardown (surfacing
+    as a misattributed "Task was destroyed but it is pending!" warning
+    against whatever test runs next - see the `adapter` fixture's own
+    docstring for this exact failure mode)."""
+    await adapter.connect("s1", cwd="/repo")
+    session = adapter._sessions["s1"]
+    notification_task = session.notification_task
+    assert notification_task is not None
+    assert not notification_task.done()
+
+    await adapter.disconnect("s1")
+
+    assert notification_task.cancelled() or notification_task.done()
 
 
 @pytest.mark.asyncio
