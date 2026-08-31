@@ -28,7 +28,7 @@ import pytest
 import pytest_asyncio
 import uvicorn
 import websockets
-from claude_agent_sdk import TaskNotificationMessage
+from claude_agent_sdk import RateLimitEvent, RateLimitInfo, TaskNotificationMessage
 
 from companion.adapters.codex_adapter import CodexAdapter
 from companion.adapters.observe_adapter import KNOWN_ENTRYPOINTS, ObserveAdapter
@@ -36,7 +36,7 @@ from companion.adapters.sdk_adapter import SDKAdapter
 from companion.config import CompanionConfig, load_config
 from companion.daemon import CompanionDaemon
 from companion import git_status, session_registry
-from companion.tests.test_codex_adapter import FakeCodexClient
+from companion.tests.test_codex_adapter import FakeCodexClient, _rate_limits_notification
 from companion.tests.test_sdk_adapter import _STOP, FakeSDKClient
 from relay import auth
 from relay.app import create_app
@@ -4042,3 +4042,461 @@ def test_adapter_for_returns_none_for_an_unknown_session_id(tmp_path):
     daemon = _bare_daemon(tmp_path)
 
     assert daemon._adapter_for("no-such-session") is None
+
+
+# --- Agent Limit Handoff plan, U2: offer detection, escalation, dismissal --
+
+
+def _push_rate_limit(
+    client,
+    session_id: str,
+    *,
+    status: str,
+    rate_limit_type: str = "five_hour",
+    utilization=None,
+    # A comfortably-future epoch (2100-01-01T00:00:00Z) - _agent_limit_window_has_reset
+    # treats any resets_at <= now as an already-passed window (KTD5), so
+    # this must stay ahead of the real wall clock for every test below
+    # that means "this window hasn't reset yet", unlike
+    # test_sdk_adapter.py's own 1700000000 fixture value (2023), which
+    # exists only to prove the field round-trips, never to model "not yet
+    # reset" against a real clock.
+    resets_at=4102444800,
+    uuid="rl-1",
+) -> None:
+    client.push(
+        RateLimitEvent(
+            rate_limit_info=RateLimitInfo(
+                status=status,
+                rate_limit_type=rate_limit_type,
+                utilization=utilization,
+                resets_at=resets_at,
+            ),
+            uuid=uuid,
+            session_id=session_id,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_real_approaching_reading_raises_an_agent_limit_offer(running_daemon, phone_token):
+    daemon, port, fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+        client = fake_clients[0]
+
+        _push_rate_limit(client, session_id, status="allowed_warning", utilization=0.82)
+        rate_limit_event = await phone.next_event()
+        assert rate_limit_event["type"] == "rate_limit"
+
+        offer_event = await phone.next_event()
+        assert offer_event["type"] == "agent_limit_offer"
+        assert offer_event["session_id"] == session_id
+        assert offer_event["data"]["agent"] == "claude_code"
+        assert offer_event["data"]["offered_agent"] == "codex"
+        assert offer_event["data"]["rate_limit_type"] == "five_hour"
+        assert offer_event["data"]["status"] == "allowed_warning"
+        assert offer_event["data"]["utilization"] == 0.82
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_a_rate_limit_estimate_event_never_raises_an_offer(running_daemon, phone_token):
+    """Key Decision (R2): only a real "rate_limit" reading can trigger an
+    offer - a calibrated "rate_limit_estimate" alone never does. Proven the
+    same way test_sdk_adapter.py's own
+    test_task_started_message_does_not_end_the_session proves an absence:
+    send a distinguishable follow-up action and confirm it's the very next
+    event, rather than racing a timeout against a negative assertion."""
+    daemon, port, fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        daemon.sdk_adapter.emit_custom(
+            session_id, "rate_limit_estimate", rate_limit_type="five_hour", utilization=0.9
+        )
+        estimate_event = await phone.next_event()
+        assert estimate_event["type"] == "rate_limit_estimate"
+
+        await phone.send_action({"kind": "send_message", "session_id": session_id, "text": "still no offer?"})
+        next_event = await phone.next_event()
+        assert next_event["type"] == "user_message"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_reading_with_no_prior_warning_raises_an_offer_directly(running_daemon, phone_token):
+    """State-diagram's own last transition: None --(rejected, no prior
+    warning)--> Exceeded, skipping Approaching entirely - a session can go
+    straight from no offer to a hard-limit offer if the first reading it
+    ever sees for this key is already "rejected"."""
+    daemon, port, fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+        client = fake_clients[0]
+
+        _push_rate_limit(client, session_id, status="rejected", utilization=1.0)
+        await phone.next_event()  # rate_limit
+        offer_event = await phone.next_event()
+        assert offer_event["type"] == "agent_limit_offer"
+        assert offer_event["data"]["status"] == "rejected"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_a_harder_reading_escalates_the_same_offer_instead_of_raising_a_second_one(
+    running_daemon, phone_token
+):
+    daemon, port, fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+        client = fake_clients[0]
+
+        _push_rate_limit(client, session_id, status="allowed_warning", utilization=0.82, uuid="rl-1")
+        await phone.next_event()  # rate_limit
+        first_offer = await phone.next_event()
+        assert first_offer["type"] == "agent_limit_offer"
+        assert first_offer["data"]["status"] == "allowed_warning"
+
+        _push_rate_limit(client, session_id, status="rejected", utilization=1.0, uuid="rl-2")
+        await phone.next_event()  # rate_limit
+        escalated_offer = await phone.next_event()
+        assert escalated_offer["type"] == "agent_limit_offer"
+        assert escalated_offer["data"]["status"] == "rejected"
+
+        # One logical offer, not two - the very next thing on the wire
+        # after the escalation is an unrelated action's own event, not a
+        # second agent_limit_offer trailing behind it.
+        await phone.send_action({"kind": "send_message", "session_id": session_id, "text": "ok"})
+        next_event = await phone.next_event()
+        assert next_event["type"] == "user_message"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_allowed_reading_clears_an_unresolved_offer_with_no_resolve_action(
+    running_daemon, phone_token
+):
+    daemon, port, fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+        client = fake_clients[0]
+
+        _push_rate_limit(client, session_id, status="allowed_warning", utilization=0.82, uuid="rl-1")
+        await phone.next_event()  # rate_limit
+        offer_event = await phone.next_event()
+        assert offer_event["type"] == "agent_limit_offer"
+
+        _push_rate_limit(client, session_id, status="allowed", utilization=0.1, uuid="rl-2")
+        await phone.next_event()  # rate_limit
+        cleared_event = await phone.next_event()
+        assert cleared_event["type"] == "agent_limit_offer_resolved"
+        assert cleared_event["data"]["rate_limit_type"] == "five_hour"
+        assert cleared_event["data"]["resolution"] == "cleared"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_a_resets_at_in_the_past_reading_also_clears_an_active_offer_before_evaluating_fresh(
+    running_daemon, phone_token
+):
+    """KTD5's clearing condition (resets_at in the past) and a fresh raise
+    from that same reading's own (still-elevated) status aren't mutually
+    exclusive - this isolates that judgment call from the plain
+    fresh-allowed-status case covered above."""
+    daemon, port, fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+        client = fake_clients[0]
+
+        _push_rate_limit(client, session_id, status="allowed_warning", utilization=0.82, uuid="rl-1")
+        await phone.next_event()  # rate_limit
+        first_offer = await phone.next_event()
+        assert first_offer["type"] == "agent_limit_offer"
+
+        # This reading's own resets_at (epoch 1) has already passed, even
+        # though its status is still elevated - a brand-new window already
+        # past its own threshold at read time.
+        _push_rate_limit(client, session_id, status="allowed_warning", utilization=0.5, resets_at=1, uuid="rl-2")
+        await phone.next_event()  # rate_limit
+        cleared_event = await phone.next_event()
+        assert cleared_event["type"] == "agent_limit_offer_resolved"
+        assert cleared_event["data"]["resolution"] == "cleared"
+        new_offer = await phone.next_event()
+        assert new_offer["type"] == "agent_limit_offer"
+        assert new_offer["data"]["status"] == "allowed_warning"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_dismissing_an_offer_on_one_session_also_resolves_it_on_a_concurrent_sharing_session(
+    running_daemon, phone_token
+):
+    """AE3/R4: two sessions sharing the same (agent, rate_limit_type) key
+    (the same account-wide window) both see the resolution, not just the
+    session the dismiss action was dispatched against."""
+    daemon, port, fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/repo-a"})
+        started_a = await phone.next_event()
+        session_a = started_a["session_id"]
+
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/repo-b"})
+        started_b = await phone.next_event()
+        session_b = started_b["session_id"]
+
+        client_a = fake_clients[0]
+        _push_rate_limit(client_a, session_a, status="allowed_warning", utilization=0.82)
+        rate_limit_event = await phone.next_event()
+        assert rate_limit_event["session_id"] == session_a
+
+        offers_by_session = {}
+        for _ in range(2):
+            event = await phone.next_event()
+            assert event["type"] == "agent_limit_offer"
+            offers_by_session[event["session_id"]] = event
+        assert set(offers_by_session) == {session_a, session_b}
+
+        await phone.send_action(
+            {
+                "kind": "resolve_agent_limit_offer",
+                "session_id": session_a,
+                "rate_limit_type": "five_hour",
+                "decision": "dismiss",
+            }
+        )
+        resolved_by_session = {}
+        for _ in range(2):
+            event = await phone.next_event()
+            assert event["type"] == "agent_limit_offer_resolved"
+            assert event["data"]["resolution"] == "dismissed"
+            resolved_by_session[event["session_id"]] = event
+        assert set(resolved_by_session) == {session_a, session_b}
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_a_claude_and_codex_rate_limit_type_collision_keeps_their_offers_independent(
+    running_daemon_with_codex, phone_token
+):
+    """The `agent` component of the offer key is what keeps this apart -
+    without it, Claude's and Codex's own independent "primary" vocabularies
+    (a coincidental string collision) would conflate two unrelated
+    windows."""
+    daemon, port, fake_sdk_clients, fake_codex_clients = running_daemon_with_codex
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started_claude = await phone.next_event()
+        claude_session_id = started_claude["session_id"]
+
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo", "agent": "codex"})
+        started_codex = await phone.next_event()
+        codex_session_id = started_codex["session_id"]
+
+        sdk_client = fake_sdk_clients[0]
+        _push_rate_limit(sdk_client, claude_session_id, status="allowed_warning", utilization=0.9, rate_limit_type="primary")
+        await phone.next_event()  # rate_limit (claude)
+        claude_offer = await phone.next_event()
+        assert claude_offer["type"] == "agent_limit_offer"
+        assert claude_offer["data"]["agent"] == "claude_code"
+        assert claude_offer["data"]["rate_limit_type"] == "primary"
+
+        codex_client = fake_codex_clients[0]
+        codex_client._client.push(_rate_limits_notification(primary_used_percent=90, resets_at=4102444800))
+        await phone.next_event()  # rate_limit (codex)
+        codex_offer = await phone.next_event()
+        assert codex_offer["type"] == "agent_limit_offer"
+        assert codex_offer["data"]["agent"] == "codex"
+        assert codex_offer["data"]["rate_limit_type"] == "primary"
+
+        await phone.send_action(
+            {
+                "kind": "resolve_agent_limit_offer",
+                "session_id": claude_session_id,
+                "rate_limit_type": "primary",
+                "decision": "dismiss",
+            }
+        )
+        resolved = await phone.next_event()
+        assert resolved["type"] == "agent_limit_offer_resolved"
+        assert resolved["session_id"] == claude_session_id
+        assert resolved["data"]["agent"] == "claude_code"
+
+        # The Codex key for the same rate_limit_type string is untouched -
+        # proven by a harder Codex reading still escalating normally (it
+        # would be silently suppressed if the Claude dismiss above had
+        # wrongly resolved the Codex key too).
+        codex_client._client.push(_rate_limits_notification(primary_used_percent=100, resets_at=4102444800))
+        await phone.next_event()  # rate_limit (codex, rejected)
+        codex_escalated = await phone.next_event()
+        assert codex_escalated["type"] == "agent_limit_offer"
+        assert codex_escalated["data"]["status"] == "rejected"
+        assert codex_escalated["data"]["agent"] == "codex"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_a_dismissed_key_can_raise_a_new_offer_once_a_fresh_allowed_reading_clears_it(
+    running_daemon, phone_token
+):
+    daemon, port, fake_clients = running_daemon
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+        client = fake_clients[0]
+
+        _push_rate_limit(client, session_id, status="allowed_warning", utilization=0.82, uuid="rl-1")
+        await phone.next_event()  # rate_limit
+        await phone.next_event()  # agent_limit_offer
+
+        await phone.send_action(
+            {
+                "kind": "resolve_agent_limit_offer",
+                "session_id": session_id,
+                "rate_limit_type": "five_hour",
+                "decision": "dismiss",
+            }
+        )
+        resolved = await phone.next_event()
+        assert resolved["type"] == "agent_limit_offer_resolved"
+        assert resolved["data"]["resolution"] == "dismissed"
+
+        # Suppressed while dismissed - another approaching reading raises
+        # nothing further.
+        _push_rate_limit(client, session_id, status="allowed_warning", utilization=0.85, uuid="rl-2")
+        await phone.next_event()  # rate_limit
+        await phone.send_action({"kind": "send_message", "session_id": session_id, "text": "still suppressed?"})
+        next_event = await phone.next_event()
+        assert next_event["type"] == "user_message"
+
+        # A fresh "allowed" reading clears the remembered dismissal (KTD5) -
+        # silently, since there was no active offer left to clear (it was
+        # already resolved, not merely raised).
+        _push_rate_limit(client, session_id, status="allowed", utilization=0.1, uuid="rl-3")
+        await phone.next_event()  # rate_limit
+        await phone.send_action({"kind": "send_message", "session_id": session_id, "text": "cleared now"})
+        after_clear_event = await phone.next_event()
+        assert after_clear_event["type"] == "user_message"
+
+        # A subsequent approaching reading raises a brand-new offer.
+        _push_rate_limit(client, session_id, status="allowed_warning", utilization=0.85, uuid="rl-4")
+        await phone.next_event()  # rate_limit
+        new_offer = await phone.next_event()
+        assert new_offer["type"] == "agent_limit_offer"
+        assert new_offer["data"]["status"] == "allowed_warning"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_limit_offer_dismiss_only_emits_resolved_with_no_handoff(
+    running_daemon, phone_token, monkeypatch
+):
+    daemon, port, fake_clients = running_daemon
+    handoff_calls = []
+
+    async def fake_handoff(session_id, agent, rate_limit_type):
+        handoff_calls.append((session_id, agent, rate_limit_type))
+
+    monkeypatch.setattr(daemon, "_start_agent_handoff", fake_handoff)
+
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+        client = fake_clients[0]
+
+        _push_rate_limit(client, session_id, status="allowed_warning", utilization=0.82)
+        await phone.next_event()  # rate_limit
+        await phone.next_event()  # agent_limit_offer
+
+        await phone.send_action(
+            {
+                "kind": "resolve_agent_limit_offer",
+                "session_id": session_id,
+                "rate_limit_type": "five_hour",
+                "decision": "dismiss",
+            }
+        )
+        resolved = await phone.next_event()
+        assert resolved["type"] == "agent_limit_offer_resolved"
+        assert resolved["data"]["resolution"] == "dismissed"
+        assert handoff_calls == []
+
+        # No agent_handoff_result trails behind it either - the next event
+        # on the wire is an unrelated action's own event.
+        await phone.send_action({"kind": "send_message", "session_id": session_id, "text": "done"})
+        next_event = await phone.next_event()
+        assert next_event["type"] == "user_message"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_limit_offer_accept_emits_resolved_then_calls_the_u3_handoff_seam(
+    running_daemon, phone_token, monkeypatch
+):
+    daemon, port, fake_clients = running_daemon
+    handoff_calls = []
+
+    async def fake_handoff(session_id, agent, rate_limit_type):
+        handoff_calls.append((session_id, agent, rate_limit_type))
+
+    monkeypatch.setattr(daemon, "_start_agent_handoff", fake_handoff)
+
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+        client = fake_clients[0]
+
+        _push_rate_limit(client, session_id, status="allowed_warning", utilization=0.82)
+        await phone.next_event()  # rate_limit
+        await phone.next_event()  # agent_limit_offer
+
+        await phone.send_action(
+            {
+                "kind": "resolve_agent_limit_offer",
+                "session_id": session_id,
+                "rate_limit_type": "five_hour",
+                "decision": "accept",
+            }
+        )
+        resolved = await phone.next_event()
+        assert resolved["type"] == "agent_limit_offer_resolved"
+        assert resolved["data"]["resolution"] == "accepted"
+        assert handoff_calls == [(session_id, "claude_code", "five_hour")]
+    finally:
+        await phone.close()

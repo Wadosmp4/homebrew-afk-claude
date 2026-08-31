@@ -127,6 +127,36 @@ EVENT_TYPES = frozenset(
         # no content back (the client already has what it just sent);
         # ChangesScreen re-dispatches git_diff itself to refresh (KTD7).
         "write_session_file",
+        # Agent Limit Handoff plan, U2 (KTD2): daemon-derived (daemon.py's
+        # own (agent, rate_limit_type)-keyed offer state - see that
+        # module's _handle_rate_limit_reading), never adapter-emitted
+        # directly - kept distinct from "rate_limit" so the Usage Limits
+        # modal (an existing "rate_limit" consumer) is unaffected. Carries
+        # the triggering `rate_limit_type`, `status`, the source `agent`,
+        # and `offered_agent` (the other agent this offer proposes handing
+        # off to). Mirrors permission_request/permission_resolved's own
+        # durable-resolution shape one level up: one offer can be raised,
+        # escalated in place (same event type, harder `status`), and later
+        # resolved - never a second live offer for the same key.
+        "agent_limit_offer",
+        # Agent Limit Handoff plan, U2 (KTD2): resolves an "agent_limit_offer"
+        # for the same (agent, rate_limit_type) key - `resolution` is
+        # "dismissed"/"accepted" (a phone's explicit
+        # resolve_agent_limit_offer action - see daemon.py's
+        # _resolve_agent_limit_offer) or "cleared" (the underlying reading
+        # returned to "allowed", or the window reset, before the offer was
+        # ever acted on - daemon.py's own judgment call, documented there,
+        # to give mobile's replay-safe scan an explicit signal that a
+        # previously-shown card should disappear, the same way
+        # permission_resolved already does for permission_request).
+        "agent_limit_offer_resolved",
+        # Agent Limit Handoff plan, U3 (KTD2): the async outcome of an
+        # accepted "agent_limit_offer" - `ok: true` + new `session_id` +
+        # destination `agent`, or `ok: false` + a specific, user-facing
+        # `reason` string (never a raw exception message). Registered here
+        # by U2 per the plan's own file list, but not yet emitted by
+        # anything - see daemon.py's _start_agent_handoff, U3's seam.
+        "agent_handoff_result",
     }
 )
 

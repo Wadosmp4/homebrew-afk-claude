@@ -357,6 +357,24 @@ class CompanionDaemon:
         # pruning already accepts, and one lock per distinct edited file
         # this daemon has ever seen is not a real memory concern.
         self._write_session_file_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        # Agent Limit Handoff plan, U2 (KTD3): one derived offer per
+        # (agent, rate_limit_type), scoped to this daemon instance - not
+        # persisted, not per-session - mirroring rate_limit_estimator.py's
+        # own "account-wide condition" scoping precedent (see that
+        # module's docstring). (agent, rate_limit_type) -> the rate_limit
+        # `status` ("allowed_warning"/"rejected") that raised/last-escalated
+        # the currently-active, still-unresolved offer for that key; absent
+        # entirely once there is no active offer (cleared or never raised).
+        self._agent_limit_offers: dict[tuple[str, str], str] = {}
+        # (agent, rate_limit_type) -> "dismissed"/"accepted" once a phone
+        # has resolved that key via resolve_agent_limit_offer - suppresses
+        # re-raising until KTD5's own reset conditions clear this entry
+        # (see _clear_agent_limit_offer). Deliberately a separate dict from
+        # the one above rather than folding "resolved" into the same value
+        # space: a key can be resolved while genuinely having no entry in
+        # _agent_limit_offers at all (the offer was popped the moment it
+        # was resolved), so they track two independent facts.
+        self._agent_limit_resolutions: dict[tuple[str, str], str] = {}
 
     def stop(self) -> None:
         """Request a graceful stop. `run()` returns once the current
@@ -753,6 +771,16 @@ class CompanionDaemon:
                     action.get("request_id"),
                     action.get("decision"),
                     message=action.get("message", ""),
+                )
+            elif kind == "resolve_agent_limit_offer":
+                # Agent Limit Handoff plan, U2 (KTD4): mirrors
+                # respond_to_permission's own decision-parameter shape one
+                # line up - dispatched here rather than through `adapter`
+                # itself (unlike respond_to_permission, this isn't an
+                # adapter capability - the offer state lives on the daemon,
+                # not on any one session's adapter).
+                await self._resolve_agent_limit_offer(
+                    adapter, session_id, action.get("rate_limit_type"), action.get("decision")
                 )
             elif kind == "git_status":
                 await self._handle_git_status(adapter, session_id)
@@ -1655,6 +1683,20 @@ class CompanionDaemon:
                         await asyncio.to_thread(
                             session_registry.mark_session_ended, session_id, self.session_registry_path
                         )
+                # Agent Limit Handoff plan, U2 (KTD3): this is the one
+                # point every adapter-emitted event already crosses on its
+                # way to the phone, so it's also the one place to watch for
+                # a REAL "rate_limit" reading (never "rate_limit_estimate" -
+                # a calibrated guess alone must never raise an offer, R2's
+                # own key decision) and derive/escalate/clear this key's
+                # offer from it. `_agent_for_adapter` returns None for any
+                # adapter other than sdk_adapter/codex_adapter (ObserveAdapter
+                # never emits "rate_limit" at all - see events.py's own
+                # comment on that event type), so this is unreachable there.
+                if event.type == "rate_limit":
+                    agent = self._agent_for_adapter(adapter)
+                    if agent is not None:
+                        self._handle_rate_limit_reading(agent, event.data)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1662,6 +1704,172 @@ class CompanionDaemon:
         finally:
             self._forwarding.pop(session_id, None)
             self._forwarding_adapter.pop(session_id, None)
+
+    def _agent_for_adapter(self, adapter) -> Optional[str]:
+        """Agent Limit Handoff plan, U2 (KTD3): the `agent` half of an
+        offer's (agent, rate_limit_type) key. Only sdk_adapter/codex_adapter
+        ever drive a session through a real agent process - observe_adapter
+        watches a transcript it doesn't itself own and never emits
+        "rate_limit" (events.py's own comment on that event type), so it
+        deliberately has no mapping here; a caller that somehow reaches this
+        for an unrecognized adapter gets None back rather than a guess."""
+        if adapter is self.sdk_adapter:
+            return "claude_code"
+        if adapter is self.codex_adapter:
+            return "codex"
+        return None
+
+    def _adapter_for_agent(self, agent: str) -> AdapterProtocol:
+        return self.sdk_adapter if agent == "claude_code" else self.codex_adapter
+
+    def _broadcast_agent_limit_event(self, agent: str, type_: str, **data: Any) -> None:
+        """Agent Limit Handoff plan, U2 (KTD3): "Raising, escalating, or
+        resolving an offer for a key emits the corresponding event to
+        EVERY session id currently tracked under that key, not only the
+        session whose reading triggered the change" - since the offer is
+        one account-wide condition, every currently-live session driven by
+        this `agent` counts as "tracked under that key", not just sessions
+        that happen to have seen this exact rate_limit_type before.
+        `discover_sessions()` is read fresh here rather than cached, so a
+        session that ended between the triggering reading and this call is
+        never handed a doomed emit_custom (KeyError on an already-popped
+        session)."""
+        adapter = self._adapter_for_agent(agent)
+        for session_id in adapter.discover_sessions():
+            adapter.emit_custom(session_id, type_, agent=agent, **data)
+
+    def _emit_agent_limit_offer(
+        self, agent: str, rate_limit_type: str, status: str, utilization: Optional[float], resets_at: Optional[int]
+    ) -> None:
+        offered_agent = "codex" if agent == "claude_code" else "claude_code"
+        self._broadcast_agent_limit_event(
+            agent,
+            "agent_limit_offer",
+            offered_agent=offered_agent,
+            rate_limit_type=rate_limit_type,
+            status=status,
+            utilization=utilization,
+            resets_at=resets_at,
+        )
+
+    def _emit_agent_limit_offer_resolved(self, agent: str, rate_limit_type: str, resolution: str) -> None:
+        self._broadcast_agent_limit_event(
+            agent, "agent_limit_offer_resolved", rate_limit_type=rate_limit_type, resolution=resolution
+        )
+
+    @staticmethod
+    def _agent_limit_window_has_reset(resets_at: Any) -> bool:
+        """KTD5: "a later rate_limit reading for that key carries a
+        resets_at in the past" - resets_at is the CLI/Codex's own raw
+        epoch-seconds field (see sdk_adapter.py's RateLimitEvent handling
+        and codex_adapter.py's RateLimitWindow.resetsAt), never an ISO
+        string, so this is a plain numeric comparison. A missing/malformed
+        value (None, or any non-numeric payload) is never treated as
+        "passed" - there's nothing honest to compare against."""
+        if not isinstance(resets_at, (int, float)) or isinstance(resets_at, bool):
+            return False
+        return resets_at <= datetime.now(timezone.utc).timestamp()
+
+    def _clear_agent_limit_offer(self, agent: str, rate_limit_type: str) -> None:
+        """KTD5: clears both the active-offer state and any remembered
+        dismissal/acceptance for this key - called when a real rate_limit
+        reading shows either the window has reset or a fresh "allowed"
+        status, "regardless of whether the offer was ever resolved". Design
+        judgment call (state-diagram's own bracketed note): when an offer
+        was actively showing and still unresolved, an explicit
+        agent_limit_offer_resolved with resolution="cleared" is broadcast
+        too, so mobile's replay-safe scan (the same findPendingPermission-
+        style pattern permission_resolved already supports) has a positive
+        signal to retire a previously-shown card that neither dismiss nor
+        accept ever touched. When the key was already resolved (no active
+        offer left to clear), only the remembered resolution itself is
+        dropped - silently, per the state diagram's own "no new event
+        needed" note for that branch."""
+        key = (agent, rate_limit_type)
+        had_active_offer = self._agent_limit_offers.pop(key, None) is not None
+        self._agent_limit_resolutions.pop(key, None)
+        if had_active_offer:
+            self._emit_agent_limit_offer_resolved(agent, rate_limit_type, "cleared")
+
+    def _handle_rate_limit_reading(self, agent: str, data: dict[str, Any]) -> None:
+        """Agent Limit Handoff plan, U2 (KTD3/KTD5): derives, escalates, or
+        clears one agent_limit_offer for (agent, data["rate_limit_type"])
+        from a single real "rate_limit" event's data. Callers must already
+        have filtered to event.type == "rate_limit" - this has no way to
+        tell a real reading from an estimate on its own once it only has
+        the bare data dict, so that check has to happen upstream (see
+        _forward_events)."""
+        rate_limit_type = data.get("rate_limit_type")
+        status = data.get("status")
+        if not rate_limit_type or not status:
+            return  # nothing to key an offer on - see sdk_adapter.py's own note that rate_limit_type/status can be nullable
+        resets_at = data.get("resets_at")
+        if status == "allowed" or self._agent_limit_window_has_reset(resets_at):
+            self._clear_agent_limit_offer(agent, rate_limit_type)
+            if status == "allowed":
+                return
+            # Judgment call: resets_at already passed, but this very
+            # reading's own status is still allowed_warning/rejected (a
+            # brand-new window already past its own threshold at read
+            # time) - fall through and evaluate it fresh below rather than
+            # silently swallowing a genuinely elevated current reading just
+            # because the same event also cleared stale pre-reset state.
+        if status not in ("allowed_warning", "rejected"):
+            return  # an unrecognized/future status value - fail closed, no offer
+        key = (agent, rate_limit_type)
+        if key in self._agent_limit_resolutions:
+            return  # already dismissed/accepted for this window - suppressed until it resets (KTD5)
+        current = self._agent_limit_offers.get(key)
+        if current == status or current == "rejected":
+            # Identical reading (nothing changed), or already at max
+            # severity - "rejected" never downgrades in place back to
+            # "allowed_warning" from a harder reading (the diagram only
+            # ever escalates upward; a softer subsequent reading before the
+            # window resets is treated as noise, not a real de-escalation).
+            return
+        self._agent_limit_offers[key] = status
+        self._emit_agent_limit_offer(agent, rate_limit_type, status, data.get("utilization"), resets_at)
+
+    async def _resolve_agent_limit_offer(
+        self, adapter, session_id: str, rate_limit_type: Optional[str], decision: Optional[str]
+    ) -> None:
+        """Agent Limit Handoff plan, U2 (KTD4): the `resolve_agent_limit_offer`
+        action's handler - mirrors respond_to_permission's own
+        decision-parameter shape. A "dismiss" only emits
+        agent_limit_offer_resolved; "accept" emits it too, then hands off
+        to _start_agent_handoff (U3's seam, below - still a stub here)."""
+        agent = self._agent_for_adapter(adapter)
+        if agent is None or not rate_limit_type or decision not in ("accept", "dismiss"):
+            logger.warning(
+                "rejected resolve_agent_limit_offer: session_id=%r agent=%r rate_limit_type=%r decision=%r",
+                session_id,
+                agent,
+                rate_limit_type,
+                decision,
+            )
+            return
+        key = (agent, rate_limit_type)
+        resolution = "accepted" if decision == "accept" else "dismissed"
+        self._agent_limit_offers.pop(key, None)
+        self._agent_limit_resolutions[key] = resolution
+        self._emit_agent_limit_offer_resolved(agent, rate_limit_type, resolution)
+        if decision == "accept":
+            await self._start_agent_handoff(session_id, agent, rate_limit_type)
+
+    async def _start_agent_handoff(self, session_id: str, agent: str, rate_limit_type: str) -> None:
+        # TODO(U3): orchestrate the actual handoff - start a fresh session
+        # with the *other* agent (daemon.py's own _VALID_AGENTS: the
+        # opposite of `agent`) on the same working directory, compose
+        # whatever digest/diff context it should be seeded with (see
+        # digest.py's existing compose_digest/session_digest machinery for
+        # likely reuse), and emit "agent_handoff_result" once it completes:
+        # {ok: True, session_id: <new session_id>, agent: <destination
+        # agent>} on success, or {ok: False, reason: <specific, user-facing
+        # string - never a raw exception message>} on failure. This method
+        # is the seam U3 fills in - U2's own scope ends at calling it here,
+        # from the accept branch of _resolve_agent_limit_offer above, as a
+        # no-op.
+        return
 
     def _effective_cli_env(self) -> dict[str, str]:
         """KTD1/KTD3: the env a new SDK-owned session actually launches
