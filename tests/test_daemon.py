@@ -4500,3 +4500,395 @@ async def test_resolve_agent_limit_offer_accept_emits_resolved_then_calls_the_u3
         assert handoff_calls == [(session_id, "claude_code", "five_hour")]
     finally:
         await phone.close()
+
+
+# --- Agent Limit Handoff plan, U3: actual handoff orchestration ----------
+
+
+def _git(cwd, *args) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+def _init_handoff_repo(repo_dir) -> None:
+    """A minimal real git repo (mirrors test_git_status.py's own `repo`
+    fixture) with one committed file, then changed - just enough for
+    _compose_handoff_diff to have real diff content to fold into a
+    handoff's seed message. No mocking of `git` itself, matching
+    test_git_status.py's own test scenarios."""
+    repo_dir.mkdir()
+    _git(repo_dir, "init", "-q")
+    _git(repo_dir, "config", "user.email", "test@example.com")
+    _git(repo_dir, "config", "user.name", "Test")
+    (repo_dir / "committed.txt").write_text("original\n")
+    _git(repo_dir, "add", "committed.txt")
+    _git(repo_dir, "commit", "-q", "-m", "Initial commit")
+    (repo_dir / "committed.txt").write_text("changed content\n")
+
+
+@pytest.mark.asyncio
+async def test_accepted_claude_originated_handoff_seeds_new_codex_session_with_digest_and_diff(
+    running_daemon_with_codex, phone_token, tmp_path, monkeypatch
+):
+    """Scenarios 1 & 6: a Claude-originated handoff that's accepted starts
+    a fresh Codex session on the same cwd, reports ok=True + the new
+    session's id back on the *origin* session's own stream, and seeds the
+    new session's first message with both the digest and the diff - driven
+    end to end through the real resolve_agent_limit_offer dispatch path
+    (offer -> resolve -> handoff -> result), the same way U2's own tests
+    exercise resolve_agent_limit_offer, rather than calling
+    daemon._start_agent_handoff directly."""
+    from companion import digest as digest_module
+    from companion import history as history_module
+
+    daemon, port, fake_sdk_clients, _fake_codex_clients = running_daemon_with_codex
+    repo_dir = tmp_path / "handoff-repo"
+    _init_handoff_repo(repo_dir)
+
+    def _fake_read_session_history(session_id, projects_dir=None):
+        return [{"type": "assistant_message", "timestamp": "t1", "data": {"text": "did a thing"}}]
+
+    async def _fake_generate_digest(events, **kwargs):
+        return "Refactored the widget loader."
+
+    monkeypatch.setattr(history_module, "read_session_history", _fake_read_session_history)
+    monkeypatch.setattr(digest_module, "generate_digest", _fake_generate_digest)
+
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": str(repo_dir)})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+        client = fake_sdk_clients[0]
+
+        _push_rate_limit(client, session_id, status="allowed_warning", utilization=0.9)
+        await phone.next_event()  # rate_limit
+        offer = await phone.next_event()
+        assert offer["type"] == "agent_limit_offer"
+
+        await phone.send_action(
+            {
+                "kind": "resolve_agent_limit_offer",
+                "session_id": session_id,
+                "rate_limit_type": "five_hour",
+                "decision": "accept",
+            }
+        )
+
+        # The remaining 4 events (resolved + the new session's own
+        # session_started/user_message + the origin's own final
+        # agent_handoff_result) can interleave across the two sessions'
+        # independent forwarder tasks - collected as a flat batch and
+        # partitioned by session_id rather than assumed in a fixed global
+        # order. Order *within* one session's own stream is still causal
+        # (single queue, single forwarder) and asserted below.
+        events = [await phone.next_event() for _ in range(4)]
+        by_session: dict = {}
+        for event in events:
+            by_session.setdefault(event["session_id"], []).append(event)
+
+        other_ids = [sid for sid in by_session if sid != session_id]
+        assert len(other_ids) == 1
+        new_session_id = other_ids[0]
+
+        origin_events = by_session[session_id]
+        assert [e["type"] for e in origin_events] == ["agent_limit_offer_resolved", "agent_handoff_result"]
+        assert origin_events[0]["data"]["resolution"] == "accepted"
+        result = origin_events[1]["data"]
+        assert result["ok"] is True
+        assert result["new_session_id"] == new_session_id
+        assert result["agent"] == "codex"  # differs from the origin's own "claude_code" (scenario 6)
+
+        new_events = by_session[new_session_id]
+        assert [e["type"] for e in new_events] == ["session_started", "user_message"]
+        assert new_events[0]["data"]["agent"] == "codex"
+        seed_text = new_events[1]["data"]["text"]
+        assert "Refactored the widget loader." in seed_text
+        assert "-original" in seed_text
+        assert "+changed content" in seed_text
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_accepted_codex_originated_handoff_seeds_new_claude_session_with_diff_only_no_digest(
+    running_daemon_with_codex, phone_token, tmp_path, monkeypatch
+):
+    """Scenarios 2 & 6: a Codex-originated handoff skips the digest
+    entirely - permanently, not as a failure case, since Codex sessions
+    have no persisted on-disk transcript generate_digest could read (see
+    _compose_handoff_seed_message's own docstring) - but still succeeds,
+    seeding the new Claude session with just the diff."""
+    from companion import digest as digest_module
+
+    daemon, port, _fake_sdk_clients, fake_codex_clients = running_daemon_with_codex
+    repo_dir = tmp_path / "handoff-repo"
+    _init_handoff_repo(repo_dir)
+
+    async def _digest_must_not_be_called(*args, **kwargs):
+        raise AssertionError("generate_digest must never be called for a Codex-originated handoff")
+
+    monkeypatch.setattr(digest_module, "generate_digest", _digest_must_not_be_called)
+
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": str(repo_dir), "agent": "codex"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+        codex_client = fake_codex_clients[0]
+
+        codex_client._client.push(_rate_limits_notification(primary_used_percent=90, resets_at=4102444800))
+        await phone.next_event()  # rate_limit
+        offer = await phone.next_event()
+        assert offer["type"] == "agent_limit_offer"
+        assert offer["data"]["agent"] == "codex"
+
+        await phone.send_action(
+            {
+                "kind": "resolve_agent_limit_offer",
+                "session_id": session_id,
+                "rate_limit_type": "primary",
+                "decision": "accept",
+            }
+        )
+
+        events = [await phone.next_event() for _ in range(4)]
+        by_session: dict = {}
+        for event in events:
+            by_session.setdefault(event["session_id"], []).append(event)
+
+        other_ids = [sid for sid in by_session if sid != session_id]
+        assert len(other_ids) == 1
+        new_session_id = other_ids[0]
+
+        origin_events = by_session[session_id]
+        assert [e["type"] for e in origin_events] == ["agent_limit_offer_resolved", "agent_handoff_result"]
+        result = origin_events[1]["data"]
+        assert result["ok"] is True
+        assert result["new_session_id"] == new_session_id
+        assert result["agent"] == "claude_code"  # differs from the origin's own "codex" (scenario 6)
+
+        new_events = by_session[new_session_id]
+        assert [e["type"] for e in new_events] == ["session_started", "user_message"]
+        seed_text = new_events[1]["data"]["text"]
+        assert "No summary is available for this handoff" in seed_text
+        assert "-original" in seed_text
+        assert "+changed content" in seed_text
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_accepted_claude_originated_handoff_falls_back_to_no_digest_line_when_digest_generation_fails(
+    running_daemon_with_codex, phone_token, tmp_path, monkeypatch
+):
+    """Scenario 3: digest.generate_digest's own documented fail-closed
+    contract (returns None - no ANTHROPIC_API_KEY, timeout, any other
+    failure) must not block the handoff - it only degrades the seed
+    message to _HANDOFF_NO_DIGEST_LINE, seeded alongside the diff exactly
+    as it would be otherwise."""
+    from companion import daemon as daemon_module
+    from companion import digest as digest_module
+    from companion import history as history_module
+
+    daemon, port, fake_sdk_clients, _fake_codex_clients = running_daemon_with_codex
+    repo_dir = tmp_path / "handoff-repo"
+    _init_handoff_repo(repo_dir)
+
+    monkeypatch.setattr(
+        history_module,
+        "read_session_history",
+        lambda session_id, projects_dir=None: [{"type": "assistant_message", "timestamp": "t1", "data": {}}],
+    )
+
+    async def _fake_generate_digest_returns_none(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(digest_module, "generate_digest", _fake_generate_digest_returns_none)
+
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": str(repo_dir)})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+        client = fake_sdk_clients[0]
+
+        _push_rate_limit(client, session_id, status="allowed_warning", utilization=0.9)
+        await phone.next_event()  # rate_limit
+        await phone.next_event()  # agent_limit_offer
+
+        await phone.send_action(
+            {
+                "kind": "resolve_agent_limit_offer",
+                "session_id": session_id,
+                "rate_limit_type": "five_hour",
+                "decision": "accept",
+            }
+        )
+
+        events = [await phone.next_event() for _ in range(4)]
+        by_session: dict = {}
+        for event in events:
+            by_session.setdefault(event["session_id"], []).append(event)
+
+        other_ids = [sid for sid in by_session if sid != session_id]
+        assert len(other_ids) == 1
+        new_session_id = other_ids[0]
+
+        result = by_session[session_id][1]["data"]
+        assert result["ok"] is True  # a fail-closed digest never fails the handoff itself
+
+        seed_text = by_session[new_session_id][1]["data"]["text"]
+        assert daemon_module._HANDOFF_NO_DIGEST_LINE in seed_text
+        assert "+changed content" in seed_text
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_accepted_handoff_reports_ok_false_when_the_destination_session_fails_to_start(
+    running_daemon_with_codex, phone_token, tmp_path, monkeypatch
+):
+    """Scenario 5: _start_session_for_agent raising for the destination
+    agent (simulated here by making codex_adapter.connect blow up) must
+    surface as a specific, user-facing ok=False reason on the *origin*
+    session's own stream - never an unanswered accept, and never a raw
+    exception message leaking into the reason string."""
+    from companion import history as history_module
+
+    daemon, port, fake_sdk_clients, _fake_codex_clients = running_daemon_with_codex
+    repo_dir = tmp_path / "handoff-repo"
+    _init_handoff_repo(repo_dir)
+
+    # No digest work is needed to prove this failure path - a bare None
+    # keeps this test focused on the destination-start failure alone.
+    monkeypatch.setattr(history_module, "read_session_history", lambda *a, **k: None)
+
+    async def _raise_on_connect(*args, **kwargs):
+        raise RuntimeError("thread_start blew up")
+
+    monkeypatch.setattr(daemon.codex_adapter, "connect", _raise_on_connect)
+
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": str(repo_dir)})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+        client = fake_sdk_clients[0]
+
+        _push_rate_limit(client, session_id, status="allowed_warning", utilization=0.9)
+        await phone.next_event()  # rate_limit
+        await phone.next_event()  # agent_limit_offer
+
+        await phone.send_action(
+            {
+                "kind": "resolve_agent_limit_offer",
+                "session_id": session_id,
+                "rate_limit_type": "five_hour",
+                "decision": "accept",
+            }
+        )
+
+        resolved = await phone.next_event()
+        assert resolved["type"] == "agent_limit_offer_resolved"
+
+        result_event = await phone.next_event()
+        assert result_event["type"] == "agent_handoff_result"
+        assert result_event["session_id"] == session_id
+        assert result_event["data"]["ok"] is False
+        assert result_event["data"]["reason"] == "Could not start a new Codex session."
+        assert "RuntimeError" not in result_event["data"]["reason"]
+        assert "thread_start blew up" not in result_event["data"]["reason"]
+
+        # No event is left unsent afterward - the very next event on the
+        # wire is an unrelated, later action's own event, not some
+        # trailing/duplicate handoff artifact.
+        await phone.send_action({"kind": "send_message", "session_id": session_id, "text": "still alive?"})
+        next_event = await phone.next_event()
+        assert next_event["type"] == "user_message"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_compose_handoff_diff_reports_a_clean_working_tree_when_nothing_changed(tmp_path):
+    """Scenario 4 (zero changed files)."""
+    daemon = _bare_daemon(tmp_path)
+    repo_dir = tmp_path / "clean-repo"
+    repo_dir.mkdir()
+    _git(repo_dir, "init", "-q")
+    _git(repo_dir, "config", "user.email", "test@example.com")
+    _git(repo_dir, "config", "user.name", "Test")
+    (repo_dir / "a.txt").write_text("hello\n")
+    _git(repo_dir, "add", "a.txt")
+    _git(repo_dir, "commit", "-q", "-m", "init")
+
+    diff_text = await daemon._compose_handoff_diff(str(repo_dir))
+
+    assert diff_text == "No local changes (working tree is clean)."
+
+
+@pytest.mark.asyncio
+async def test_compose_handoff_diff_includes_a_single_changed_files_unified_diff(tmp_path):
+    """Scenario 4 (one changed file)."""
+    daemon = _bare_daemon(tmp_path)
+    repo_dir = tmp_path / "one-change-repo"
+    _init_handoff_repo(repo_dir)
+
+    diff_text = await daemon._compose_handoff_diff(str(repo_dir))
+
+    assert "diff --git a/committed.txt b/committed.txt" in diff_text
+    assert "-original" in diff_text
+    assert "+changed content" in diff_text
+
+
+@pytest.mark.asyncio
+async def test_compose_handoff_diff_concatenates_diffs_for_every_changed_file(tmp_path):
+    """Scenario 4 (many changed files, mixing modified and added)."""
+    daemon = _bare_daemon(tmp_path)
+    repo_dir = tmp_path / "many-changes-repo"
+    repo_dir.mkdir()
+    _git(repo_dir, "init", "-q")
+    _git(repo_dir, "config", "user.email", "test@example.com")
+    _git(repo_dir, "config", "user.name", "Test")
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (repo_dir / name).write_text(f"{name} original\n")
+    _git(repo_dir, "add", "a.txt", "b.txt", "c.txt")
+    _git(repo_dir, "commit", "-q", "-m", "init")
+    (repo_dir / "a.txt").write_text("a.txt changed\n")
+    (repo_dir / "b.txt").write_text("b.txt changed\n")
+    (repo_dir / "d.txt").write_text("brand new\n")  # untracked -> "added"
+
+    diff_text = await daemon._compose_handoff_diff(str(repo_dir))
+
+    assert "diff --git a/a.txt b/a.txt" in diff_text
+    assert "diff --git a/b.txt b/b.txt" in diff_text
+    assert "diff --git a/d.txt b/d.txt" in diff_text
+    assert "a.txt changed" in diff_text
+    assert "b.txt changed" in diff_text
+    assert "brand new" in diff_text
+    assert "c.txt" not in diff_text  # unchanged file never enters the diff at all
+
+
+@pytest.mark.asyncio
+async def test_compose_handoff_diff_falls_back_to_a_file_list_summary_over_the_char_cap(tmp_path):
+    """Scenario 4 (a changeset exceeding _MAX_HANDOFF_DIFF_CHARS)."""
+    daemon = _bare_daemon(tmp_path)
+    repo_dir = tmp_path / "huge-change-repo"
+    repo_dir.mkdir()
+    _git(repo_dir, "init", "-q")
+    _git(repo_dir, "config", "user.email", "test@example.com")
+    _git(repo_dir, "config", "user.name", "Test")
+    (repo_dir / "big.txt").write_text("line\n" * 10)
+    _git(repo_dir, "add", "big.txt")
+    _git(repo_dir, "commit", "-q", "-m", "init")
+    # A diff comfortably over _MAX_HANDOFF_DIFF_CHARS (20_000) - every line
+    # changed, each long enough that the unified diff itself (not just the
+    # raw file content) clears the cap.
+    (repo_dir / "big.txt").write_text(("x" * 200 + "\n") * 200)
+
+    diff_text = await daemon._compose_handoff_diff(str(repo_dir))
+
+    assert "diff omitted" in diff_text
+    assert "20000-character handoff cap" in diff_text
+    assert "- big.txt" in diff_text
+    assert "diff --git" not in diff_text  # the actual diff content itself never leaks through

@@ -146,6 +146,33 @@ _VALID_AGENTS = frozenset({"claude_code", "codex"})
 # an effect.
 _RESUME_WORTHY_ACTION_KINDS = frozenset({"send_message", "respond_to_permission"})
 
+# Agent Limit Handoff plan, U3 (KTD6): a short, generic line substituted
+# for an actual digest whenever generate_digest is skipped (Codex-
+# originated handoff - no persisted on-disk transcript to summarize) or
+# returns None (Claude-originated, fail-closed) - see
+# CompanionDaemon._compose_handoff_seed_message. Never blocks the handoff;
+# only degrades its seed message.
+_HANDOFF_NO_DIGEST_LINE = (
+    "No summary is available for this handoff - see the diff below for what's changed so far."
+)
+
+# Agent Limit Handoff plan, U3 (KTD6): caps the *characters* of
+# concatenated diff content folded into a handoff's seed message. There's
+# no existing diff-sized bounding precedent to reuse directly - digest.py's
+# MAX_EVENTS_IN_PROMPT bounds a transcript by event count, not character
+# count, and git_status.py has no whole-tree diff concept at all - so this
+# is a fresh, explicitly-chosen constant: generous enough for a normal
+# in-progress changeset, small enough that a huge one degrades to a
+# file-list summary (CompanionDaemon._compose_handoff_diff) instead of
+# ballooning the new session's very first turn.
+_MAX_HANDOFF_DIFF_CHARS = 20_000
+
+# Agent Limit Handoff plan, U3: human-readable labels for the handoff seed
+# message and its user-facing failure reasons - _VALID_AGENTS' wire values
+# ("claude_code"/"codex") are internal identifiers, not something to show
+# the person reading the new session's first message or a rejection reason.
+_AGENT_DISPLAY_NAMES = {"claude_code": "Claude Code", "codex": "Codex"}
+
 # KTD4: set_personal_account_token's raw pasted token rides straight in the
 # action dict - _handle_action's generic exception logger (below) logs the
 # whole action on any dispatch failure, which would otherwise print it even
@@ -375,6 +402,17 @@ class CompanionDaemon:
         # _agent_limit_offers at all (the offer was popped the moment it
         # was resolved), so they track two independent facts.
         self._agent_limit_resolutions: dict[tuple[str, str], str] = {}
+        # Agent Limit Handoff plan, U3: the one currently-serving connection
+        # (or None while connecting/reconnecting) - set/cleared by
+        # _serve_connection. _start_agent_handoff needs a `ws` to spawn the
+        # handed-off session's own forwarder on (via _start_session_for_agent),
+        # but it's reached from _resolve_agent_limit_offer, several calls
+        # below the one place `ws` is naturally in scope
+        # (_dispatch_session_scoped_action) - threading it down through
+        # every intermediate signature was rejected in favor of this, since
+        # there is only ever at most one live connection at a time (this
+        # module's own docstring: "connecting -> connected -> ...").
+        self._active_ws: Optional["websockets.WebSocketClientProtocol"] = None
 
     def stop(self) -> None:
         """Request a graceful stop. `run()` returns once the current
@@ -425,6 +463,7 @@ class CompanionDaemon:
         """Run heartbeat, inbound-action handling, and observe-session
         discovery concurrently until the connection drops or a stop is
         requested - whichever happens first tears down the others."""
+        self._active_ws = ws
         tasks = [
             asyncio.create_task(self._heartbeat_loop(ws)),
             asyncio.create_task(self._receive_loop(ws)),
@@ -438,6 +477,7 @@ class CompanionDaemon:
                 if exc is not None:
                     raise exc
         finally:
+            self._active_ws = None
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -518,92 +558,23 @@ class CompanionDaemon:
                     "rejected start_session agent %r: must be one of %r", agent, sorted(_VALID_AGENTS)
                 )
                 return
-            session_id = str(uuid4())
-            adapter: AdapterProtocol = self.codex_adapter if agent == "codex" else self.sdk_adapter
             try:
-                if agent == "codex":
-                    # No permission_mode: Codex has no interactive
-                    # per-tool-call approval concept (see codex_adapter.py's
-                    # module docstring, spike-finding #2) - it runs under
-                    # its own ApprovalMode.auto_review instead.
-                    #
-                    # U2 (PKTD3): api_key mirrors _effective_cli_env's own
-                    # active_account branch above, one level simpler - Codex
-                    # has no ambient-env-precedence-stripping concern to
-                    # replicate (KTD3), just "pass the configured personal
-                    # key under 'personal', pass nothing under 'vscode'".
-                    # Only ever reads codex_active_account/
-                    # codex_personal_api_key, never Claude's own
-                    # active_account/personal_oauth_token (R10).
-                    #
-                    # Merge (main): client_request_id (bug fix, user report -
-                    # 2aba83b) applies equally to Codex-started sessions -
-                    # mobile's reduceEvent() matches ANY session_started event
-                    # by client_request_id regardless of agent, so omitting it
-                    # here would silently regress that fix back to cwd-string
-                    # matching for Codex sessions specifically.
-                    await self.codex_adapter.connect(
-                        session_id,
-                        cwd=action.get("cwd"),
-                        model=action.get("model"),
-                        sandbox=action.get("sandbox"),
-                        api_key=(
-                            self.config.codex_personal_api_key
-                            if self.config.codex_active_account == "personal"
-                            else None
-                        ),
-                        client_request_id=action.get("client_request_id"),
-                    )
-                else:
-                    await self.sdk_adapter.connect(
-                        session_id,
-                        cwd=action.get("cwd"),
-                        model=action.get("model"),
-                        permission_mode=action.get("permission_mode"),
-                        # Unlike model/permission_mode above, cli_path/cli_env
-                        # (KTD5) are Mac-level settings with no phone-side
-                        # per-request equivalent - always sourced from this
-                        # companion's own config, never the action payload.
-                        # cli_env goes through _effective_cli_env (R2/KTD1/
-                        # KTD3), not the raw config field, so a "personal"-
-                        # identity spawn gets CLAUDE_CODE_OAUTH_TOKEN merged in.
-                        cli_path=self.config.cli_path,
-                        cli_env=self._effective_cli_env(),
-                        # Bug fix (user report): echoed back verbatim on
-                        # session_started so the requesting phone can recognize
-                        # its own new session without comparing cwd strings -
-                        # see sdk_adapter.py's connect() for why cwd-string
-                        # matching broke (realpath resolves through symlinks).
-                        client_request_id=action.get("client_request_id"),
-                    )
+                await self._start_session_for_agent(
+                    ws,
+                    agent,
+                    cwd=action.get("cwd"),
+                    model=action.get("model"),
+                    permission_mode=action.get("permission_mode"),
+                    sandbox=action.get("sandbox"),
+                    # Bug fix (user report): echoed back verbatim on
+                    # session_started so the requesting phone can recognize
+                    # its own new session without comparing cwd strings -
+                    # see sdk_adapter.py's connect() for why cwd-string
+                    # matching broke (realpath resolves through symlinks).
+                    client_request_id=action.get("client_request_id"),
+                )
             except Exception:
                 logger.exception("start_session failed for action %r", action)
-                return
-            self._spawn_forwarder(ws, adapter, session_id)
-            resolved_cwd = adapter.get_cwd(session_id)
-            if resolved_cwd:
-                async with self._recents_lock:
-                    await asyncio.to_thread(projects.record_recent, resolved_cwd, self.recents_path)
-                # Code-review fix: only sdk_adapter sessions get a
-                # session_registry row. That row exists purely to support
-                # _try_resume_sdk_session after a restart, which resolves
-                # cwd via observe_adapter.projects_dir (~/.claude/projects)
-                # - a Codex session_id can never match there, so a Codex
-                # row could never actually be resumed. Writing one anyway
-                # would leave it permanently 'active' forever, since the
-                # end-marking gates below are (correctly) sdk_adapter-only
-                # - simpler to never create the unresumable row than to
-                # widen every end-marking gate just to clean up after it.
-                if adapter is self.sdk_adapter:
-                    async with self._session_registry_lock:
-                        await asyncio.to_thread(
-                            session_registry.upsert_session,
-                            session_id,
-                            cwd=resolved_cwd,
-                            model=action.get("model"),
-                            permission_mode=action.get("permission_mode"),
-                            path=self.session_registry_path,
-                        )
             return
 
         if kind == "list_projects":
@@ -694,6 +665,113 @@ class CompanionDaemon:
         # land instead of adding yet another branch to an already-long
         # do-everything router.
         await self._dispatch_session_scoped_action(ws, kind, action)
+
+    async def _start_session_for_agent(
+        self,
+        ws: "websockets.WebSocketClientProtocol",
+        agent: str,
+        *,
+        cwd: Optional[str],
+        model: Optional[str] = None,
+        permission_mode: Optional[str] = None,
+        sandbox: Optional[str] = None,
+        client_request_id: Optional[str] = None,
+    ) -> str:
+        """KTD9 (Agent Limit Handoff plan, U3): the connect/_spawn_forwarder/
+        recents/registry sequence that used to live inline in the
+        `start_session` action's own dispatch branch above - extracted so
+        that branch (unchanged behavior - every kwarg here is threaded
+        straight from the action payload the same way it always was) and
+        U3's new handoff orchestration (_start_agent_handoff below) share
+        one copy instead of risking two ~30-line copies drifting apart.
+
+        Mints a fresh session_id, connects the chosen adapter (codex_adapter
+        for "codex", sdk_adapter for anything else - callers must have
+        already validated `agent` against _VALID_AGENTS; this trusts that),
+        spawns its event forwarder on `ws`, records the resolved cwd as a
+        recent project, and (sdk_adapter only) upserts a session_registry
+        row. Returns the new session_id. Raises whatever adapter.connect()
+        raises on failure - deliberately not caught here, so each caller
+        decides how to surface it (start_session's dispatch logs and drops
+        the action; U3's handoff path reports agent_handoff_result with
+        ok=False and a user-facing reason)."""
+        session_id = str(uuid4())
+        adapter: AdapterProtocol = self.codex_adapter if agent == "codex" else self.sdk_adapter
+        if agent == "codex":
+            # No permission_mode: Codex has no interactive per-tool-call
+            # approval concept (see codex_adapter.py's module docstring,
+            # spike-finding #2) - it runs under its own
+            # ApprovalMode.auto_review instead.
+            #
+            # U2 (PKTD3): api_key mirrors _effective_cli_env's own
+            # active_account branch below, one level simpler - Codex has no
+            # ambient-env-precedence-stripping concern to replicate (KTD3),
+            # just "pass the configured personal key under 'personal', pass
+            # nothing under 'vscode'". Only ever reads codex_active_account/
+            # codex_personal_api_key, never Claude's own active_account/
+            # personal_oauth_token (R10).
+            #
+            # Merge (main): client_request_id (bug fix, user report -
+            # 2aba83b) applies equally to Codex-started sessions - mobile's
+            # reduceEvent() matches ANY session_started event by
+            # client_request_id regardless of agent, so omitting it here
+            # would silently regress that fix back to cwd-string matching
+            # for Codex sessions specifically.
+            await self.codex_adapter.connect(
+                session_id,
+                cwd=cwd,
+                model=model,
+                sandbox=sandbox,
+                api_key=(
+                    self.config.codex_personal_api_key
+                    if self.config.codex_active_account == "personal"
+                    else None
+                ),
+                client_request_id=client_request_id,
+            )
+        else:
+            await self.sdk_adapter.connect(
+                session_id,
+                cwd=cwd,
+                model=model,
+                permission_mode=permission_mode,
+                # Unlike model/permission_mode above, cli_path/cli_env
+                # (KTD5) are Mac-level settings with no phone-side
+                # per-request equivalent - always sourced from this
+                # companion's own config, never the action payload. cli_env
+                # goes through _effective_cli_env (R2/KTD1/KTD3), not the
+                # raw config field, so a "personal"-identity spawn gets
+                # CLAUDE_CODE_OAUTH_TOKEN merged in.
+                cli_path=self.config.cli_path,
+                cli_env=self._effective_cli_env(),
+                client_request_id=client_request_id,
+            )
+        self._spawn_forwarder(ws, adapter, session_id)
+        resolved_cwd = adapter.get_cwd(session_id)
+        if resolved_cwd:
+            async with self._recents_lock:
+                await asyncio.to_thread(projects.record_recent, resolved_cwd, self.recents_path)
+            # Code-review fix: only sdk_adapter sessions get a
+            # session_registry row. That row exists purely to support
+            # _try_resume_sdk_session after a restart, which resolves cwd
+            # via observe_adapter.projects_dir (~/.claude/projects) - a
+            # Codex session_id can never match there, so a Codex row could
+            # never actually be resumed. Writing one anyway would leave it
+            # permanently 'active' forever, since the end-marking gates
+            # elsewhere are (correctly) sdk_adapter-only - simpler to never
+            # create the unresumable row than to widen every end-marking
+            # gate just to clean up after it.
+            if adapter is self.sdk_adapter:
+                async with self._session_registry_lock:
+                    await asyncio.to_thread(
+                        session_registry.upsert_session,
+                        session_id,
+                        cwd=resolved_cwd,
+                        model=model,
+                        permission_mode=permission_mode,
+                        path=self.session_registry_path,
+                    )
+        return session_id
 
     async def _dispatch_session_scoped_action(
         self, ws: "websockets.WebSocketClientProtocol", kind: Optional[str], action: dict[str, Any]
@@ -1856,20 +1934,180 @@ class CompanionDaemon:
         if decision == "accept":
             await self._start_agent_handoff(session_id, agent, rate_limit_type)
 
+    async def _compose_handoff_diff(self, cwd: str) -> str:
+        """Agent Limit Handoff plan, U3 (KTD6): git_status.py has no
+        whole-tree diff helper - get_diff is single-file only (confirmed in
+        this plan's own research) - so this aggregates get_status(cwd)'s
+        changed-path lists through one get_diff(cwd, path) call per path,
+        concatenating the results up to _MAX_HANDOFF_DIFF_CHARS. Beyond the
+        cap, falls back to a plain file-list summary instead of a
+        half-truncated diff blob that would leave the handed-off session
+        guessing at a cut-off hunk."""
+        status = await asyncio.to_thread(git_status.get_status, cwd)
+        changed_paths = [*status.modified, *status.added, *status.deleted]
+        if not changed_paths:
+            return "No local changes (working tree is clean)."
+        chunks: list[str] = []
+        total_chars = 0
+        for path in changed_paths:
+            diff = await asyncio.to_thread(git_status.get_diff, cwd, path)
+            if diff.is_binary:
+                chunk = f"diff --git a/{path} b/{path}\nBinary file changed.\n"
+            else:
+                chunk = diff.diff or f"diff --git a/{path} b/{path}\n(no textual diff available)\n"
+            total_chars += len(chunk)
+            if total_chars > _MAX_HANDOFF_DIFF_CHARS:
+                file_list = "\n".join(f"- {p}" for p in changed_paths)
+                return (
+                    f"{len(changed_paths)} changed file(s) - diff omitted, total size exceeds "
+                    f"the {_MAX_HANDOFF_DIFF_CHARS}-character handoff cap:\n{file_list}"
+                )
+            chunks.append(chunk)
+        return "\n".join(chunks)
+
+    async def _compose_handoff_seed_message(self, session_id: str, agent: str, cwd: str) -> str:
+        """Agent Limit Handoff plan, U3 (KTD6): the handed-off session's
+        first message - a short intro, a digest section, and a diff
+        section. The digest is only ever attempted for a Claude-originated
+        handoff (`agent == "claude_code"`), mirroring _handle_session_digest's
+        own argument-gathering (read_session_history against
+        observe_adapter.projects_dir, then generate_digest with the same
+        risk_judge_use_api-gated api_client and _effective_cli_env()) - a
+        Codex-originated handoff skips straight to diff-only, permanently,
+        not as a failure case, since Codex sessions have no persisted
+        on-disk transcript generate_digest could read. Either a missing
+        transcript, a fail-closed generate_digest (None), or a skipped
+        Codex origin all degrade to _HANDOFF_NO_DIGEST_LINE rather than
+        blocking the handoff - never a reason to fail it."""
+        digest_text: Optional[str] = None
+        if agent == "claude_code":
+            events = await asyncio.to_thread(
+                history.read_session_history, session_id, str(self.observe_adapter.projects_dir)
+            )
+            if events:
+                api_client = digest.get_api_client() if self.config.risk_judge_use_api else None
+                digest_text = await digest.generate_digest(
+                    events, api_client=api_client, env=self._effective_cli_env()
+                )
+        diff_text = await self._compose_handoff_diff(cwd)
+        origin_label = _AGENT_DISPLAY_NAMES.get(agent, agent)
+        return (
+            f"You're picking up a session handed off from {origin_label} after it hit its usage limit.\n\n"
+            f"## Summary\n{digest_text or _HANDOFF_NO_DIGEST_LINE}\n\n"
+            f"## Uncommitted changes\n{diff_text}"
+        )
+
+    def _emit_handoff_result(
+        self,
+        adapter,
+        session_id: str,
+        *,
+        ok: bool,
+        reason: Optional[str] = None,
+        new_session_id: Optional[str] = None,
+        agent: Optional[str] = None,
+    ) -> None:
+        """Agent Limit Handoff plan, U3: the one place "agent_handoff_result"
+        is emitted, so every path through _start_agent_handoff below reports
+        the same shape on the *origin* session's own stream (R6) - never
+        leaves an accepted offer unanswered. Wrapped in its own try/except:
+        emit_custom raises for an origin session_id that's no longer known
+        (e.g. it ended in the window between the accept and this call) -
+        there's no one left to answer at that point, and the caller
+        (_resolve_agent_limit_offer, itself inside
+        _dispatch_session_scoped_action's own broad exception handler)
+        would otherwise just log-and-drop the very same failure anyway, so
+        swallowing it here (with its own explicit log line) is no less
+        visible."""
+        try:
+            if ok:
+                adapter.emit_custom(
+                    session_id, "agent_handoff_result", ok=True, new_session_id=new_session_id, agent=agent
+                )
+            else:
+                adapter.emit_custom(session_id, "agent_handoff_result", ok=False, reason=reason)
+        except Exception:
+            logger.exception("failed to emit agent_handoff_result for origin session %r", session_id)
+
     async def _start_agent_handoff(self, session_id: str, agent: str, rate_limit_type: str) -> None:
-        # TODO(U3): orchestrate the actual handoff - start a fresh session
-        # with the *other* agent (daemon.py's own _VALID_AGENTS: the
-        # opposite of `agent`) on the same working directory, compose
-        # whatever digest/diff context it should be seeded with (see
-        # digest.py's existing compose_digest/session_digest machinery for
-        # likely reuse), and emit "agent_handoff_result" once it completes:
-        # {ok: True, session_id: <new session_id>, agent: <destination
-        # agent>} on success, or {ok: False, reason: <specific, user-facing
-        # string - never a raw exception message>} on failure. This method
-        # is the seam U3 fills in - U2's own scope ends at calling it here,
-        # from the accept branch of _resolve_agent_limit_offer above, as a
-        # no-op.
-        return
+        """Agent Limit Handoff plan, U3: orchestrates R5's actual handoff
+        once an offer is accepted (called from _resolve_agent_limit_offer's
+        accept branch above). Composes the origin session's context (a
+        digest, Claude-originated only, plus a whole-session git diff - see
+        _compose_handoff_seed_message), starts a fresh session with the
+        *other* agent on the same cwd (KTD9's shared
+        _start_session_for_agent), seeds it with that content as its first
+        message, and reports the outcome back on the *origin* session's own
+        event stream (R6) so the phone never sees an unexplained hang -
+        `ok: False` with a specific, user-facing `reason` on any failure,
+        never a raw exception message (see events.py's own
+        "agent_handoff_result" registration comment)."""
+        source_adapter = self._adapter_for_agent(agent)
+        destination_agent = "codex" if agent == "claude_code" else "claude_code"
+        destination_label = _AGENT_DISPLAY_NAMES.get(destination_agent, destination_agent)
+
+        cwd = source_adapter.get_cwd(session_id)
+        if cwd is None:
+            self._emit_handoff_result(
+                source_adapter,
+                session_id,
+                ok=False,
+                reason="Could not determine this session's working directory.",
+            )
+            return
+
+        try:
+            seed_message = await self._compose_handoff_seed_message(session_id, agent, cwd)
+        except Exception:
+            logger.exception("failed to compose handoff seed content for session %r", session_id)
+            self._emit_handoff_result(
+                source_adapter, session_id, ok=False, reason="Could not prepare the handoff context."
+            )
+            return
+
+        # R5/KTD9: reuses whichever connection is currently serving actions
+        # at all - see _active_ws's own docstring in __init__ for why this
+        # reads instance state instead of a threaded-through parameter.
+        ws = self._active_ws
+        if ws is None:
+            self._emit_handoff_result(
+                source_adapter,
+                session_id,
+                ok=False,
+                reason="No active connection to the phone to start the new session on.",
+            )
+            return
+
+        try:
+            new_session_id = await self._start_session_for_agent(ws, destination_agent, cwd=cwd)
+        except Exception:
+            logger.exception(
+                "agent handoff failed to start a %r session for cwd=%r", destination_agent, cwd
+            )
+            self._emit_handoff_result(
+                source_adapter,
+                session_id,
+                ok=False,
+                reason=f"Could not start a new {destination_label} session.",
+            )
+            return
+
+        destination_adapter = self._adapter_for_agent(destination_agent)
+        try:
+            await destination_adapter.send_message(new_session_id, seed_message)
+        except Exception:
+            logger.exception("failed to seed handed-off session %r", new_session_id)
+            self._emit_handoff_result(
+                source_adapter,
+                session_id,
+                ok=False,
+                reason=f"Started the new {destination_label} session but could not seed it with context.",
+            )
+            return
+
+        self._emit_handoff_result(
+            source_adapter, session_id, ok=True, new_session_id=new_session_id, agent=destination_agent
+        )
 
     def _effective_cli_env(self) -> dict[str, str]:
         """KTD1/KTD3: the env a new SDK-owned session actually launches
