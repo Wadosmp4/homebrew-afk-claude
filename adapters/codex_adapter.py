@@ -92,6 +92,29 @@ _DISCONNECT_CALL_TIMEOUT_SECONDS = 10.0
 _RATE_LIMIT_REJECTED_USED_PERCENT = 100
 _RATE_LIMIT_APPROACHING_USED_PERCENT = 85
 
+# Code-review fix (P2): _drain_account_notifications previously died
+# permanently on any single non-cancellation exception from
+# next_notification() - a plausible transient blip against the documented-
+# unstable private SDK attribute it reaches into (see that method's own
+# docstring) would silently and permanently disable Codex rate-limit
+# visibility for the rest of the session. These bound a short backoff-and-
+# retry loop instead: consecutive failures reset to 0 on any successful
+# notification, so a session that's mostly healthy never approaches the cap
+# - only a truly persistent failure (e.g. the private attribute genuinely
+# disappearing in a future SDK release) exhausts it and gives up.
+_DRAIN_RETRY_BASE_DELAY_SECONDS = 1.0
+_DRAIN_RETRY_MAX_DELAY_SECONDS = 30.0
+_DRAIN_MAX_CONSECUTIVE_FAILURES = 5
+
+# Code-review fix (P2): the rate_limit_type used for a hard usage/budget
+# rejection surfaced via ErrorNotification.codex_error_info (see
+# _handle_notification's own comment on this emission) - this
+# ErrorNotification carries no specific primary/secondary window of its
+# own, unlike AccountRateLimitsUpdatedNotification, so a stable sentinel
+# distinct from those window names (and from Claude's own five_hour/
+# seven_day/... vocabulary) is used instead of a stale guess.
+_HARD_LIMIT_ERROR_RATE_LIMIT_TYPE = "usage_limit"
+
 
 def _is_spawn_subagent_call(item: Any) -> bool:
     """A `collabAgentToolCall` item's own `tool` field distinguishes actually
@@ -514,6 +537,26 @@ class CodexAdapter:
             event = await session.events.get()
             yield event
             if event.type in ("session_ended", "error"):
+                # Code-review fix (P2, follow-on from the codex_adapter.py
+                # rate_limit_type fix above): terminating immediately here
+                # used to silently orphan any event already queued behind
+                # "error" - concretely, a daemon-injected "agent_limit_offer"
+                # reacting synchronously to a "rate_limit" event that this
+                # same ErrorNotification handling emits immediately before
+                # "error" (see _handle_notification's own comment on that
+                # emission) is queued behind "error" by the time this
+                # generator gets to it, and was never delivered at all until
+                # this drain. Only items ALREADY in the queue at this exact
+                # moment are drained - this does not turn into an unbounded
+                # wait, since get_nowait() on an empty queue raises
+                # immediately rather than blocking. Mirrors the same
+                # ordering discipline _drive_turn's own except-branch
+                # already documents ("emitting the synthetic tool_result(s)
+                # first means they still reach a live subscriber") one level
+                # up: any event already in flight before termination reaches
+                # a subscriber; only genuinely-future events do not.
+                while not session.events.empty():
+                    yield session.events.get_nowait()
                 return
 
     def _get(self, session_id: str) -> "_CodexSession":
@@ -597,28 +640,64 @@ class CodexAdapter:
         _handle_notification's own ItemStartedNotification/
         ItemCompletedNotification branches already use for ThreadItem's
         analogous root-model wrapping, rather than assuming the attribute
-        is always present."""
+        is always present.
+
+        Code-review fix (P2): a transient failure from next_notification()
+        itself no longer ends this loop for the rest of the session's life
+        - it retries with a short backoff, up to
+        _DRAIN_MAX_CONSECUTIVE_FAILURES in a row (resetting on any
+        subsequent success), unlike _drive_turn's own stream crash handling
+        (there's no in-flight turn state to reconcile here - no open
+        tool-call items, no turn to mark errored - this is a side-channel
+        feed, not the turn's own result path). A failure while *processing*
+        an already-received notification is narrower (the fetch itself
+        succeeded) and is logged and skipped without counting against the
+        retry cap."""
         from openai_codex.generated.v2_all import AccountRateLimitsUpdatedNotification
 
-        try:
-            while True:
+        consecutive_failures = 0
+        while True:
+            try:
                 notification = await session.client._client.next_notification()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                consecutive_failures += 1
+                if consecutive_failures > _DRAIN_MAX_CONSECUTIVE_FAILURES:
+                    logger.error(
+                        "Codex account-notification drain giving up for session %s after %d consecutive "
+                        "failures: %s",
+                        session.session_id,
+                        consecutive_failures,
+                        exc,
+                    )
+                    return
+                logger.warning(
+                    "Codex account-notification drain hit a transient error for session %s "
+                    "(attempt %d/%d), retrying: %s",
+                    session.session_id,
+                    consecutive_failures,
+                    _DRAIN_MAX_CONSECUTIVE_FAILURES,
+                    exc,
+                )
+                await asyncio.sleep(
+                    min(_DRAIN_RETRY_BASE_DELAY_SECONDS * consecutive_failures, _DRAIN_RETRY_MAX_DELAY_SECONDS)
+                )
+                continue
+
+            consecutive_failures = 0
+            try:
                 payload = notification.payload if hasattr(notification, "payload") else notification
                 if isinstance(payload, AccountRateLimitsUpdatedNotification):
                     self._emit_rate_limit_from_snapshot(session, payload.rate_limits)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            # Unlike _drive_turn's own stream crash handling, there's no
-            # in-flight turn state to reconcile here (no open tool-call
-            # items, no turn to mark errored) - this is a side-channel
-            # feed, not the turn's own result path. Logging and letting the
-            # task end is the same "don't crash the session over a
-            # secondary signal" posture set_session_model/set_session_sandbox
-            # already take for their own local-state-only failures.
-            logger.warning(
-                "Codex account-notification drain crashed for session %s: %s", session.session_id, exc
-            )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Codex account-notification drain failed to process a notification for session %s: %s",
+                    session.session_id,
+                    exc,
+                )
 
     @staticmethod
     def _emit_rate_limit_from_snapshot(session: "_CodexSession", snapshot: Any) -> None:
@@ -747,6 +826,22 @@ class CodexAdapter:
             # own scope note), and codex_error_info is itself optional, so
             # neither case reaches this block at all.
             #
+            # Code-review fix (P2): this used to emit rate_limit_type=None,
+            # which both known consumers (this app's own daemon.py
+            # _handle_rate_limit_reading, and SessionDashboardScreen.tsx's
+            # rate_limit handler) treat as "nothing to key on" and silently
+            # drop - so the whole point of this emission (Usage Limits
+            # modal update, and a new agent_limit_offer for the exact hard-
+            # rejection scenario the Agent Limit Handoff feature exists for)
+            # never happened. This ErrorNotification carries no specific
+            # window of its own to attribute the rejection to (unlike
+            # AccountRateLimitsUpdatedNotification's primary/secondary), so
+            # rather than guessing at a stale last-seen window, this uses a
+            # stable sentinel type distinct from both those window names and
+            # from Claude's own vocabulary (five_hour/seven_day/...) - the
+            # (agent, rate_limit_type) key this feeds into already includes
+            # `agent`, so no cross-agent collision risk.
+            #
             # codex_error_info.root: CodexErrorInfo is a RootModel wrapping
             # either the plain CodexErrorInfoValue enum or one of several
             # richer error-detail models - only the enum member form is
@@ -764,7 +859,7 @@ class CodexAdapter:
                 ):
                     session.emit(
                         "rate_limit",
-                        rate_limit_type=None,
+                        rate_limit_type=_HARD_LIMIT_ERROR_RATE_LIMIT_TYPE,
                         status="rejected",
                         utilization=None,
                         resets_at=None,

@@ -402,6 +402,16 @@ class CompanionDaemon:
         # _agent_limit_offers at all (the offer was popped the moment it
         # was resolved), so they track two independent facts.
         self._agent_limit_resolutions: dict[tuple[str, str], str] = {}
+        # Code-review fix (P1): keys with an accept currently mid-flight
+        # (added right before _start_agent_handoff is awaited, removed in
+        # its finally once that awaits completes, success or failure) -
+        # _resolve_agent_limit_offer's own accept branch uses this to
+        # reject a duplicate accept for the same key (a Retry tap, or any
+        # other re-dispatch) while one is already running, so a slow
+        # handoff can never be raced into starting a second destination
+        # session. A retry AFTER the first handoff has already finished is
+        # unaffected - the key is gone from this set by then.
+        self._agent_limit_handoffs_in_progress: set[tuple[str, str]] = set()
         # Agent Limit Handoff plan, U3: the one currently-serving connection
         # (or None while connecting/reconnecting) - set/cleared by
         # _serve_connection. _start_agent_handoff needs a `ws` to spawn the
@@ -1927,12 +1937,31 @@ class CompanionDaemon:
             )
             return
         key = (agent, rate_limit_type)
+        if decision == "accept" and key in self._agent_limit_handoffs_in_progress:
+            # Code-review fix (P1): a Retry tap (AgentLimitOfferCard's own
+            # handleRetry has no double-tap guard) or a second accept
+            # arriving for a key whose handoff hasn't finished yet must not
+            # start a second, fully independent _start_agent_handoff - that
+            # would spawn two live destination-agent sessions for one
+            # logical accept, with the second result silently dropped by
+            # mobile's single-slot correlation ref. A genuine retry AFTER
+            # the first handoff has already finished (removed from this set
+            # in the finally below) is unaffected and proceeds normally.
+            logger.info(
+                "ignored duplicate resolve_agent_limit_offer(accept) for %r - a handoff is already in flight",
+                key,
+            )
+            return
         resolution = "accepted" if decision == "accept" else "dismissed"
         self._agent_limit_offers.pop(key, None)
         self._agent_limit_resolutions[key] = resolution
         self._emit_agent_limit_offer_resolved(agent, rate_limit_type, resolution)
         if decision == "accept":
-            await self._start_agent_handoff(session_id, agent, rate_limit_type)
+            self._agent_limit_handoffs_in_progress.add(key)
+            try:
+                await self._start_agent_handoff(session_id, agent, rate_limit_type)
+            finally:
+                self._agent_limit_handoffs_in_progress.discard(key)
 
     async def _compose_handoff_diff(self, cwd: str) -> str:
         """Agent Limit Handoff plan, U3 (KTD6): git_status.py has no

@@ -130,8 +130,19 @@ class FakeGlobalNotificationStream:
     def push(self, notification) -> None:
         self._notifications.put_nowait(notification)
 
+    def push_error(self, exc: BaseException) -> None:
+        """Code-review fix (P2) test support: queues an exception to be
+        raised BY next_notification() itself (a transient SDK-level
+        failure), distinct from push()'s normal notification delivery -
+        exercises _drain_account_notifications's own retry-with-backoff
+        path rather than its separate notification-processing try/except."""
+        self._notifications.put_nowait(exc)
+
     async def next_notification(self):
-        return await self._notifications.get()
+        item = await self._notifications.get()
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
 
 class FakeCodexClient:
@@ -1100,6 +1111,12 @@ async def test_a_usage_limit_exceeded_error_notification_emits_both_rate_limit_a
     rate_limit_event = await asyncio.wait_for(events.__anext__(), timeout=1)
     assert rate_limit_event.type == "rate_limit"
     assert rate_limit_event.data["status"] == "rejected"
+    # Code-review fix (P2): rate_limit_type=None was silently dropped by
+    # every known consumer (daemon.py's _handle_rate_limit_reading and
+    # SessionDashboardScreen.tsx's rate_limit handler both gate on a truthy
+    # value) - a real sentinel type is required for this emission to have
+    # any observable effect at all.
+    assert rate_limit_event.data["rate_limit_type"] == "usage_limit"
 
     error_event = await asyncio.wait_for(events.__anext__(), timeout=1)
     assert error_event.type == "error"
@@ -1132,6 +1149,7 @@ async def test_a_session_budget_exceeded_error_notification_also_emits_a_rate_li
     rate_limit_event = await asyncio.wait_for(events.__anext__(), timeout=1)
     assert rate_limit_event.type == "rate_limit"
     assert rate_limit_event.data["status"] == "rejected"
+    assert rate_limit_event.data["rate_limit_type"] == "usage_limit"
 
 
 @pytest.mark.asyncio
@@ -1164,6 +1182,48 @@ async def test_a_context_window_exceeded_error_notification_emits_no_rate_limit_
 
 
 @pytest.mark.asyncio
+async def test_subscribe_drains_any_already_queued_event_behind_a_terminating_error(adapter):
+    """Code-review fix (P2, follow-on): "error" (like "session_ended")
+    previously ended the subscription generator immediately, silently
+    orphaning anything already sitting in the queue behind it. This is not
+    theoretical - it's exactly what happened once the rate_limit_type=None
+    fix above made a Codex hard-rejection's ErrorNotification actually
+    raise an agent_limit_offer: that offer is emitted by the daemon
+    synchronously reacting to "rate_limit", which this same
+    ErrorNotification handling emits immediately before "error" - so the
+    offer event was already queued behind "error" by the time subscribe()
+    got to it, and was silently dropped. This isolates subscribe()'s own
+    drain fix directly, without the full ErrorNotification/daemon-reaction
+    path test_daemon.py's end-to-end test exercises."""
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    session = adapter._sessions["s1"]
+    session.emit("error", message="boom")
+    # Simulates the daemon's own synchronous reaction to a preceding event -
+    # already queued by the time subscribe()'s post-"error" check runs.
+    session.emit(
+        "agent_limit_offer",
+        agent="codex",
+        offered_agent="claude_code",
+        rate_limit_type="usage_limit",
+        status="rejected",
+        utilization=None,
+        resets_at=None,
+    )
+
+    error_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert error_event.type == "error"
+
+    offer_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert offer_event.type == "agent_limit_offer"
+
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(events.__anext__(), timeout=1)
+
+
+@pytest.mark.asyncio
 async def test_disconnect_cancels_the_notification_drain_task_cleanly(adapter):
     """Matches stream_task's own existing teardown convention: the
     notification-drain task loops forever (nothing ever completes it on
@@ -1182,6 +1242,61 @@ async def test_disconnect_cancels_the_notification_drain_task_cleanly(adapter):
     await adapter.disconnect("s1")
 
     assert notification_task.cancelled() or notification_task.done()
+
+
+@pytest.mark.asyncio
+async def test_a_transient_drain_failure_recovers_instead_of_permanently_ending_the_task(adapter, monkeypatch):
+    """Code-review fix (P2): a single non-cancellation exception from
+    next_notification() itself (e.g. a transient blip against the
+    documented-unstable private SDK attribute) must not permanently end
+    Codex rate-limit visibility for the rest of the session - the drain
+    loop retries and a subsequent real notification is still processed."""
+    from companion.adapters import codex_adapter as codex_adapter_module
+
+    monkeypatch.setattr(codex_adapter_module, "_DRAIN_RETRY_BASE_DELAY_SECONDS", 0.001)
+    monkeypatch.setattr(codex_adapter_module, "_DRAIN_RETRY_MAX_DELAY_SECONDS", 0.01)
+
+    await adapter.connect("s1", cwd="/repo")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    client = adapter._test_clients["latest"]
+    client._client.push_error(ConnectionError("transient blip"))
+    client._client.push(_rate_limits_notification(primary_used_percent=90))
+
+    rate_limit_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert rate_limit_event.type == "rate_limit"
+    assert rate_limit_event.data["status"] == "allowed_warning"
+
+    session = adapter._sessions["s1"]
+    assert not session.notification_task.done()  # still alive, not permanently ended
+
+
+@pytest.mark.asyncio
+async def test_the_drain_gives_up_after_exhausting_consecutive_failure_retries(adapter, monkeypatch):
+    """The retry-with-backoff loop isn't infinite - a truly persistent
+    failure (e.g. the private SDK attribute genuinely disappearing) must
+    still end the task eventually rather than busy-looping forever."""
+    from companion.adapters import codex_adapter as codex_adapter_module
+
+    monkeypatch.setattr(codex_adapter_module, "_DRAIN_RETRY_BASE_DELAY_SECONDS", 0.001)
+    monkeypatch.setattr(codex_adapter_module, "_DRAIN_RETRY_MAX_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr(codex_adapter_module, "_DRAIN_MAX_CONSECUTIVE_FAILURES", 3)
+
+    await adapter.connect("s1", cwd="/repo")
+    client = adapter._test_clients["latest"]
+    for _ in range(4):
+        client._client.push_error(RuntimeError("persistently broken"))
+
+    session = adapter._sessions["s1"]
+    await asyncio.wait_for(_wait_until_done(session.notification_task), timeout=1)
+    assert session.notification_task.done()
+    assert not session.notification_task.cancelled()  # gave up cleanly, wasn't cancelled from outside
+
+
+async def _wait_until_done(task) -> None:
+    while not task.done():
+        await asyncio.sleep(0.001)
 
 
 @pytest.mark.asyncio

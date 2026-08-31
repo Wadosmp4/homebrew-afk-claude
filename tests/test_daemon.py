@@ -4156,6 +4156,66 @@ async def test_a_rejected_reading_with_no_prior_warning_raises_an_offer_directly
 
 
 @pytest.mark.asyncio
+async def test_a_codex_usage_limit_exceeded_error_notification_raises_an_offer_end_to_end(
+    running_daemon_with_codex, phone_token
+):
+    """Code-review fix (P2): a Codex hard usage/budget rejection reaching
+    the daemon via ErrorNotification.codex_error_info (not the
+    AccountRateLimitsUpdatedNotification path U1's other tests exercise)
+    used to emit rate_limit_type=None, which _handle_rate_limit_reading
+    silently drops - so this exact scenario, the hard-rejection case the
+    whole Agent Limit Handoff feature exists for on the Codex side, never
+    raised an offer at all. Exercises the real end-to-end path (turn error
+    -> rate_limit -> agent_limit_offer), not codex_adapter.py in isolation."""
+    from openai_codex.generated.v2_all import CodexErrorInfo, CodexErrorInfoValue, TurnError
+    from openai_codex.models import ErrorNotification
+
+    daemon, port, _fake_sdk_clients, fake_codex_clients = running_daemon_with_codex
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": "/tmp/some-repo", "agent": "codex"})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+
+        await phone.send_action({"kind": "send_message", "session_id": session_id, "text": "run the tests"})
+        await phone.next_event()  # user_message
+
+        turn_handle = fake_codex_clients[0].threads[0].turns[0]
+        turn_handle.push(
+            ErrorNotification(
+                error=TurnError(
+                    message="usage limit exceeded",
+                    codexErrorInfo=CodexErrorInfo(CodexErrorInfoValue.usage_limit_exceeded),
+                ),
+                threadId="t1",
+                turnId="turn-1",
+                willRetry=False,
+            )
+        )
+
+        rate_limit_event = await asyncio.wait_for(phone.next_event(), timeout=2)
+        assert rate_limit_event["type"] == "rate_limit"
+        assert rate_limit_event["data"]["rate_limit_type"] == "usage_limit"
+
+        # "error" arrives next (codex_adapter.py's own ErrorNotification
+        # handling emits it right after "rate_limit", per KTD1) - the
+        # daemon's reaction to "rate_limit" (raising agent_limit_offer)
+        # queues behind it. subscribe()'s own post-"error" drain (a
+        # follow-on fix - "error" used to end the subscription immediately,
+        # permanently orphaning whatever the daemon had just queued in
+        # reaction to the preceding "rate_limit") is what still delivers it.
+        error_event = await asyncio.wait_for(phone.next_event(), timeout=2)
+        assert error_event["type"] == "error"
+
+        offer_event = await asyncio.wait_for(phone.next_event(), timeout=2)
+        assert offer_event["type"] == "agent_limit_offer"
+        assert offer_event["data"]["agent"] == "codex"
+        assert offer_event["data"]["status"] == "rejected"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
 async def test_a_harder_reading_escalates_the_same_offer_instead_of_raising_a_second_one(
     running_daemon, phone_token
 ):
@@ -4805,6 +4865,156 @@ async def test_accepted_handoff_reports_ok_false_when_the_destination_session_fa
         await phone.send_action({"kind": "send_message", "session_id": session_id, "text": "still alive?"})
         next_event = await phone.next_event()
         assert next_event["type"] == "user_message"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_a_duplicate_accept_while_a_handoff_is_in_flight_does_not_start_a_second_handoff(
+    running_daemon_with_codex, phone_token, tmp_path, monkeypatch
+):
+    """Code-review fix (P1): a Retry tap (AgentLimitOfferCard's own
+    handleRetry has no server-independent guard) or any other re-dispatch of
+    resolve_agent_limit_offer(accept) for a key whose handoff hasn't
+    finished yet must not launch a second, independent _start_agent_handoff
+    - see _resolve_agent_limit_offer's own in-flight guard
+    (_agent_limit_handoffs_in_progress). Uses a digest call that blocks on
+    an asyncio.Event to deterministically catch the first handoff mid-flight
+    before dispatching the duplicate, rather than racing on scheduling
+    order."""
+    from companion import digest as digest_module
+    from companion import history as history_module
+
+    daemon, port, fake_sdk_clients, _fake_codex_clients = running_daemon_with_codex
+    repo_dir = tmp_path / "handoff-repo"
+    _init_handoff_repo(repo_dir)
+
+    digest_started = asyncio.Event()
+    digest_release = asyncio.Event()
+
+    def _fake_read_session_history(session_id, projects_dir=None):
+        return [{"type": "assistant_message", "timestamp": "t1", "data": {"text": "did a thing"}}]
+
+    async def _slow_generate_digest(events, **kwargs):
+        digest_started.set()
+        await digest_release.wait()
+        return "Refactored the widget loader."
+
+    monkeypatch.setattr(history_module, "read_session_history", _fake_read_session_history)
+    monkeypatch.setattr(digest_module, "generate_digest", _slow_generate_digest)
+
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": str(repo_dir)})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+        client = fake_sdk_clients[0]
+
+        _push_rate_limit(client, session_id, status="allowed_warning", utilization=0.9)
+        await phone.next_event()  # rate_limit
+        offer = await phone.next_event()
+        assert offer["type"] == "agent_limit_offer"
+
+        accept_action = {
+            "kind": "resolve_agent_limit_offer",
+            "session_id": session_id,
+            "rate_limit_type": "five_hour",
+            "decision": "accept",
+        }
+        await phone.send_action(accept_action)
+        resolved = await phone.next_event()
+        assert resolved["type"] == "agent_limit_offer_resolved"
+        assert resolved["data"]["resolution"] == "accepted"
+
+        # The first handoff has now genuinely reached its async digest call
+        # - _agent_limit_handoffs_in_progress holds the key at this point.
+        await asyncio.wait_for(digest_started.wait(), timeout=1)
+
+        # A duplicate accept for the same key arrives while that handoff is
+        # still in flight - must produce nothing at all (no re-emitted
+        # resolved event, no second handoff).
+        await phone.send_action(accept_action)
+
+        digest_release.set()  # let the one legitimate handoff finish
+
+        events = [await phone.next_event() for _ in range(3)]
+        by_session: dict = {}
+        for event in events:
+            by_session.setdefault(event["session_id"], []).append(event)
+
+        other_ids = [sid for sid in by_session if sid != session_id]
+        assert len(other_ids) == 1  # exactly one new session, not two
+
+        origin_events = by_session[session_id]
+        assert [e["type"] for e in origin_events] == ["agent_handoff_result"]
+        assert origin_events[0]["data"]["ok"] is True
+
+        # Nothing else was left queued by the duplicate accept.
+        await phone.send_action({"kind": "send_message", "session_id": session_id, "text": "still just one"})
+        next_event = await phone.next_event()
+        assert next_event["type"] == "user_message"
+    finally:
+        await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_a_retry_after_the_first_handoff_has_already_finished_proceeds_normally(
+    running_daemon_with_codex, phone_token, tmp_path, monkeypatch
+):
+    """The in-flight guard must not block a genuine retry dispatched AFTER
+    the first handoff has already completed (successfully or not) - only a
+    duplicate arriving WHILE one is still running is rejected."""
+    from companion import history as history_module
+
+    daemon, port, fake_sdk_clients, _fake_codex_clients = running_daemon_with_codex
+    repo_dir = tmp_path / "handoff-repo"
+    _init_handoff_repo(repo_dir)
+
+    monkeypatch.setattr(history_module, "read_session_history", lambda *a, **k: None)
+
+    connect_calls = 0
+
+    async def _fail_once_then_succeed(*args, **kwargs):
+        nonlocal connect_calls
+        connect_calls += 1
+        if connect_calls == 1:
+            raise RuntimeError("first attempt blows up")
+        return await CodexAdapter.connect(daemon.codex_adapter, *args, **kwargs)
+
+    monkeypatch.setattr(daemon.codex_adapter, "connect", _fail_once_then_succeed)
+
+    phone = await _FakePhone.connect(port, phone_token)
+    try:
+        await phone.send_action({"kind": "start_session", "cwd": str(repo_dir)})
+        started = await phone.next_event()
+        session_id = started["session_id"]
+        client = fake_sdk_clients[0]
+
+        _push_rate_limit(client, session_id, status="allowed_warning", utilization=0.9)
+        await phone.next_event()  # rate_limit
+        await phone.next_event()  # agent_limit_offer
+
+        accept_action = {
+            "kind": "resolve_agent_limit_offer",
+            "session_id": session_id,
+            "rate_limit_type": "five_hour",
+            "decision": "accept",
+        }
+        await phone.send_action(accept_action)
+        await phone.next_event()  # agent_limit_offer_resolved(accepted)
+        first_result = await phone.next_event()
+        assert first_result["type"] == "agent_handoff_result"
+        assert first_result["data"]["ok"] is False
+
+        # The first handoff has fully finished (in-flight set cleared) - a
+        # fresh accept for the same key (the card's own Retry) must proceed
+        # normally, not be silently swallowed by the duplicate-accept guard.
+        await phone.send_action(accept_action)
+        second_resolved = await phone.next_event()
+        assert second_resolved["type"] == "agent_limit_offer_resolved"
+        assert second_resolved["data"]["resolution"] == "accepted"
+        second_result_events = [await phone.next_event() for _ in range(2)]
+        assert any(e["type"] == "session_started" for e in second_result_events)
     finally:
         await phone.close()
 
