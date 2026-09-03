@@ -52,12 +52,12 @@ cover here.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from collections.abc import AsyncIterator
 from typing import Any, Callable, Optional
 
 from .base import UnsupportedOperation
+from .base import cancel_and_wait, drain_session_events
 from .events import Event, EventSequencer
 
 logger = logging.getLogger(__name__)
@@ -416,23 +416,13 @@ class CodexAdapter:
                 )
             except Exception:
                 logger.exception("failed to interrupt Codex turn on disconnect for session_id=%r", session_id)
-        if session.stream_task is not None:
-            session.stream_task.cancel()
-            # cancel() only schedules cancellation - without awaiting it,
-            # this task can still be pending when the caller (or a test's
-            # event loop) tears down, which asyncio reports as "Task was
-            # destroyed but it is pending!".
-            with contextlib.suppress(asyncio.CancelledError):
-                await session.stream_task
-        if session.notification_task is not None:
-            # Same cancel/await-in-suppress convention as stream_task
-            # directly above - this task otherwise loops forever (see its
-            # own docstring), so leaving it merely cancel()'d without
-            # awaiting it would hit the same "Task was destroyed but it is
-            # pending!" warning stream_task's own teardown exists to avoid.
-            session.notification_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await session.notification_task
+        # cancel_and_wait: cancel() only schedules cancellation - without
+        # awaiting each task afterward, it can still be pending when the
+        # caller (or a test's event loop) tears down, which asyncio reports
+        # as "Task was destroyed but it is pending!". notification_task in
+        # particular otherwise loops forever (see its own docstring).
+        await cancel_and_wait(session.stream_task)
+        await cancel_and_wait(session.notification_task)
         # Code-review fix: close() must not skip session.end() - the
         # session is already popped from self._sessions above, so if close()
         # raises here, nothing else will ever emit session_ended, stranding
@@ -532,32 +522,15 @@ class CodexAdapter:
         self._get(session_id).emit(type_, **data)
 
     async def subscribe(self, session_id: str) -> AsyncIterator[Event]:
+        """See drain_session_events's own docstring - the terminal-event
+        drain there is what first caught, and fixed, this exact bug: a
+        Codex hard-rejection's "rate_limit" immediately followed by "error"
+        (see _handle_notification's own comment on that emission) used to
+        silently orphan the agent_limit_offer daemon.py raises reacting to
+        "rate_limit", since it landed behind the already-queued "error"."""
         session = self._get(session_id)
-        while True:
-            event = await session.events.get()
+        async for event in drain_session_events(session):
             yield event
-            if event.type in ("session_ended", "error"):
-                # Code-review fix (P2, follow-on from the codex_adapter.py
-                # rate_limit_type fix above): terminating immediately here
-                # used to silently orphan any event already queued behind
-                # "error" - concretely, a daemon-injected "agent_limit_offer"
-                # reacting synchronously to a "rate_limit" event that this
-                # same ErrorNotification handling emits immediately before
-                # "error" (see _handle_notification's own comment on that
-                # emission) is queued behind "error" by the time this
-                # generator gets to it, and was never delivered at all until
-                # this drain. Only items ALREADY in the queue at this exact
-                # moment are drained - this does not turn into an unbounded
-                # wait, since get_nowait() on an empty queue raises
-                # immediately rather than blocking. Mirrors the same
-                # ordering discipline _drive_turn's own except-branch
-                # already documents ("emitting the synthetic tool_result(s)
-                # first means they still reach a live subscriber") one level
-                # up: any event already in flight before termination reaches
-                # a subscriber; only genuinely-future events do not.
-                while not session.events.empty():
-                    yield session.events.get_nowait()
-                return
 
     def _get(self, session_id: str) -> "_CodexSession":
         session = self._sessions.get(session_id)

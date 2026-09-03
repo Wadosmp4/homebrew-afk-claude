@@ -41,6 +41,7 @@ from claude_agent_sdk import (
 
 from ..auto_approve import is_structured_question as _is_structured_question
 from ..rate_limit_estimator import RateLimitEstimator
+from .base import cancel_and_wait, drain_session_events
 from .events import Event, EventSequencer, truncate_tool_result_content
 
 logger = logging.getLogger(__name__)
@@ -376,17 +377,14 @@ class SDKAdapter:
         # reads it as still pending forever.
         for request_id in list(session.pending):
             session.resolve_permission(request_id, "deny", "Session ended before this was answered")
-        if session.reader_task is not None:
-            session.reader_task.cancel()
-            # cancel() only *schedules* cancellation - without awaiting the
-            # task afterward, disconnect() can return (and a test's event
-            # loop can close) while read_loop() is still pending, which
-            # asyncio reports as "Task was destroyed but it is pending!"
-            # and, if it was itself awaiting a queue .get(), sometimes a
-            # "RuntimeError: Event loop is closed" from that coroutine
-            # being garbage-collected after the loop is gone.
-            with contextlib.suppress(asyncio.CancelledError):
-                await session.reader_task
+        # cancel_and_wait: cancel() only *schedules* cancellation - without
+        # awaiting the task afterward, disconnect() can return (and a
+        # test's event loop can close) while read_loop() is still pending,
+        # which asyncio reports as "Task was destroyed but it is pending!"
+        # and, if it was itself awaiting a queue .get(), sometimes a
+        # "RuntimeError: Event loop is closed" from that coroutine being
+        # garbage-collected after the loop is gone.
+        await cancel_and_wait(session.reader_task)
         await session.client.disconnect()
         session.end("disconnected")
 
@@ -426,13 +424,12 @@ class SDKAdapter:
 
     async def subscribe(self, session_id: str) -> AsyncIterator[Event]:
         """Yield this session's normalized events as they occur, until the
-        session ends or errors (then the generator returns)."""
+        session ends or errors (then the generator returns, after draining
+        anything already queued behind that terminal event - see
+        drain_session_events's own docstring)."""
         session = self._get(session_id)
-        while True:
-            event = await session.events.get()
+        async for event in drain_session_events(session):
             yield event
-            if event.type in ("session_ended", "error"):
-                return
 
     def _get(self, session_id: str) -> "_Session":
         try:

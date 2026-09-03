@@ -49,6 +49,7 @@ from uuid import uuid4
 from .. import auto_approve as approval_policy
 from .. import risk_judge
 from .base import UnsupportedOperation
+from .base import cancel_and_wait, drain_session_events
 from .events import Event, EventSequencer, truncate_tool_result_content
 
 logger = logging.getLogger(__name__)
@@ -199,10 +200,7 @@ class ObserveAdapter:
         # warning, and - if it was itself waiting on a selector-registered
         # fd - a "RuntimeError: Event loop is closed" from that coroutine's
         # own cleanup running after the loop that owned it already closed).
-        if self._watch_task is not None:
-            self._watch_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._watch_task
+        await cancel_and_wait(self._watch_task)
         # Code-review fix (P2): mirrors _ObserveSession.end()'s own
         # deny-pending-before-teardown above (see its docstring) - a
         # session that hasn't ended yet can still have a PermissionRequest
@@ -298,12 +296,12 @@ class ObserveAdapter:
         session.resolve_permission(request_id, decision, message)
 
     async def subscribe(self, session_id: str) -> AsyncIterator[Event]:
+        """See drain_session_events's own docstring - drains anything
+        already queued behind a terminal "session_ended"/"error" event
+        before actually stopping, rather than orphaning it."""
         session = self._get(session_id)
-        while True:
-            event = await session.events.get()
+        async for event in drain_session_events(session):
             yield event
-            if event.type in ("session_ended", "error"):
-                return
 
     def get_cwd(self, session_id: str) -> Optional[str]:
         """U10 (R16): captured from the JSONL transcript entries' own

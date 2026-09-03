@@ -1279,6 +1279,41 @@ async def test_interrupt_is_a_clean_noop_when_end_session_already_won_the_race(a
 
 
 @pytest.mark.asyncio
+async def test_subscribe_drains_any_already_queued_event_behind_a_terminating_error(adapter):
+    """Code-review fix (whole-codebase SOLID/DRY audit): subscribe() used to
+    return the instant it yielded a terminal "session_ended"/"error" event,
+    silently orphaning anything already sitting in the queue behind it. This
+    is a live bug, not theoretical: daemon.py's _forward_events reacts to a
+    "rate_limit" event by synchronously calling emit_custom(session_id,
+    "agent_limit_offer", ...) on this SAME session - if the SDK subprocess
+    then crashes immediately after (emitting "error" then "session_ended"
+    synchronously, before the daemon has drained the rate_limit reading),
+    both the crash's own session_ended AND the just-raised agent_limit_offer
+    would be silently dropped forever. This was already fixed once in
+    CodexAdapter.subscribe() for its own trigger scenario and is now shared
+    via drain_session_events (companion/adapters/base.py) so both adapters
+    get it - this test proves SDKAdapter's copy actually uses it."""
+    await adapter.connect("s1")
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    session = adapter._sessions["s1"]
+    session.emit("error", message="boom")
+    # Simulates the daemon's own synchronous reaction to a preceding event -
+    # already queued by the time subscribe()'s post-"error" check runs.
+    session.emit("waiting_for_input", subtype="test")
+
+    error_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert error_event.type == "error"
+
+    drained_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert drained_event.type == "waiting_for_input"
+
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(events.__anext__(), timeout=1)
+
+
+@pytest.mark.asyncio
 async def test_disconnect_stops_session_and_emits_lifecycle_event(adapter):
     await adapter.connect("s1")
     client = adapter._test_clients["latest"]

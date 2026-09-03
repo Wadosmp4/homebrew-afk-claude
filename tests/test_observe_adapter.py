@@ -236,6 +236,41 @@ async def test_discovers_transcript_and_streams_normalized_events(adapter, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_subscribe_drains_any_already_queued_event_behind_a_terminating_error(adapter, tmp_path):
+    """Code-review fix (whole-codebase SOLID/DRY audit): subscribe() used to
+    return the instant it yielded a terminal "session_ended"/"error" event,
+    silently orphaning anything already sitting in the queue behind it -
+    the same live bug already found and fixed in CodexAdapter (for its own
+    trigger scenario) and SDKAdapter, now shared via drain_session_events
+    (companion/adapters/base.py). This proves ObserveAdapter's copy uses it
+    too."""
+    project_dir = tmp_path / "projects" / "my-repo"
+    project_dir.mkdir()
+    transcript = project_dir / "session-abc.jsonl"
+    transcript.touch()
+    await _wait_until(lambda: "session-abc" in adapter.discover_sessions())
+
+    events = adapter.subscribe("session-abc")
+    await events.__anext__()  # session_started
+
+    session = adapter._sessions["session-abc"]
+    session.emit("error", message="boom")
+    # Simulates a reactive handler's own synchronous append to this same
+    # session's queue - already queued by the time subscribe()'s
+    # post-"error" check runs.
+    session.emit("waiting_for_input", subtype="test")
+
+    error_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert error_event.type == "error"
+
+    drained_event = await asyncio.wait_for(events.__anext__(), timeout=1)
+    assert drained_event.type == "waiting_for_input"
+
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(events.__anext__(), timeout=1)
+
+
+@pytest.mark.asyncio
 async def test_tool_result_duration_computed_from_entry_timestamps(adapter, tmp_path):
     """U9 (R14): unlike U3's SDK-owned session (a monotonic clock),
     duration here comes from the JSONL entries' own `timestamp` fields."""

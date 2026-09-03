@@ -1759,13 +1759,14 @@ class CompanionDaemon:
                 # read_loop can all reach here") is the one funnel point for
                 # every way an SDK-owned session actually stops - hooking
                 # here durably marks the registry 'ended' whichever path
-                # got here, not just an explicit end_session action. A
+                # got here, not just an explicit end_session action.
+                # Code-review fix (stale comment): this used to claim a
                 # crash (read_loop's except-branch) never reaches end() and
-                # so never emits this event - deliberately left 'active' in
-                # the registry, since the session genuinely still exists,
-                # just wasn't cleanly closed (R4's job is keeping that
-                # visible, not KTD4's). Observed sessions have no registry
-                # row at all (KTD4).
+                # so leaves the registry row 'active' - no longer true,
+                # read_loop's own except-branch calls self.end("crashed"),
+                # which reaches this same "session_ended" funnel like every
+                # other end path. Observed sessions have no registry row at
+                # all (KTD4) - that's the one real "not tracked here" case.
                 if adapter is self.sdk_adapter and event.type == "session_ended":
                     async with self._session_registry_lock:
                         await asyncio.to_thread(
