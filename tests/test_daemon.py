@@ -4488,7 +4488,7 @@ async def test_resolve_agent_limit_offer_dismiss_only_emits_resolved_with_no_han
     async def fake_handoff(session_id, agent, rate_limit_type):
         handoff_calls.append((session_id, agent, rate_limit_type))
 
-    monkeypatch.setattr(daemon, "_start_agent_handoff", fake_handoff)
+    monkeypatch.setattr(daemon.agent_limits, "_start_agent_handoff", fake_handoff)
 
     phone = await _FakePhone.connect(port, phone_token)
     try:
@@ -4533,7 +4533,7 @@ async def test_resolve_agent_limit_offer_accept_emits_resolved_then_calls_the_u3
     async def fake_handoff(session_id, agent, rate_limit_type):
         handoff_calls.append((session_id, agent, rate_limit_type))
 
-    monkeypatch.setattr(daemon, "_start_agent_handoff", fake_handoff)
+    monkeypatch.setattr(daemon.agent_limits, "_start_agent_handoff", fake_handoff)
 
     phone = await _FakePhone.connect(port, phone_token)
     try:
@@ -4746,7 +4746,7 @@ async def test_accepted_claude_originated_handoff_falls_back_to_no_digest_line_w
     failure) must not block the handoff - it only degrades the seed
     message to _HANDOFF_NO_DIGEST_LINE, seeded alongside the diff exactly
     as it would be otherwise."""
-    from companion import daemon as daemon_module
+    from companion import agent_limit_coordinator as agent_limit_coordinator_module
     from companion import digest as digest_module
     from companion import history as history_module
 
@@ -4798,7 +4798,7 @@ async def test_accepted_claude_originated_handoff_falls_back_to_no_digest_line_w
         assert result["ok"] is True  # a fail-closed digest never fails the handoff itself
 
         seed_text = by_session[new_session_id][1]["data"]["text"]
-        assert daemon_module._HANDOFF_NO_DIGEST_LINE in seed_text
+        assert agent_limit_coordinator_module._HANDOFF_NO_DIGEST_LINE in seed_text
         assert "+changed content" in seed_text
     finally:
         await phone.close()
@@ -5032,7 +5032,7 @@ async def test_compose_handoff_diff_reports_a_clean_working_tree_when_nothing_ch
     _git(repo_dir, "add", "a.txt")
     _git(repo_dir, "commit", "-q", "-m", "init")
 
-    diff_text = await daemon._compose_handoff_diff(str(repo_dir))
+    diff_text = await daemon.agent_limits._compose_handoff_diff(str(repo_dir))
 
     assert diff_text == "No local changes (working tree is clean)."
 
@@ -5044,7 +5044,7 @@ async def test_compose_handoff_diff_includes_a_single_changed_files_unified_diff
     repo_dir = tmp_path / "one-change-repo"
     _init_handoff_repo(repo_dir)
 
-    diff_text = await daemon._compose_handoff_diff(str(repo_dir))
+    diff_text = await daemon.agent_limits._compose_handoff_diff(str(repo_dir))
 
     assert "diff --git a/committed.txt b/committed.txt" in diff_text
     assert "-original" in diff_text
@@ -5068,7 +5068,7 @@ async def test_compose_handoff_diff_concatenates_diffs_for_every_changed_file(tm
     (repo_dir / "b.txt").write_text("b.txt changed\n")
     (repo_dir / "d.txt").write_text("brand new\n")  # untracked -> "added"
 
-    diff_text = await daemon._compose_handoff_diff(str(repo_dir))
+    diff_text = await daemon.agent_limits._compose_handoff_diff(str(repo_dir))
 
     assert "diff --git a/a.txt b/a.txt" in diff_text
     assert "diff --git a/b.txt b/b.txt" in diff_text
@@ -5096,7 +5096,7 @@ async def test_compose_handoff_diff_falls_back_to_a_file_list_summary_over_the_c
     # raw file content) clears the cap.
     (repo_dir / "big.txt").write_text(("x" * 200 + "\n") * 200)
 
-    diff_text = await daemon._compose_handoff_diff(str(repo_dir))
+    diff_text = await daemon.agent_limits._compose_handoff_diff(str(repo_dir))
 
     assert "diff omitted" in diff_text
     assert "20000-character handoff cap" in diff_text
