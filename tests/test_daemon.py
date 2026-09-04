@@ -556,6 +556,89 @@ class _FakeWs:
         pass
 
 
+class _FakeCountAdapter:
+    """Minimal adapter double for testing _gather_active_sessions/
+    _count_active_sessions (Update Safety plan U3, R4) - unlike
+    _FakeReclaimAdapter above (hardcoded is_active()=True), each session's
+    active state is set individually via add_session, so a mix of
+    genuinely-active and inactive sessions can be exercised in one
+    adapter."""
+
+    def __init__(self):
+        self.session_ids: list[str] = []
+        self._active: dict[str, bool] = {}
+
+    def add_session(self, session_id: str, *, active: bool = True) -> None:
+        self.session_ids.append(session_id)
+        self._active[session_id] = active
+
+    def discover_sessions(self) -> list[str]:
+        return list(self.session_ids)
+
+    def get_cwd(self, session_id):
+        return "/tmp/project"
+
+    def is_active(self, session_id):
+        return self._active.get(session_id, True)
+
+    def get_agent(self, session_id):
+        return None
+
+
+def _count_test_daemon(tmp_path, *, sdk=None, observe=None, codex=None, status_socket_path=None) -> CompanionDaemon:
+    config = CompanionConfig(relay_url="ws://127.0.0.1:1/ws/companion", device_token="t")
+    return CompanionDaemon(
+        config,
+        sdk_adapter=sdk or _FakeCountAdapter(),
+        observe_adapter=observe or _FakeCountAdapter(),
+        codex_adapter=codex or _FakeCountAdapter(),
+        recents_path=str(tmp_path / "recent_projects.json"),
+        config_path=str(tmp_path / "companion_config.json"),
+        session_registry_path=str(tmp_path / "session_registry.db"),
+        status_socket_path=status_socket_path,
+    )
+
+
+@pytest.mark.asyncio
+async def test_count_active_sessions_counts_only_active_true_across_adapters(tmp_path):
+    """R4 (Update Safety plan U3), AE3 + test scenario 4: the pre-check's
+    whole point is a count of sessions an upgrade could actually disrupt -
+    genuinely active ones (active: True) across all three adapters, not
+    every session this daemon has ever heard of. One inactive session
+    (mirroring a restart-recovered-but-not-yet-reconnected entry -
+    _gather_active_sessions's own docstring) must not be counted."""
+    fake_sdk = _FakeCountAdapter()
+    fake_codex = _FakeCountAdapter()
+    fake_observe = _FakeCountAdapter()
+    fake_sdk.add_session("sdk-1", active=True)
+    fake_codex.add_session("codex-1", active=True)
+    fake_observe.add_session("observe-1", active=False)
+    daemon = _count_test_daemon(tmp_path, sdk=fake_sdk, observe=fake_observe, codex=fake_codex)
+
+    assert await daemon._count_active_sessions() == 2
+
+
+@pytest.mark.asyncio
+async def test_status_socket_reports_the_active_session_count(tmp_path):
+    """Test scenario 1/2: a client connecting to the status socket
+    (companion/cli.py's `precheck`, or a raw client in this test) gets back
+    one JSON line reporting the count - AE3's "reports 2 active sessions"."""
+    fake_sdk = _FakeCountAdapter()
+    fake_sdk.add_session("sdk-1", active=True)
+    fake_sdk.add_session("sdk-2", active=True)
+    status_socket_path = _short_socket_path()
+    daemon = _count_test_daemon(tmp_path, sdk=fake_sdk, status_socket_path=status_socket_path)
+
+    await daemon._start_status_socket()
+    try:
+        reader, writer = await asyncio.open_unix_connection(status_socket_path)
+        raw = await reader.readuntil(b"\n")
+        writer.close()
+        assert json.loads(raw.decode("utf-8")) == {"active_sessions": 2}
+    finally:
+        await daemon._stop_status_socket()
+
+
 @pytest.mark.asyncio
 async def test_reclaim_forwarder_hands_a_session_back_to_its_authoritative_adapter(tmp_path):
     """code-review finding (P1): _forwarding_adapter/_watch_active_sessions/

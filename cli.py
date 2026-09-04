@@ -1,7 +1,7 @@
 """Command-line entry point for the companion, installed as `afk-claude-companion`
 (see the repo-root pyproject.toml's [project.scripts] and the Homebrew formula).
 
-Five subcommands:
+Six subcommands:
 
 - `run`       - starts the daemon (companion.daemon.main), same as the
   existing `python3 -m companion.daemon`.
@@ -36,6 +36,15 @@ Five subcommands:
   zero network transit. Refuses to run with piped/non-interactive stdin
   rather than silently accepting a plaintext value. A running companion
   needs restarting to pick up the change.
+- `precheck`   - Update Safety plan (U3), R4-R6: reports how many sessions
+  the currently-running daemon considers active, before an operator runs
+  `brew upgrade` - purely informational (R5), never blocks or fails the
+  upgrade itself, and there is no way to make `brew upgrade` pause on it
+  (Homebrew has no pre-upgrade hook - see this unit's plan). Talks to the
+  daemon's status socket (companion/daemon.py's `_start_status_socket`) as
+  a plain client; if that daemon isn't running or doesn't answer, this
+  reports "unreachable" plainly (R6) rather than raising or exiting
+  nonzero, following hook_bridge.py's own fail-open-on-OSError posture.
 
 Only stdlib (`urllib`) for the HTTP calls these need - deliberately not
 adding `httpx`/`requests` as a dependency just for this, since every
@@ -62,7 +71,7 @@ from .config import (
     save_config,
     update_config_field,
 )
-from .daemon import main as run_daemon
+from .daemon import DEFAULT_STATUS_SOCKET_PATH, main as run_daemon
 
 DEFAULT_PAIR_TIMEOUT_SECONDS = 300.0  # matches the relay's own PAIRING_CODE_TTL_SECONDS
 DEFAULT_PAIR_POLL_INTERVAL_SECONDS = 2.0
@@ -293,6 +302,48 @@ def _token_set(args: argparse.Namespace) -> None:
     print("A running companion won't pick this up until it's restarted (`afk-claude-companion run`).")
 
 
+def _precheck(args: argparse.Namespace) -> None:
+    """Update Safety plan (U3), R4-R6: this is a standalone pre-check the
+    operator runs themselves before `brew upgrade` - Homebrew has no
+    pre-upgrade hook to wire this into (see this module's docstring), so it
+    is never invoked automatically and never blocks the upgrade regardless
+    of what it reports (R5). Deliberately does not import anything from
+    `relay/` - companion/pyproject.toml's own packages list already keeps
+    `relay/` out of a Homebrew install entirely, so this stays a plain
+    client of the daemon's own local status socket (companion/daemon.py's
+    `_start_status_socket`), matching hook_bridge.py's fail-open-on-OSError
+    posture: an unreachable daemon (not running, socket gone, unresponsive)
+    is reported plainly rather than raised as an error (R6), and this
+    function never calls sys.exit with a nonzero code - AE4 is explicit
+    that "unreachable" must not look like it blocked anything."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(5.0)
+            sock.connect(args.status_socket_path)
+            response = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+    except OSError:
+        print("Companion daemon is unreachable - could not check active sessions.")
+        return
+
+    try:
+        count = json.loads(response.decode("utf-8"))["active_sessions"]
+    except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError):
+        count = None
+
+    if count is None:
+        print("Companion daemon is unreachable - could not check active sessions.")
+        return
+
+    plural = "s" if count != 1 else ""
+    print(f"The running companion daemon reports {count} active session{plural}.")
+    print("This is informational only - `brew upgrade` will proceed regardless of this count.")
+
+
 def _setup(args: argparse.Namespace) -> None:
     """The one command for any Mac, in any state - already configured,
     an additional Mac joining a phone that's already paired, or the very
@@ -441,6 +492,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Path to the companion config file (default: {DEFAULT_SESSION_REGISTRY_PATH})",
     )
     token_set_parser.set_defaults(func=_token_set)
+
+    precheck_parser = subparsers.add_parser(
+        "precheck",
+        help="Report how many sessions the running companion daemon considers active - run this before `brew upgrade` (never blocks it)",
+    )
+    precheck_parser.add_argument(
+        "--status-socket-path",
+        default=DEFAULT_STATUS_SOCKET_PATH,
+        help=f"Path to the running daemon's status socket (default: {DEFAULT_STATUS_SOCKET_PATH})",
+    )
+    precheck_parser.set_defaults(func=_precheck)
 
     return parser
 

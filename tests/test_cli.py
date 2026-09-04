@@ -10,7 +10,12 @@ comment on them).
 """
 from __future__ import annotations
 
+import json
+import os
+import socket
+import threading
 import urllib.error
+import uuid
 
 import pytest
 
@@ -601,3 +606,55 @@ def test_token_set_refuses_non_interactive_stdin_without_calling_save_config(mon
         main(["token", "set", "claude", "--config-path", str(config_path)])
 
     assert "interactive" in capsys.readouterr().out.lower()
+
+
+# --- precheck ----------------------------------------------------------------
+#
+# Update Safety plan (U3), R4-R6: this is a standalone pre-check the operator
+# runs themselves before `brew upgrade` - never a `brew upgrade` hook (Homebrew
+# has none to wire into), and never something that blocks or fails the
+# upgrade regardless of what it reports (R5). It talks to the running
+# daemon's status socket (companion/daemon.py's _start_status_socket) as a
+# plain client, matching hook_bridge.py's own fail-open-on-OSError posture -
+# see test_hook_bridge.py for that pattern's original test.
+
+
+def _short_socket_path() -> str:
+    return f"/tmp/rc-cli-precheck-{uuid.uuid4().hex[:8]}.sock"
+
+
+def test_precheck_reports_the_active_session_count_from_a_running_daemon(capsys):
+    """AE3: the pre-check reports however many active sessions the running
+    daemon says it has - here 2 - regardless of what that number is."""
+    socket_path = _short_socket_path()
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(socket_path)
+    server.listen(1)
+
+    def serve_one():
+        conn, _ = server.accept()
+        with conn:
+            conn.sendall(json.dumps({"active_sessions": 2}).encode("utf-8") + b"\n")
+
+    thread = threading.Thread(target=serve_one)
+    thread.start()
+    try:
+        main(["precheck", "--status-socket-path", socket_path])
+    finally:
+        thread.join(timeout=2)
+        server.close()
+        os.remove(socket_path)
+
+    out = capsys.readouterr().out
+    assert "2" in out
+    assert "active session" in out.lower()
+
+
+def test_precheck_reports_daemon_unreachable_when_the_socket_does_not_exist(capsys):
+    """AE4: no running daemon (or a stale/gone socket) is reported plainly,
+    not as an error - and, per R5, must never look like it blocked
+    anything. main() must not raise SystemExit here (implicit exit 0)."""
+    main(["precheck", "--status-socket-path", "/tmp/definitely-not-a-real-status-socket.sock"])
+
+    out = capsys.readouterr().out.lower()
+    assert "unreachable" in out

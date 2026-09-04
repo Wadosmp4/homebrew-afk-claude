@@ -50,6 +50,7 @@ import os
 import pathlib
 import pty
 import re
+import stat
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -115,6 +116,16 @@ def _companion_version() -> str:
 # below) reports this same value, rather than re-reading package metadata on
 # every reconnect.
 COMPANION_VERSION = _companion_version()
+
+# Update Safety plan (U3), R4/R5/R6, KTD10: a second, separate Unix socket
+# from ObserveAdapter's own hooks.sock (adapters/observe_adapter.py) - this
+# one exists purely so the `companion precheck` CLI command (companion/cli.py)
+# can ask a running daemon "how many sessions do you consider active right
+# now" before an operator runs `brew upgrade`. Homebrew has no pre-upgrade
+# hook to wire this into (see this unit's plan), so it's a standalone
+# command the operator runs themselves - never something `brew upgrade`
+# itself depends on or blocks on (R5).
+DEFAULT_STATUS_SOCKET_PATH = os.path.expanduser("~/.config/remote-claude-companion/status.sock")
 
 # Dynamic-linker/interpreter injection vectors - a phone-supplied cli_env
 # containing any of these could hijack the spawned CLI subprocess (e.g.
@@ -337,6 +348,7 @@ class CompanionDaemon:
         recents_path: Optional[str] = None,
         config_path: Optional[str] = None,
         session_registry_path: Optional[str] = None,
+        status_socket_path: Optional[str] = None,
     ):
         self.config = config
         # Companion-Local Token Entry & SQLite Config plan, KTD2: the
@@ -371,6 +383,13 @@ class CompanionDaemon:
         # Same injectability reason, for session_registry.py's own default
         # path - see _try_resume_sdk_session for why this exists at all.
         self.session_registry_path = session_registry_path
+        # Update Safety plan (U3), R4/R6, KTD10: same injectability reason
+        # as the paths above - tests must never bind the real
+        # ~/.config/remote-claude-companion/status.sock, and a machine
+        # running two daemons in parallel (dev + real) needs distinct
+        # sockets too.
+        self.status_socket_path = status_socket_path or DEFAULT_STATUS_SOCKET_PATH
+        self._status_server: Optional[asyncio.AbstractServer] = None
         self.state = "connecting"
         self.connect_attempts = 0
         self.heartbeats_sent = 0
@@ -448,6 +467,13 @@ class CompanionDaemon:
 
     async def run(self) -> None:
         await self.observe_adapter.start()
+        # Update Safety plan (U3), R4/R6: started here, alongside
+        # observe_adapter's own socket, rather than inside the
+        # connect/reconnect loop below - the precheck must keep answering
+        # "how many active sessions" even while this daemon is offline or
+        # stuck reconnecting to the relay, since that's exactly the
+        # situation an operator most needs it to still work in.
+        await self._start_status_socket()
         try:
             while not self._stop_event.is_set():
                 self.state = "connecting"
@@ -492,6 +518,7 @@ class CompanionDaemon:
                 self._backoff = min(self._backoff * 2, self.config.reconnect_max_delay)
         finally:
             await self.observe_adapter.stop()
+            await self._stop_status_socket()
             # A still-active SDK-owned/Codex session's own background task
             # (SDKAdapter's reader_task, CodexAdapter's stream_task) would
             # otherwise outlive this daemon shutdown, leaked - orphaned,
@@ -1050,6 +1077,27 @@ class CompanionDaemon:
         actually navigated back past) never gets to see. This snapshot
         fills that gap on mount, the same way _handle_list_projects fills
         it for the project picker."""
+        sessions = await self._gather_active_sessions()
+        event = {
+            "session_id": "_active_sessions",
+            "event_id": 0,
+            "type": "active_sessions",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "data": {"sessions": sessions},
+        }
+        await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
+
+    async def _gather_active_sessions(self) -> list[dict[str, Any]]:
+        """The combined snapshot _handle_list_active_sessions sends to the
+        phone - extracted (Update Safety plan U3, KTD11) so
+        _count_active_sessions below can share it rather than separately
+        re-deriving its own view of which sessions exist. Mixes
+        genuinely-live sessions from all three adapters (`active: True`,
+        from each adapter's own discover_sessions()/is_active()) with
+        restart-recovered-but-not-yet-reconnected sessions the
+        session_registry still remembers from before a restart, which are
+        deliberately appended below with `active: False` (R4/KTD3) - see
+        that section's own comment."""
         live_sdk_session_ids = set(self.sdk_adapter.discover_sessions())
         sessions = [
             {
@@ -1117,14 +1165,64 @@ class CompanionDaemon:
             for record in known
             if record.session_id not in live_sdk_session_ids
         )
-        event = {
-            "session_id": "_active_sessions",
-            "event_id": 0,
-            "type": "active_sessions",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "data": {"sessions": sessions},
-        }
-        await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
+        return sessions
+
+    async def _count_active_sessions(self) -> int:
+        """Update Safety plan (U3), R4/R5/R6, KTD11: how many sessions this
+        daemon currently considers active - the pre-upgrade check an
+        operator runs themselves before `brew upgrade` (never a hook
+        Homebrew runs on its own - see this unit's plan). Shares
+        _gather_active_sessions's combined list rather than separately
+        re-deriving "what counts as a session" - that list deliberately
+        mixes truly-live sessions with restart-recovered-but-not-yet-
+        reconnected ones appended with `active: False` (see that method's
+        own docstring), so filtering on the `active` flag here (not a bare
+        `len()`) is what keeps this count from overstating how many
+        sessions an upgrade could actually disrupt."""
+        sessions = await self._gather_active_sessions()
+        return sum(1 for session in sessions if session["active"])
+
+    async def _start_status_socket(self) -> None:
+        """Update Safety plan (U3), R4/R6, KTD10: a Unix socket serving
+        exactly one purpose - answering `companion precheck` (companion/
+        cli.py). Same lifecycle shape as ObserveAdapter.start()'s own hooks
+        socket (adapters/observe_adapter.py): stale-socket cleanup from a
+        prior crashed run, then 0600 permissions (local-only - no reason
+        for another user on this machine to learn session counts)."""
+        os.makedirs(os.path.dirname(self.status_socket_path) or ".", exist_ok=True)
+        if os.path.exists(self.status_socket_path):
+            os.remove(self.status_socket_path)  # stale socket from a prior crashed run
+        self._status_server = await asyncio.start_unix_server(
+            self._handle_status_connection, path=self.status_socket_path
+        )
+        os.chmod(self.status_socket_path, stat.S_IRUSR | stat.S_IWUSR)  # 0600 - local privilege surface (Risk)
+
+    async def _stop_status_socket(self) -> None:
+        """Mirrors ObserveAdapter.stop()'s own socket teardown."""
+        if self._status_server is not None:
+            self._status_server.close()
+            await self._status_server.wait_closed()
+        if os.path.exists(self.status_socket_path):
+            os.remove(self.status_socket_path)
+
+    async def _handle_status_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """R4/R5/R6: there's only ever one question a client can ask here,
+        so unlike ObserveAdapter's hooks socket this never reads a request
+        payload - it just answers as soon as a client connects. Writes the
+        response unconditionally from a `finally`, mirroring
+        ObserveAdapter._handle_hook_connection's own shape, so a bug in
+        _count_active_sessions can't leave `companion precheck` hanging on
+        a connection that's never going to answer."""
+        response: dict[str, Any] = {"active_sessions": None}
+        try:
+            response = {"active_sessions": await self._count_active_sessions()}
+        except Exception:
+            logger.exception("status socket: failed to count active sessions")
+        finally:
+            writer.write(json.dumps(response).encode("utf-8") + b"\n")
+            with contextlib.suppress(Exception):
+                await writer.drain()
+            writer.close()
 
     async def _handle_list_project_sessions(
         self, ws: "websockets.WebSocketClientProtocol", cwd: Optional[str]
