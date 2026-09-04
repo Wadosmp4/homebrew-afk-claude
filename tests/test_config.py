@@ -407,6 +407,75 @@ def test_two_concurrent_connects_racing_a_forward_migration_do_not_raise(tmp_pat
     assert missing_field in existing_columns
 
 
+# --- Schema migration data preservation (R7/R8/AE5) -------------------------
+
+
+def test_an_existing_config_db_with_the_old_schema_gains_codex_personal_api_key_without_losing_data(tmp_path):
+    """Regression test mirroring test_session_registry.py's own additive-
+    migration test (KTD4): a real installation's on-disk config table can
+    predate codex_personal_api_key entirely - it's the newest field on
+    CompanionConfig, added by the Codex Agent Integration plan's U2 (see
+    config.py's own dataclass comment) - so `CREATE TABLE IF NOT EXISTS` is
+    a no-op against the already-existing table (it only ever fires for a
+    brand-new file). _connect()'s ensure_table_columns call must therefore
+    ALTER TABLE the column onto a table that already exists, not just rely
+    on the updated CREATE TABLE statement.
+
+    This writes the OLD schema directly via a bare sqlite3 connection -
+    bypassing config.py's own _connect()/save_config entirely - to prove
+    the migration path itself survives real pre-existing data, rather than
+    only exercising a fresh empty database (which CREATE TABLE IF NOT
+    EXISTS would already handle trivially, proving nothing about ALTER
+    TABLE)."""
+    path = str(tmp_path / "session_registry.db")
+
+    # The immediately-prior schema: every current column except the newest
+    # one (codex_personal_api_key).
+    old_fields = [f for f in config_module._CONFIG_FIELDS if f != "codex_personal_api_key"]
+    columns_ddl = ", ".join(f"{name} {config_module._column_type(name)}" for name in old_fields)
+
+    old_data = {
+        "relay_url": "ws://127.0.0.1:9000/ws/companion",
+        "device_token": "pre-existing-token",
+        "heartbeat_interval": 7.5,
+        "reconnect_initial_delay": 2.0,
+        "reconnect_max_delay": 45.0,
+        "observe_scan_interval": 2.5,
+        "observe_entrypoints": ["claude-desktop", "claude-vscode"],
+        "observe_auto_approve": True,
+        "observe_llm_judge": False,
+        "cli_path": "/usr/local/bin/claude-custom",
+        "cli_env": {"ANTHROPIC_API_KEY": "sk-test"},
+        "risk_judge_use_api": False,
+        "active_account": "personal",
+        "personal_oauth_token": "sk-ant-oat-pre-existing",
+        "codex_active_account": "personal",
+    }
+    values = tuple(config_module._to_column_value(name, old_data[name]) for name in old_fields)
+
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(f"CREATE TABLE config (id INTEGER PRIMARY KEY CHECK (id = 1), {columns_ddl})")
+        placeholders = ", ".join("?" for _ in old_fields)
+        conn.execute(
+            f"INSERT INTO config (id, {', '.join(old_fields)}) VALUES (1, {placeholders})",
+            values,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # The next real access to this file (not a fresh CREATE TABLE IF NOT
+    # EXISTS - that path is a no-op here) must add codex_personal_api_key
+    # without disturbing the pre-existing row, and R7 says the old row's
+    # data is never translated into a value for a column that didn't exist
+    # when it was written - the migrated column reads as None (dataclass
+    # default), not backfilled.
+    loaded = load_config(path)
+    expected = CompanionConfig(**old_data)  # codex_personal_api_key defaults to None
+    assert loaded == expected
+
+
 def test_load_configs_own_default_parameter_points_at_the_shared_session_registry_path():
     """R5/KTD2: load_config's `path` default is a literal default-argument
     expression (`path: str = DEFAULT_SESSION_REGISTRY_PATH`), matching the
