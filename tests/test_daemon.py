@@ -339,6 +339,96 @@ async def test_daemon_reconnects_after_relay_restart_without_losing_identity(tmp
 
 
 @pytest.mark.asyncio
+async def test_run_blocks_without_reconnecting_when_relay_closes_with_version_floor_code(tmp_path):
+    """Update Safety plan (U2/R10/KTD9/AE8): a 4402 close (KTD6 - "version
+    below the supported floor") must stop this companion from ever
+    re-entering the connect/backoff cycle, not merely exit run()'s inner
+    while loop for one iteration. Uses a bare stub "relay" (raw
+    websockets.serve, mirroring test_connect_and_serve_reports_its_own_
+    version_in_the_hello_payload above) that acks the hello and then closes
+    with 4402 - the real relay's own floor-enforcement decision (whether to
+    send 4402 at all) is covered separately in relay/tests/test_events.py;
+    this test only needs to prove how the daemon reacts to receiving it.
+
+    Asserting `not task.done()` after a few `asyncio.sleep(0)` yields (not
+    just that the while loop exited) is the whole point here: a plain
+    `return` from run() would also make daemon.state end up something other
+    than "connecting"/"reconnecting", but would let the task finish - which
+    is exactly the bug KTD9 warns a bare `return` would silently reintroduce
+    via launchd/brew services' KeepAlive respawning the process into the
+    same retry loop R10 exists to eliminate."""
+    port = _free_port()
+
+    async def handler(ws):
+        await ws.recv()  # the hello
+        await ws.close(code=4402, reason="unsupported companion version - minimum required is 9.9.9")
+
+    server = await websockets.serve(handler, "127.0.0.1", port)
+    try:
+        daemon = CompanionDaemon(
+            _fast_config(port, "irrelevant-token"),
+            observe_adapter=_test_observe_adapter(tmp_path),
+            recents_path=str(tmp_path / "recent_projects.json"),
+            config_path=str(tmp_path / "companion_config.json"),
+            session_registry_path=str(tmp_path / "session_registry.db"),
+        )
+        task = asyncio.create_task(daemon.run())
+        await _wait_until(lambda: daemon.state == "version_blocked")
+
+        connect_attempts_at_block = daemon.connect_attempts
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not task.done()  # blocked, not returned - see docstring above
+        assert daemon.state == "version_blocked"
+        assert daemon.connect_attempts == connect_attempts_at_block  # never re-entered the connect loop
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_run_still_backs_off_and_retries_on_a_non_version_floor_close(tmp_path):
+    """Regression coverage for the branch added alongside the 4402 handling
+    above: a ConnectionClosed with any *other* code (a transient relay
+    restart, an ordinary 1000 close, etc.) must still fall through to the
+    existing reconnect/backoff behavior, not be mistaken for a version-floor
+    rejection."""
+    port = _free_port()
+    closes = 0
+
+    async def handler(ws):
+        nonlocal closes
+        await ws.recv()  # the hello
+        closes += 1
+        await ws.close(code=1000, reason="simulated transient drop")
+
+    server = await websockets.serve(handler, "127.0.0.1", port)
+    try:
+        daemon = CompanionDaemon(
+            _fast_config(port, "irrelevant-token"),
+            observe_adapter=_test_observe_adapter(tmp_path),
+            recents_path=str(tmp_path / "recent_projects.json"),
+            config_path=str(tmp_path / "companion_config.json"),
+            session_registry_path=str(tmp_path / "session_registry.db"),
+        )
+        task = asyncio.create_task(daemon.run())
+
+        await _wait_until(lambda: closes >= 3)
+        assert not task.done()  # kept retrying instead of blocking
+        assert daemon.state != "version_blocked"
+        assert daemon.connect_attempts >= 3
+
+        await _stop_daemon(daemon, task)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_sdk_session_forwarding_resumes_after_relay_reconnect(tmp_path, pg_url):
     """Regression test: an SDK-owned session started before a relay drop
     must keep forwarding events after the daemon reconnects - previously

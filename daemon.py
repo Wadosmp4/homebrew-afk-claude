@@ -47,7 +47,9 @@ import importlib.metadata
 import json
 import logging
 import os
+import pathlib
 import pty
+import re
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -74,15 +76,38 @@ def _companion_version() -> str:
     files (pyproject.toml, companion/pyproject.toml) already kept in sync
     manually per the release runbook - the installed package's own
     metadata is authoritative regardless of Homebrew, pip, or editable
-    install. Falls back to "0.0.0" - itself always below any relay version
-    floor (relay/app.py's MIN_SUPPORTED_COMPANION_VERSION) - if metadata is
-    somehow missing (e.g. running from a source checkout with no package
-    ever installed), so a broken lookup degrades to "rejected as too old"
-    rather than crashing every connection attempt."""
+    install.
+
+    A real Homebrew/pip install always has this metadata, but this
+    project's own local dev/test workflow runs straight from a source
+    checkout with no `pip install -e .` step (confirmed: no CI workflow
+    runs the Python test suite at all, and every daemon-integration test
+    here starts a real `CompanionDaemon` against a real relay expecting it
+    to connect) - `importlib.metadata.version` raises
+    `PackageNotFoundError` in exactly that case. Falling back straight to
+    "0.0.0" there would make a source checkout's own daemon permanently
+    fail relay/app.py's version floor against every relay, including the
+    embedded ones this test suite spins up - not a hypothetical, this
+    broke `test_daemon_connects_authenticates_and_sends_heartbeats` and
+    friends the first time this landed. So: fall back to reading this
+    version straight out of `companion/pyproject.toml` (a sibling of this
+    file when running from source) before falling back further to "0.0.0"
+    - itself always below any relay version floor - only if that file is
+    also missing or unparseable (some other packaging layout this hasn't
+    anticipated), so a broken lookup still degrades to "rejected as too
+    old" rather than crashing every connection attempt."""
     try:
         return importlib.metadata.version("remote-claude-companion")
     except importlib.metadata.PackageNotFoundError:
-        return "0.0.0"
+        pass
+    try:
+        pyproject_text = (pathlib.Path(__file__).parent / "pyproject.toml").read_text()
+        match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', pyproject_text)
+        if match:
+            return match.group(1)
+    except OSError:
+        pass
+    return "0.0.0"
 
 
 # Read once at import time (daemon startup) and cached for the process
@@ -429,6 +454,35 @@ class CompanionDaemon:
                 self.connect_attempts += 1
                 try:
                     await self._connect_and_serve()
+                except websockets.exceptions.ConnectionClosed as exc:
+                    # Update Safety plan (U2/R10/KTD9): a 4402 close names
+                    # this companion's own version as below the relay's
+                    # supported floor (KTD6) - retrying would just get
+                    # rejected again forever, with the rejection message
+                    # never surfacing anywhere an operator would see it
+                    # (this daemon has no interactive UI of its own). A
+                    # plain `return` here is not enough: main() has no
+                    # sys.exit after asyncio.run(daemon.run()), so exiting
+                    # cleanly would just have launchd/brew's KeepAlive
+                    # respawn the process into the exact retry loop this
+                    # exists to eliminate (see this file's module docstring
+                    # and Formula/afk-claude-companion.rb's service block).
+                    # Blocking on _stop_event instead keeps the process
+                    # alive - satisfying KeepAlive's "long-running service"
+                    # expectation - while genuinely never reconnecting; only
+                    # an explicit stop() call or the next deliberate service
+                    # restart ends it.
+                    if exc.code == 4402:
+                        self.state = "version_blocked"
+                        logger.error(
+                            "relay rejected this companion's connection for being below "
+                            "the supported version floor - it will NOT retry until "
+                            "upgraded and restarted: %s",
+                            exc.reason,
+                        )
+                        await self._stop_event.wait()
+                    else:
+                        logger.info("companion connection lost/failed: %s", exc)
                 except (OSError, websockets.exceptions.WebSocketException) as exc:
                     logger.info("companion connection lost/failed: %s", exc)
                 if self._stop_event.is_set():
