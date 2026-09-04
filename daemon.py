@@ -467,14 +467,21 @@ class CompanionDaemon:
 
     async def run(self) -> None:
         await self.observe_adapter.start()
-        # Update Safety plan (U3), R4/R6: started here, alongside
-        # observe_adapter's own socket, rather than inside the
-        # connect/reconnect loop below - the precheck must keep answering
-        # "how many active sessions" even while this daemon is offline or
-        # stuck reconnecting to the relay, since that's exactly the
-        # situation an operator most needs it to still work in.
-        await self._start_status_socket()
         try:
+            # Update Safety plan (U3), R4/R6, code review finding: started
+            # here (inside the try, ahead of the while loop) rather than
+            # before it - a failure in _start_status_socket() (e.g. a
+            # permission error, or two daemon instances contending for the
+            # same default status_socket_path, exactly the scenario
+            # status_socket_path's own constructor comment calls out) must
+            # still reach the finally below and tear down the
+            # already-started observe_adapter, not leak its socket. Started
+            # ahead of the connect/reconnect loop, not inside it, because
+            # the precheck must keep answering "how many active sessions"
+            # even while this daemon is offline or stuck reconnecting to
+            # the relay - exactly the situation an operator most needs it
+            # to still work in.
+            await self._start_status_socket()
             while not self._stop_event.is_set():
                 self.state = "connecting"
                 self.connect_attempts += 1

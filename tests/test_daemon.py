@@ -619,6 +619,41 @@ async def test_count_active_sessions_counts_only_active_true_across_adapters(tmp
 
 
 @pytest.mark.asyncio
+async def test_a_status_socket_start_failure_still_tears_down_observe_adapter(tmp_path, monkeypatch):
+    """Code review finding (reliability, U3): _start_status_socket() sits
+    between observe_adapter.start() and the try/finally that calls
+    observe_adapter.stop() - if it raises (a permission error, or two
+    daemon instances contending for the same default status_socket_path,
+    exactly the scenario status_socket_path's own constructor comment
+    calls out), the exception used to propagate straight out of run()
+    with observe_adapter.stop() never called, leaking its bound Unix
+    socket. Moved _start_status_socket() inside the try so a failure there
+    still reaches finally. Proven here via a real ObserveAdapter (not the
+    _FakeCountAdapter used elsewhere in this file) so the assertion is
+    "the real hooks socket file is gone", the same observable cleanup
+    ObserveAdapter.stop() itself performs - not a mock-call assertion that
+    could pass without the real teardown path actually running."""
+    observe_adapter = _test_observe_adapter(tmp_path)
+    daemon = CompanionDaemon(
+        CompanionConfig(relay_url="ws://127.0.0.1:1/ws/companion", device_token="t"),
+        observe_adapter=observe_adapter,
+        recents_path=str(tmp_path / "recent_projects.json"),
+        config_path=str(tmp_path / "companion_config.json"),
+        session_registry_path=str(tmp_path / "session_registry.db"),
+    )
+
+    async def _boom() -> None:
+        raise OSError("simulated: status socket bind failed")
+
+    monkeypatch.setattr(daemon, "_start_status_socket", _boom)
+
+    with pytest.raises(OSError, match="simulated"):
+        await daemon.run()
+
+    assert not os.path.exists(observe_adapter.socket_path)  # observe_adapter.stop() still ran
+
+
+@pytest.mark.asyncio
 async def test_status_socket_reports_the_active_session_count(tmp_path):
     """Test scenario 1/2: a client connecting to the status socket
     (companion/cli.py's `precheck`, or a raw client in this test) gets back
