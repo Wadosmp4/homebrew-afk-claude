@@ -34,12 +34,12 @@ from companion.adapters.codex_adapter import CodexAdapter
 from companion.adapters.observe_adapter import KNOWN_ENTRYPOINTS, ObserveAdapter
 from companion.adapters.sdk_adapter import SDKAdapter
 from companion.config import CompanionConfig, load_config
-from companion.daemon import CompanionDaemon
+from companion.daemon import COMPANION_VERSION, CompanionDaemon
 from companion import git_status, session_registry
 from companion.tests.test_codex_adapter import FakeCodexClient, _rate_limits_notification
 from companion.tests.test_sdk_adapter import _STOP, FakeSDKClient
 from relay import auth
-from relay.app import create_app
+from relay.app import MIN_SUPPORTED_PHONE_VERSION, create_app
 
 
 def _free_port() -> int:
@@ -239,6 +239,43 @@ async def test_daemon_connects_authenticates_and_sends_heartbeats(relay, compani
 
     await _stop_daemon(daemon, task)
     assert daemon.state == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_connect_and_serve_reports_its_own_version_in_the_hello_payload(tmp_path):
+    """Update Safety plan (U1/R1): the hello payload must report this
+    companion's own version (KTD1: importlib.metadata.version, cached at
+    import time as companion.daemon.COMPANION_VERSION), so the relay can
+    enforce its version floor (R2). Uses a bare stub "relay" (raw
+    websockets.serve, not the real FastAPI app) rather than the `relay`
+    fixture - this test only needs to prove what the daemon actually sends
+    on the wire; the real relay's own floor-enforcement behavior is
+    covered separately in relay/tests/test_events.py."""
+    received: list[dict] = []
+    port = _free_port()
+
+    async def handler(ws):
+        received.append(json.loads(await ws.recv()))
+        await ws.send(json.dumps({"type": "ack", "device_id": "stub"}))
+        await ws.wait_closed()
+
+    server = await websockets.serve(handler, "127.0.0.1", port)
+    try:
+        daemon = CompanionDaemon(
+            _fast_config(port, "irrelevant-token"),
+            observe_adapter=_test_observe_adapter(tmp_path),
+            recents_path=str(tmp_path / "recent_projects.json"),
+            config_path=str(tmp_path / "companion_config.json"),
+            session_registry_path=str(tmp_path / "session_registry.db"),
+        )
+        task = asyncio.create_task(daemon.run())
+        await _wait_until(lambda: len(received) >= 1)
+        await _stop_daemon(daemon, task)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert received[0]["version"] == COMPANION_VERSION
 
 
 @pytest.mark.asyncio
@@ -513,7 +550,12 @@ class _FakePhone:
     @classmethod
     async def connect(cls, port: int, token: str) -> "_FakePhone":
         ws = await websockets.connect(f"ws://127.0.0.1:{port}/ws/phone")
-        await ws.send(json.dumps({"token": token}))
+        # Update Safety plan (U1/R2): the relay now hard-blocks a connect
+        # with no "version" field (treated as below floor) - a
+        # floor-satisfying version keeps this stand-in phone connecting
+        # normally rather than every test using it tripping the new
+        # rejection.
+        await ws.send(json.dumps({"token": token, "version": MIN_SUPPORTED_PHONE_VERSION}))
         reply = json.loads(await ws.recv())
         assert reply["type"] == "ack"
         return cls(ws, token)

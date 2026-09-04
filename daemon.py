@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.metadata
 import json
 import logging
 import os
@@ -64,6 +65,31 @@ from .adapters.sdk_adapter import SDKAdapter
 from .config import DEFAULT_SESSION_REGISTRY_PATH, CompanionConfig, load_config, save_config
 
 logger = logging.getLogger(__name__)
+
+
+def _companion_version() -> str:
+    """Update Safety plan (U1), KTD1: reads this companion's own version
+    via the installed package's metadata rather than a hand-maintained
+    `__version__` string that could drift from the two pyproject.toml
+    files (pyproject.toml, companion/pyproject.toml) already kept in sync
+    manually per the release runbook - the installed package's own
+    metadata is authoritative regardless of Homebrew, pip, or editable
+    install. Falls back to "0.0.0" - itself always below any relay version
+    floor (relay/app.py's MIN_SUPPORTED_COMPANION_VERSION) - if metadata is
+    somehow missing (e.g. running from a source checkout with no package
+    ever installed), so a broken lookup degrades to "rejected as too old"
+    rather than crashing every connection attempt."""
+    try:
+        return importlib.metadata.version("remote-claude-companion")
+    except importlib.metadata.PackageNotFoundError:
+        return "0.0.0"
+
+
+# Read once at import time (daemon startup) and cached for the process
+# lifetime (KTD1) - every hello this companion ever sends (_connect_and_serve
+# below) reports this same value, rather than re-reading package metadata on
+# every reconnect.
+COMPANION_VERSION = _companion_version()
 
 # Dynamic-linker/interpreter injection vectors - a phone-supplied cli_env
 # containing any of these could hijack the spawned CLI subprocess (e.g.
@@ -424,7 +450,16 @@ class CompanionDaemon:
 
     async def _connect_and_serve(self) -> None:
         async with websockets.connect(self.config.relay_url) as ws:
-            await ws.send(json.dumps({"token": self.config.device_token, "type": "hello"}))
+            # Update Safety plan (U1/R1): reports this companion's own
+            # version at connect time - the relay is the sole enforcement
+            # point for version compatibility (R2), so this daemon makes no
+            # attempt to interpret or validate the relay's own version in
+            # return, only to report its own honestly.
+            await ws.send(
+                json.dumps(
+                    {"token": self.config.device_token, "type": "hello", "version": COMPANION_VERSION}
+                )
+            )
             reply = json.loads(await ws.recv())
             if reply.get("type") != "ack":
                 raise websockets.exceptions.WebSocketException(
