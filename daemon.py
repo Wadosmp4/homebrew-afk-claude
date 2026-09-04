@@ -480,9 +480,11 @@ class CompanionDaemon:
                 self.connect_attempts += 1
                 try:
                     await self._connect_and_serve()
-                except websockets.exceptions.ConnectionClosed as exc:
-                    # Update Safety plan (U2/R10/KTD9): a 4402 close names
-                    # this companion's own version as below the relay's
+                except (OSError, websockets.exceptions.WebSocketException) as exc:
+                    # Update Safety plan (U2/R10/KTD9): a 4402 close (a
+                    # ConnectionClosed, which is itself a WebSocketException
+                    # - already caught by this clause) names this
+                    # companion's own version as below the relay's
                     # supported floor (KTD6) - retrying would just get
                     # rejected again forever, with the rejection message
                     # never surfacing anywhere an operator would see it
@@ -498,7 +500,7 @@ class CompanionDaemon:
                     # expectation - while genuinely never reconnecting; only
                     # an explicit stop() call or the next deliberate service
                     # restart ends it.
-                    if exc.code == 4402:
+                    if isinstance(exc, websockets.exceptions.ConnectionClosed) and exc.code == 4402:
                         self.state = "version_blocked"
                         logger.error(
                             "relay rejected this companion's connection for being below "
@@ -509,8 +511,6 @@ class CompanionDaemon:
                         await self._stop_event.wait()
                     else:
                         logger.info("companion connection lost/failed: %s", exc)
-                except (OSError, websockets.exceptions.WebSocketException) as exc:
-                    logger.info("companion connection lost/failed: %s", exc)
                 if self._stop_event.is_set():
                     break
                 self.state = "reconnecting"
