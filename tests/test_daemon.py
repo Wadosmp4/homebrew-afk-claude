@@ -278,6 +278,77 @@ async def test_connect_and_serve_reports_its_own_version_in_the_hello_payload(tm
     assert received[0]["version"] == COMPANION_VERSION
 
 
+# --- _companion_version()'s fallback chain (Update Safety plan U1, KTD1) ----
+#
+# Code review finding (testing): the only existing coverage above compares
+# the wire payload to COMPANION_VERSION, the same runtime-computed constant -
+# tautological, since it would pass even if _companion_version() itself
+# silently regressed. These call the function directly with each branch's
+# dependency mocked out.
+
+
+def test_companion_version_uses_installed_package_metadata_when_present(monkeypatch):
+    import importlib.metadata
+
+    from companion import daemon as daemon_module
+
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "9.9.9")
+    assert daemon_module._companion_version() == "9.9.9"
+
+
+def test_companion_version_falls_back_to_pyproject_toml_when_package_not_installed(monkeypatch):
+    """The dev/test workflow this repo actually uses (source checkout, no
+    `pip install -e .`) hits exactly this branch - see the function's own
+    docstring for the test breakage this fix was written to prevent."""
+    import importlib.metadata
+    import pathlib
+
+    from companion import daemon as daemon_module
+
+    def _raise(name):
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    fake_pyproject = 'other = "ignored"\nversion = "1.2.3"\nname = "remote-claude-companion"\n'
+    monkeypatch.setattr(importlib.metadata, "version", _raise)
+    monkeypatch.setattr(pathlib.Path, "read_text", lambda self: fake_pyproject)
+    assert daemon_module._companion_version() == "1.2.3"
+
+
+def test_companion_version_falls_back_to_0_0_0_when_neither_source_is_available(monkeypatch):
+    """Belt-and-suspenders last resort: "0.0.0" is always below any relay
+    version floor, so a broken lookup degrades to "rejected as too old"
+    rather than crashing every connection attempt (see the function's own
+    docstring)."""
+    import importlib.metadata
+    import pathlib
+
+    from companion import daemon as daemon_module
+
+    def _raise(name):
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    def _raise_os_error(self):
+        raise OSError("simulated: pyproject.toml not found")
+
+    monkeypatch.setattr(importlib.metadata, "version", _raise)
+    monkeypatch.setattr(pathlib.Path, "read_text", _raise_os_error)
+    assert daemon_module._companion_version() == "0.0.0"
+
+
+def test_companion_version_falls_back_to_0_0_0_when_pyproject_toml_has_no_version_line(monkeypatch):
+    import importlib.metadata
+    import pathlib
+
+    from companion import daemon as daemon_module
+
+    def _raise(name):
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", _raise)
+    monkeypatch.setattr(pathlib.Path, "read_text", lambda self: 'name = "remote-claude-companion"\n')
+    assert daemon_module._companion_version() == "0.0.0"
+
+
 @pytest.mark.asyncio
 async def test_daemon_retries_with_backoff_when_relay_unreachable(tmp_path):
     unreachable_port = _free_port()  # nothing listening on it
