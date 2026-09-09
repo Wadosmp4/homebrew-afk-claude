@@ -691,14 +691,14 @@ async def test_count_active_sessions_counts_only_active_true_across_adapters(tmp
 
 @pytest.mark.asyncio
 async def test_a_status_socket_start_failure_still_tears_down_observe_adapter(tmp_path, monkeypatch):
-    """Code review finding (reliability, U3): _start_status_socket() sits
+    """Code review finding (reliability, U3): status_server.start() sits
     between observe_adapter.start() and the try/finally that calls
     observe_adapter.stop() - if it raises (a permission error, or two
     daemon instances contending for the same default status_socket_path,
     exactly the scenario status_socket_path's own constructor comment
     calls out), the exception used to propagate straight out of run()
     with observe_adapter.stop() never called, leaking its bound Unix
-    socket. Moved _start_status_socket() inside the try so a failure there
+    socket. Moved status_server.start() inside the try so a failure there
     still reaches finally. Proven here via a real ObserveAdapter (not the
     _FakeCountAdapter used elsewhere in this file) so the assertion is
     "the real hooks socket file is gone", the same observable cleanup
@@ -716,7 +716,7 @@ async def test_a_status_socket_start_failure_still_tears_down_observe_adapter(tm
     async def _boom() -> None:
         raise OSError("simulated: status socket bind failed")
 
-    monkeypatch.setattr(daemon, "_start_status_socket", _boom)
+    monkeypatch.setattr(daemon.status_server, "start", _boom)
 
     with pytest.raises(OSError, match="simulated"):
         await daemon.run()
@@ -735,14 +735,14 @@ async def test_status_socket_reports_the_active_session_count(tmp_path):
     status_socket_path = _short_socket_path()
     daemon = _count_test_daemon(tmp_path, sdk=fake_sdk, status_socket_path=status_socket_path)
 
-    await daemon._start_status_socket()
+    await daemon.status_server.start()
     try:
         reader, writer = await asyncio.open_unix_connection(status_socket_path)
         raw = await reader.readuntil(b"\n")
         writer.close()
         assert json.loads(raw.decode("utf-8")) == {"active_sessions": 2}
     finally:
-        await daemon._stop_status_socket()
+        await daemon.status_server.stop()
 
 
 @pytest.mark.asyncio
@@ -762,7 +762,7 @@ async def test_status_socket_reports_an_error_field_when_counting_raises(tmp_pat
 
     monkeypatch.setattr(daemon, "_count_active_sessions", _boom)
 
-    await daemon._start_status_socket()
+    await daemon.status_server.start()
     try:
         reader, writer = await asyncio.open_unix_connection(status_socket_path)
         raw = await reader.readuntil(b"\n")
@@ -771,7 +771,7 @@ async def test_status_socket_reports_an_error_field_when_counting_raises(tmp_pat
         assert body["active_sessions"] is None
         assert "error" in body and isinstance(body["error"], str) and body["error"]
     finally:
-        await daemon._stop_status_socket()
+        await daemon.status_server.stop()
 
 
 @pytest.mark.asyncio

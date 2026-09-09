@@ -50,7 +50,6 @@ import os
 import pathlib
 import pty
 import re
-import stat
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -66,6 +65,7 @@ from .adapters.events import Event
 from .adapters.observe_adapter import KNOWN_ENTRYPOINTS, ObserveAdapter
 from .adapters.sdk_adapter import SDKAdapter
 from .config import DEFAULT_SESSION_REGISTRY_PATH, CompanionConfig, load_config, save_config
+from .status_socket import StatusSocketServer
 
 logger = logging.getLogger(__name__)
 
@@ -387,9 +387,17 @@ class CompanionDaemon:
         # as the paths above - tests must never bind the real
         # ~/.config/remote-claude-companion/status.sock, and a machine
         # running two daemons in parallel (dev + real) needs distinct
-        # sockets too.
+        # sockets too. The server itself lives in status_socket.py (code
+        # review finding, maintainability) - this daemon only supplies the
+        # path and its own _count_active_sessions as the one thing the
+        # server needs to answer with.
         self.status_socket_path = status_socket_path or DEFAULT_STATUS_SOCKET_PATH
-        self._status_server: Optional[asyncio.AbstractServer] = None
+        # A lambda deferring the attribute lookup to call time, not a bound
+        # method reference captured here - the latter would freeze in this
+        # exact _count_active_sessions object, so a test's
+        # monkeypatch.setattr(daemon, "_count_active_sessions", ...) after
+        # construction would silently never reach status_server's calls.
+        self.status_server = StatusSocketServer(self.status_socket_path, lambda: self._count_active_sessions())
         self.state = "connecting"
         self.connect_attempts = 0
         self.heartbeats_sent = 0
@@ -470,7 +478,7 @@ class CompanionDaemon:
         try:
             # Update Safety plan (U3), R4/R6, code review finding: started
             # here (inside the try, ahead of the while loop) rather than
-            # before it - a failure in _start_status_socket() (e.g. a
+            # before it - a failure in status_server.start() (e.g. a
             # permission error, or two daemon instances contending for the
             # same default status_socket_path, exactly the scenario
             # status_socket_path's own constructor comment calls out) must
@@ -481,7 +489,7 @@ class CompanionDaemon:
             # even while this daemon is offline or stuck reconnecting to
             # the relay - exactly the situation an operator most needs it
             # to still work in.
-            await self._start_status_socket()
+            await self.status_server.start()
             while not self._stop_event.is_set():
                 self.state = "connecting"
                 self.connect_attempts += 1
@@ -525,7 +533,7 @@ class CompanionDaemon:
                 self._backoff = min(self._backoff * 2, self.config.reconnect_max_delay)
         finally:
             await self.observe_adapter.stop()
-            await self._stop_status_socket()
+            await self.status_server.stop()
             # A still-active SDK-owned/Codex session's own background task
             # (SDKAdapter's reader_task, CodexAdapter's stream_task) would
             # otherwise outlive this daemon shutdown, leaked - orphaned,
@@ -1188,58 +1196,6 @@ class CompanionDaemon:
         sessions an upgrade could actually disrupt."""
         sessions = await self._gather_active_sessions()
         return sum(1 for session in sessions if session["active"])
-
-    async def _start_status_socket(self) -> None:
-        """Update Safety plan (U3), R4/R6, KTD10: a Unix socket serving
-        exactly one purpose - answering `companion precheck` (companion/
-        cli.py). Same lifecycle shape as ObserveAdapter.start()'s own hooks
-        socket (adapters/observe_adapter.py): stale-socket cleanup from a
-        prior crashed run, then 0600 permissions (local-only - no reason
-        for another user on this machine to learn session counts)."""
-        os.makedirs(os.path.dirname(self.status_socket_path) or ".", exist_ok=True)
-        if os.path.exists(self.status_socket_path):
-            os.remove(self.status_socket_path)  # stale socket from a prior crashed run
-        self._status_server = await asyncio.start_unix_server(
-            self._handle_status_connection, path=self.status_socket_path
-        )
-        os.chmod(self.status_socket_path, stat.S_IRUSR | stat.S_IWUSR)  # 0600 - local privilege surface (Risk)
-
-    async def _stop_status_socket(self) -> None:
-        """Mirrors ObserveAdapter.stop()'s own socket teardown."""
-        if self._status_server is not None:
-            self._status_server.close()
-            await self._status_server.wait_closed()
-        if os.path.exists(self.status_socket_path):
-            os.remove(self.status_socket_path)
-
-    async def _handle_status_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        """R4/R5/R6: there's only ever one question a client can ask here,
-        so unlike ObserveAdapter's hooks socket this never reads a request
-        payload - it just answers as soon as a client connects. Writes the
-        response unconditionally from a `finally`, mirroring
-        ObserveAdapter._handle_hook_connection's own shape, so a bug in
-        _count_active_sessions can't leave `companion precheck` hanging on
-        a connection that's never going to answer.
-
-        Code review finding (testing/correctness, U3): an internal failure
-        here used to answer with the bare `{"active_sessions": null}` a
-        client also gets from a plain OSError (socket doesn't exist,
-        connection refused) - `precheck` couldn't tell "the daemon is up
-        but something broke counting sessions" apart from "the daemon
-        isn't reachable at all", which matters to an operator deciding
-        whether to upgrade anyway. The `error` field, present only on this
-        branch, is precheck's signal to report the distinction."""
-        response: dict[str, Any] = {"active_sessions": None}
-        try:
-            response = {"active_sessions": await self._count_active_sessions()}
-        except Exception as exc:
-            logger.exception("status socket: failed to count active sessions")
-            response = {"active_sessions": None, "error": str(exc) or exc.__class__.__name__}
-        finally:
-            writer.write(json.dumps(response).encode("utf-8") + b"\n")
-            with contextlib.suppress(Exception):
-                await writer.drain()
-            writer.close()
 
     async def _handle_list_project_sessions(
         self, ws: "websockets.WebSocketClientProtocol", cwd: Optional[str]
