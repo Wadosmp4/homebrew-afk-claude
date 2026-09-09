@@ -12,6 +12,34 @@ from __future__ import annotations
 import json
 import socket
 import sys
+from typing import Optional
+
+
+def read_unix_socket_response(
+    socket_path: str, payload: Optional[bytes] = None, timeout: Optional[float] = None
+) -> bytes:
+    """Connects to a local Unix-domain socket, optionally sends `payload`
+    (half-closing the write side afterward so the server sees EOF), and
+    reads until the server closes its end. Shared by this module's own
+    `main()` below and companion/cli.py's `precheck` (U3) - both are plain
+    request/response clients of a companion-owned Unix socket and were
+    hand-rolling the same connect+recv-until-close loop before this
+    extraction, which had already let the two drift (only one had a
+    `timeout`)."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        if timeout is not None:
+            sock.settimeout(timeout)
+        sock.connect(socket_path)
+        if payload is not None:
+            sock.sendall(payload)
+            sock.shutdown(socket.SHUT_WR)
+        response = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+        return response
 
 
 def main(argv: list[str]) -> int:
@@ -27,16 +55,7 @@ def main(argv: list[str]) -> int:
     payload["_hook_event"] = event_name
 
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.connect(socket_path)
-            sock.sendall(json.dumps(payload).encode("utf-8") + b"\n")
-            sock.shutdown(socket.SHUT_WR)
-            response = b""
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                response += chunk
+        response = read_unix_socket_response(socket_path, json.dumps(payload).encode("utf-8") + b"\n")
     except OSError:
         # Companion isn't running / socket gone - fail open with an empty
         # decision rather than crashing the hook and blocking Claude Code.

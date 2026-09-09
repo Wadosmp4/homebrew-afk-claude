@@ -1219,12 +1219,22 @@ class CompanionDaemon:
         response unconditionally from a `finally`, mirroring
         ObserveAdapter._handle_hook_connection's own shape, so a bug in
         _count_active_sessions can't leave `companion precheck` hanging on
-        a connection that's never going to answer."""
+        a connection that's never going to answer.
+
+        Code review finding (testing/correctness, U3): an internal failure
+        here used to answer with the bare `{"active_sessions": null}` a
+        client also gets from a plain OSError (socket doesn't exist,
+        connection refused) - `precheck` couldn't tell "the daemon is up
+        but something broke counting sessions" apart from "the daemon
+        isn't reachable at all", which matters to an operator deciding
+        whether to upgrade anyway. The `error` field, present only on this
+        branch, is precheck's signal to report the distinction."""
         response: dict[str, Any] = {"active_sessions": None}
         try:
             response = {"active_sessions": await self._count_active_sessions()}
-        except Exception:
+        except Exception as exc:
             logger.exception("status socket: failed to count active sessions")
+            response = {"active_sessions": None, "error": str(exc) or exc.__class__.__name__}
         finally:
             writer.write(json.dumps(response).encode("utf-8") + b"\n")
             with contextlib.suppress(Exception):
@@ -2018,11 +2028,11 @@ class CompanionDaemon:
             pass
 
 
-def main(config_path: Optional[str] = None) -> None:
+def main(config_path: Optional[str] = None, status_socket_path: Optional[str] = None) -> None:
     logging.basicConfig(level=logging.INFO)
     resolved_config_path = config_path or DEFAULT_SESSION_REGISTRY_PATH
     config = load_config(resolved_config_path)
-    daemon = CompanionDaemon(config, config_path=resolved_config_path)
+    daemon = CompanionDaemon(config, config_path=resolved_config_path, status_socket_path=status_socket_path)
     try:
         asyncio.run(daemon.run())
     except KeyboardInterrupt:

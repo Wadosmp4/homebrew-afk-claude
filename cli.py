@@ -63,6 +63,7 @@ import urllib.error
 import urllib.request
 from typing import Optional, Sequence
 
+from . import hook_bridge
 from .config import (
     CompanionConfig,
     DEFAULT_RELAY_URL,
@@ -87,7 +88,7 @@ def _configure(args: argparse.Namespace) -> None:
 
 
 def _run(args: argparse.Namespace) -> None:
-    run_daemon(config_path=args.config_path)
+    run_daemon(config_path=args.config_path, status_socket_path=args.status_socket_path)
 
 
 def _derive_ws_url(relay_http_url: str) -> str:
@@ -311,32 +312,40 @@ def _precheck(args: argparse.Namespace) -> None:
     `relay/` - companion/pyproject.toml's own packages list already keeps
     `relay/` out of a Homebrew install entirely, so this stays a plain
     client of the daemon's own local status socket (companion/daemon.py's
-    `_start_status_socket`), matching hook_bridge.py's fail-open-on-OSError
-    posture: an unreachable daemon (not running, socket gone, unresponsive)
-    is reported plainly rather than raised as an error (R6), and this
-    function never calls sys.exit with a nonzero code - AE4 is explicit
-    that "unreachable" must not look like it blocked anything."""
+    `_start_status_socket`), sharing hook_bridge.py's connect+recv-until-
+    close helper and its fail-open-on-OSError posture: an unreachable
+    daemon (not running, socket gone, unresponsive) is reported plainly
+    rather than raised as an error (R6), and this function never calls
+    sys.exit with a nonzero code - AE4 is explicit that "unreachable" must
+    not look like it blocked anything.
+
+    Code review finding (correctness): a daemon that IS reachable but
+    fails internally counting sessions (companion/daemon.py's
+    `_handle_status_connection` exception branch) used to print the exact
+    same "unreachable" message as a daemon that isn't running at all -
+    genuinely different situations for an operator deciding whether to
+    upgrade anyway. That branch's response now carries an `error` field;
+    this function reports it distinctly rather than folding it into
+    "unreachable"."""
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(5.0)
-            sock.connect(args.status_socket_path)
-            response = b""
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                response += chunk
+        response = hook_bridge.read_unix_socket_response(args.status_socket_path, timeout=5.0)
     except OSError:
         print("Companion daemon is unreachable - could not check active sessions.")
         return
 
     try:
-        count = json.loads(response.decode("utf-8"))["active_sessions"]
+        body = json.loads(response.decode("utf-8"))
+        count = body["active_sessions"]
+        error = body.get("error") if isinstance(body, dict) else None
     except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError):
         count = None
+        error = None
 
     if count is None:
-        print("Companion daemon is unreachable - could not check active sessions.")
+        if error:
+            print(f"Companion daemon is running but failed to count active sessions: {error}")
+        else:
+            print("Companion daemon is unreachable - could not check active sessions.")
         return
 
     plural = "s" if count != 1 else ""
@@ -406,6 +415,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--config-path",
         default=DEFAULT_SESSION_REGISTRY_PATH,
         help=f"Path to the companion config file (default: {DEFAULT_SESSION_REGISTRY_PATH})",
+    )
+    run_parser.add_argument(
+        "--status-socket-path",
+        default=None,
+        help=(
+            "Path to this daemon's status socket, answered by `precheck` (default: "
+            f"{DEFAULT_STATUS_SOCKET_PATH}). Only needed to run a second daemon "
+            "instance alongside one already using the default path."
+        ),
     )
     run_parser.set_defaults(func=_run)
 

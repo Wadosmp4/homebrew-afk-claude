@@ -675,6 +675,35 @@ async def test_status_socket_reports_the_active_session_count(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_status_socket_reports_an_error_field_when_counting_raises(tmp_path, monkeypatch):
+    """Code review finding (testing/correctness, U3): a client connecting
+    while _count_active_sessions() itself raises previously got back
+    `{"active_sessions": null}` - indistinguishable from a daemon that
+    can't be reached at all, since precheck's own OSError-catch produces
+    the same null. The response now carries an `error` field in that case
+    so precheck (below) can tell "daemon is up but failed internally"
+    apart from "daemon is unreachable"."""
+    status_socket_path = _short_socket_path()
+    daemon = _count_test_daemon(tmp_path, status_socket_path=status_socket_path)
+
+    async def _boom() -> int:
+        raise RuntimeError("simulated: session registry is locked")
+
+    monkeypatch.setattr(daemon, "_count_active_sessions", _boom)
+
+    await daemon._start_status_socket()
+    try:
+        reader, writer = await asyncio.open_unix_connection(status_socket_path)
+        raw = await reader.readuntil(b"\n")
+        writer.close()
+        body = json.loads(raw.decode("utf-8"))
+        assert body["active_sessions"] is None
+        assert "error" in body and isinstance(body["error"], str) and body["error"]
+    finally:
+        await daemon._stop_status_socket()
+
+
+@pytest.mark.asyncio
 async def test_reclaim_forwarder_hands_a_session_back_to_its_authoritative_adapter(tmp_path):
     """code-review finding (P1): _forwarding_adapter/_watch_active_sessions/
     _reclaim_forwarder implement a nontrivial race-condition fix with zero

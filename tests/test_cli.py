@@ -89,23 +89,51 @@ def test_configure_defaults_observe_auto_approve_and_llm_judge_off(tmp_path):
 
 def test_run_delegates_to_the_daemon_main_with_the_given_config_path(monkeypatch, tmp_path):
     calls = []
-    monkeypatch.setattr("companion.cli.run_daemon", lambda config_path=None: calls.append(config_path))
+    monkeypatch.setattr(
+        "companion.cli.run_daemon",
+        lambda config_path=None, status_socket_path=None: calls.append((config_path, status_socket_path)),
+    )
 
     config_path = str(tmp_path / "config.json")
     main(["run", "--config-path", config_path])
 
-    assert calls == [config_path]
+    assert calls == [(config_path, None)]
 
 
 def test_run_defaults_to_the_standard_config_path(monkeypatch):
     from companion.config import DEFAULT_SESSION_REGISTRY_PATH
 
     calls = []
-    monkeypatch.setattr("companion.cli.run_daemon", lambda config_path=None: calls.append(config_path))
+    monkeypatch.setattr(
+        "companion.cli.run_daemon",
+        lambda config_path=None, status_socket_path=None: calls.append((config_path, status_socket_path)),
+    )
 
     main(["run"])
 
-    assert calls == [DEFAULT_SESSION_REGISTRY_PATH]
+    assert calls == [(DEFAULT_SESSION_REGISTRY_PATH, None)]
+
+
+def test_run_forwards_an_explicit_status_socket_path(monkeypatch, tmp_path):
+    """Code review finding (correctness, U3): `run` had no way to point a
+    second daemon instance at a different status socket, unlike `precheck`
+    which already accepts one - two daemons started with different
+    --config-path values (e.g. a dev instance alongside a real one) would
+    collide on the same default status.sock, with the second silently
+    stealing it (see status_socket_path's own constructor comment in
+    companion/daemon.py)."""
+    calls = []
+    monkeypatch.setattr(
+        "companion.cli.run_daemon",
+        lambda config_path=None, status_socket_path=None: calls.append((config_path, status_socket_path)),
+    )
+
+    from companion.config import DEFAULT_SESSION_REGISTRY_PATH
+
+    status_socket_path = str(tmp_path / "status.sock")
+    main(["run", "--status-socket-path", status_socket_path])
+
+    assert calls == [(DEFAULT_SESSION_REGISTRY_PATH, status_socket_path)]
 
 
 def test_no_subcommand_is_a_usage_error():
@@ -655,6 +683,68 @@ def test_precheck_reports_daemon_unreachable_when_the_socket_does_not_exist(caps
     not as an error - and, per R5, must never look like it blocked
     anything. main() must not raise SystemExit here (implicit exit 0)."""
     main(["precheck", "--status-socket-path", "/tmp/definitely-not-a-real-status-socket.sock"])
+
+    out = capsys.readouterr().out.lower()
+    assert "unreachable" in out
+
+
+def test_precheck_distinguishes_a_daemon_internal_error_from_unreachable(capsys):
+    """Code review finding (correctness): a daemon that answered but failed
+    internally counting sessions (companion/daemon.py's `error` field) must
+    print a message distinguishable from "unreachable" - an operator seeing
+    "unreachable" would reasonably conclude the daemon isn't running at
+    all, which is a different situation (and a different next step) than a
+    running daemon that hit an internal bug."""
+    socket_path = _short_socket_path()
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(socket_path)
+    server.listen(1)
+
+    def serve_one():
+        conn, _ = server.accept()
+        with conn:
+            conn.sendall(
+                json.dumps({"active_sessions": None, "error": "session registry is locked"}).encode("utf-8")
+                + b"\n"
+            )
+
+    thread = threading.Thread(target=serve_one)
+    thread.start()
+    try:
+        main(["precheck", "--status-socket-path", socket_path])
+    finally:
+        thread.join(timeout=2)
+        server.close()
+        os.remove(socket_path)
+
+    out = capsys.readouterr().out.lower()
+    assert "unreachable" not in out
+    assert "session registry is locked" in out
+
+
+def test_precheck_reports_unreachable_on_a_malformed_response(capsys):
+    """A daemon that answers with garbage (not the {"active_sessions": ...}
+    shape at all) must fail open the same way an actually-unreachable
+    daemon does, not raise past AE4's "never look like it blocked
+    anything" contract."""
+    socket_path = _short_socket_path()
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(socket_path)
+    server.listen(1)
+
+    def serve_one():
+        conn, _ = server.accept()
+        with conn:
+            conn.sendall(b"not json at all\n")
+
+    thread = threading.Thread(target=serve_one)
+    thread.start()
+    try:
+        main(["precheck", "--status-socket-path", socket_path])
+    finally:
+        thread.join(timeout=2)
+        server.close()
+        os.remove(socket_path)
 
     out = capsys.readouterr().out.lower()
     assert "unreachable" in out
