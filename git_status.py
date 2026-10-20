@@ -9,6 +9,7 @@ event on the requesting session's stream (see its `_handle_action`).
 """
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import subprocess
 from dataclasses import dataclass, field
@@ -49,6 +50,27 @@ def _is_git_repo(cwd: str) -> bool:
     return result.returncode == 0 and result.stdout.strip() == "true"
 
 
+def _classify_porcelain_line(line: str) -> Optional[tuple[str, str]]:
+    """Parses one `git status --porcelain` line into (kind, path) - kind is
+    one of 'added'/'deleted'/'modified', matching _ADDED_CODES/
+    _DELETED_CODES above. Shared by get_status (whole-tree) and
+    _status_kind_for_path (single-path, scoped) below so both classify a
+    line identically.
+
+    Porcelain v1: two status chars, a space, then the path (possibly
+    `old -> new` for a rename, treated as a modification of `new` - a full
+    rename-aware UI is future work, not R16's scope)."""
+    if not line:
+        return None
+    code = line[:2]
+    path = line[3:].split(" -> ")[-1]
+    if "?" in code or "A" in code:
+        return "added", path
+    if "D" in code:
+        return "deleted", path
+    return "modified", path
+
+
 @dataclass
 class GitStatus:
     is_git_repo: bool
@@ -78,30 +100,32 @@ def get_status(cwd: str) -> GitStatus:
     if not _is_git_repo(cwd):
         return GitStatus(is_git_repo=False)
 
-    branch_result = _run_git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
-    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
+    # Speed fix (user report): these three are independent reads - none of
+    # them depends on another's result - so running them concurrently
+    # instead of one after another cuts this call's wall-clock time to
+    # roughly its slowest single subprocess rather than the sum of all
+    # three (each `subprocess.run` releases the GIL while its child process
+    # runs, so this genuinely overlaps, not just queues, on CPython).
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        branch_future = executor.submit(_run_git, cwd, "rev-parse", "--abbrev-ref", "HEAD")
+        commit_future = executor.submit(_run_git, cwd, "log", "-1", "--pretty=%s")
+        porcelain_future = executor.submit(_run_git, cwd, "status", "--porcelain")
+        branch_result = branch_future.result()
+        commit_result = commit_future.result()
+        porcelain = porcelain_future.result()
 
-    commit_result = _run_git(cwd, "log", "-1", "--pretty=%s")
+    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
     last_commit = commit_result.stdout.strip() if commit_result.returncode == 0 and commit_result.stdout.strip() else None
 
-    porcelain = _run_git(cwd, "status", "--porcelain")
     modified: list[str] = []
     added: list[str] = []
     deleted: list[str] = []
     for line in porcelain.stdout.splitlines():
-        if not line:
+        classified = _classify_porcelain_line(line)
+        if classified is None:
             continue
-        # Porcelain v1: two status chars, a space, then the path (possibly
-        # `old -> new` for a rename, which we treat as a modification of
-        # `new` - a full rename-aware UI is future work, not R16's scope).
-        code = line[:2]
-        path = line[3:].split(" -> ")[-1]
-        if "?" in code or "A" in code:
-            added.append(path)
-        elif "D" in code:
-            deleted.append(path)
-        else:
-            modified.append(path)
+        kind, path = classified
+        {"added": added, "deleted": deleted, "modified": modified}[kind].append(path)
 
     return GitStatus(is_git_repo=True, branch=branch, modified=modified, added=added, deleted=deleted, last_commit=last_commit)
 
@@ -123,10 +147,18 @@ def get_diff(cwd: str, path: str) -> GitDiff:
     A binary file is reported as changed (is_binary=True) without
     attempting to render a text diff - git's own `Binary files differ`
     porcelain line is the signal, not a heuristic on the path/content."""
-    if not _is_git_repo(cwd):
-        return GitDiff(is_git_repo=False)
+    # Speed fix (user report): `diff HEAD` against a path that turns out not
+    # to be inside a git repo at all just fails harmlessly (empty stdout,
+    # non-zero exit) - so it's safe to kick it off at the same time as the
+    # is-a-repo check instead of waiting for that check first, and only use
+    # its result once the repo check actually passes.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        is_repo_future = executor.submit(_is_git_repo, cwd)
+        tracked_future = executor.submit(_run_git, cwd, "diff", "HEAD", "--", path)
+        if not is_repo_future.result():
+            return GitDiff(is_git_repo=False)
+        tracked = tracked_future.result()
 
-    tracked = _run_git(cwd, "diff", "HEAD", "--", path)
     output = tracked.stdout
     if not output.strip():
         # Not modified relative to HEAD - could be untracked; diff against
@@ -148,6 +180,27 @@ class PathValidation:
     reason: Optional[str] = None
 
 
+def _status_kind_for_path(cwd: str, relative_path: str) -> Optional[str]:
+    """Speed fix (user report): _validate_session_path only ever needs to
+    know one path's own status - it used to call get_status(cwd) wholesale
+    for that, which spends two extra subprocess calls on branch/last_commit
+    it never looks at, and (on a repo with many changed files, or just a
+    large working tree) makes git enumerate the *entire* working tree's
+    status rather than the one path being checked. Scoping the same
+    `git status --porcelain` call to `relative_path` via a pathspec gets
+    git to do that narrower, cheaper walk directly, and drops the branch/
+    commit calls entirely. Returns None when the path isn't reported as
+    changed at all (not a git repo, untracked-but-ignored, or unchanged) -
+    the same "not changed" shape get_status's own empty lists give a
+    caller when cwd isn't a repo."""
+    result = _run_git(cwd, "status", "--porcelain", "--", relative_path)
+    for line in result.stdout.splitlines():
+        classified = _classify_porcelain_line(line)
+        if classified is not None:
+            return classified[0]
+    return None
+
+
 def _validate_session_path(cwd: str, path: str) -> PathValidation:
     """Quick-Edit Changed Files plan, KTD1: shared by get_file_content and
     write_session_file - a path must both stay inside the session's own
@@ -162,8 +215,8 @@ def _validate_session_path(cwd: str, path: str) -> PathValidation:
     none, which is deliberately not the pattern followed here.
 
     Membership compares `os.path.relpath(resolved_path, resolved_cwd)`,
-    forward-slash-normalized, for an *exact* match against get_status(cwd)'s
-    modified/added lists - never a substring/endswith match, and never the
+    forward-slash-normalized, against _status_kind_for_path's own classification
+    of that exact path - never a substring/endswith match, and never the
     absolute resolved path itself, since git's own porcelain output is
     always cwd-relative. A doc-review pass on this plan found the originally
     drafted check compared the absolute path directly, which would have
@@ -176,11 +229,11 @@ def _validate_session_path(cwd: str, path: str) -> PathValidation:
     if not (resolved_path == resolved_cwd or resolved_path.startswith(resolved_cwd + os.sep)):
         return PathValidation(ok=False, reason="path_escape")
 
-    status = get_status(cwd)
     relative = os.path.relpath(resolved_path, resolved_cwd).replace(os.sep, "/")
-    if relative in status.deleted:
+    kind = _status_kind_for_path(cwd, relative)
+    if kind == "deleted":
         return PathValidation(ok=False, reason="deleted")
-    if relative not in status.modified and relative not in status.added:
+    if kind not in ("added", "modified"):
         return PathValidation(ok=False, reason="not_changed")
     return PathValidation(ok=True, resolved_path=resolved_path)
 

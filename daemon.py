@@ -48,7 +48,6 @@ import json
 import logging
 import os
 import pathlib
-import pty
 import re
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -167,11 +166,6 @@ def _redact_secrets(value: Any, secrets: tuple[str, ...]) -> Any:
     return value
 
 
-# KTD5: `claude setup-token` performs its own full OAuth flow (opens a
-# browser, waits for the user to approve there) - 90s gives a human enough
-# room to notice the browser, log in if needed, and approve, unlike the
-# near-instant SDK-connect case elsewhere in this module.
-_SETUP_TOKEN_TIMEOUT_SECONDS = 90.0
 _VALID_ACCOUNTS = frozenset({"vscode", "personal"})
 # Codex Agent Integration plan (002), U2 (R10): Codex's own independent
 # account-mode allowlist. Deliberately a distinct frozenset from
@@ -227,79 +221,6 @@ def _scrub_action_for_logging(action: dict[str, Any]) -> dict[str, Any]:
         key: ("[redacted]" if key in _ACTION_KEYS_NEVER_LOGGED and value is not None else value)
         for key, value in action.items()
     }
-
-
-async def _run_setup_token_under_pty(cli_path: Optional[str]) -> Optional[str]:
-    """KTD5's automated setup attempt: spawn `claude setup-token` (or a
-    configured custom cli_path) under a pseudo-terminal so the CLI believes
-    it has a real terminal, wait up to _SETUP_TOKEN_TIMEOUT_SECONDS for it
-    to exit, and return the captured token if the output looks like exactly
-    one clean token line - or None on any failure (binary not found, spawn
-    error, timeout, non-zero exit, or ambiguous output), which the caller
-    treats as "automation unavailable, fall back to manual entry".
-
-    Per security review: never logs the raw pty buffer or the returned
-    token, at any level - only the caller's success/failure boolean is
-    ever observable outside this function.
-
-    Whether `claude setup-token` actually tolerates running under a pty
-    non-interactively is unverified in any environment this plan's
-    research could reach (see Planning Contract Assumptions) - this
-    function is written to the documented contract (opens its own OAuth
-    flow, prints the token, exits) and fails closed to "unavailable" on
-    anything it doesn't recognize, rather than guessing at a wrong token.
-    """
-    binary = cli_path or "claude"
-    master_fd, slave_fd = pty.openpty()
-    output_chunks: list[bytes] = []
-    loop = asyncio.get_event_loop()
-
-    def _drain() -> None:
-        try:
-            chunk = os.read(master_fd, 4096)
-        except OSError:
-            chunk = b""
-        if chunk:
-            output_chunks.append(chunk)
-        else:
-            loop.remove_reader(master_fd)
-
-    try:
-        process = await asyncio.create_subprocess_exec(
-            binary, "setup-token", stdin=slave_fd, stdout=slave_fd, stderr=slave_fd
-        )
-    except OSError:
-        os.close(master_fd)
-        os.close(slave_fd)
-        return None
-    os.close(slave_fd)  # only the child needs the slave end
-
-    os.set_blocking(master_fd, False)
-    loop.add_reader(master_fd, _drain)
-    try:
-        try:
-            await asyncio.wait_for(process.wait(), timeout=_SETUP_TOKEN_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            return None
-        if process.returncode != 0:
-            return None
-    finally:
-        try:
-            loop.remove_reader(master_fd)
-        except (ValueError, OSError):
-            pass
-        os.close(master_fd)
-
-    raw = b"".join(output_chunks).decode("utf-8", errors="ignore")
-    lines = [line.strip() for line in raw.splitlines() if line.strip()]
-    if len(lines) != 1:
-        return None
-    candidate = lines[0]
-    if " " in candidate or len(candidate) < 20:
-        return None
-    return candidate
 
 
 # KTD3: outrank CLAUDE_CODE_OAUTH_TOKEN in the CLI's own auth precedence,
@@ -747,8 +668,8 @@ class CompanionDaemon:
             await self._handle_set_personal_account_token(ws, action.get("token"))
             return
 
-        if kind == "start_personal_account_setup":
-            await self._handle_start_personal_account_setup(ws)
+        if kind == "clear_personal_account_token":
+            await self._handle_clear_personal_account_token(ws)
             return
 
         if kind == "set_active_codex_account":
@@ -757,6 +678,10 @@ class CompanionDaemon:
 
         if kind == "set_personal_codex_account_token":
             await self._handle_set_personal_codex_account_token(ws, action.get("token"))
+            return
+
+        if kind == "clear_personal_codex_account_token":
+            await self._handle_clear_personal_codex_account_token(ws)
             return
 
         if kind == "compose_digest":
@@ -1315,7 +1240,9 @@ class CompanionDaemon:
         await asyncio.to_thread(save_config, self.config_path, self.config)
         await self._handle_get_auto_approve_settings(ws)  # confirm back with the new state
 
-    async def _handle_get_cli_settings(self, ws: "websockets.WebSocketClientProtocol") -> None:
+    async def _handle_get_cli_settings(
+        self, ws: "websockets.WebSocketClientProtocol", rejected: tuple[str, ...] = ()
+    ) -> None:
         """R7/KD5/KTD5: which Claude Code CLI binary/profile this Mac's
         companion invokes for new SDK-owned sessions - a Mac-level setting
         (not per-session, not per-request), so this is the whole state
@@ -1328,6 +1255,9 @@ class CompanionDaemon:
             "data": {
                 "cli_path": self.config.cli_path,
                 "cli_env": self.config.cli_env,
+                # Only present when a value just sent was refused, so the phone can say so right
+                # away instead of waiting out its pending-confirmation timeout.
+                **({"rejected": list(rejected)} if rejected else {}),
             },
         }
         await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
@@ -1348,14 +1278,20 @@ class CompanionDaemon:
         below still reports the last-accepted state either way, so the
         phone can tell a rejection happened by comparing what it sent
         against what comes back."""
+        rejected: list[str] = []
         if cli_path is not None:
-            if _is_valid_remote_cli_path(cli_path):
+            if not cli_path.strip():
+                # The phone's "leave blank to use the default" - the only way back to the
+                # default once a path has been set.
+                self.config.cli_path = None
+            elif _is_valid_remote_cli_path(cli_path):
                 self.config.cli_path = cli_path
             else:
                 logger.warning(
                     "rejected set_cli_settings cli_path %r: not an absolute path to an existing executable file",
                     cli_path,
                 )
+                rejected.append("cli_path")
         if cli_env is not None:
             # code-review finding: cli_env must be dict-shaped (with str
             # keys/values, matching ClaudeAgentOptions.env's own typing)
@@ -1368,14 +1304,17 @@ class CompanionDaemon:
                 isinstance(k, str) and isinstance(v, str) for k, v in cli_env.items()
             ):
                 logger.warning("rejected set_cli_settings cli_env %r: expected a dict of str to str", cli_env)
+                rejected.append("cli_env")
             else:
                 dangerous = _DANGEROUS_CLI_ENV_KEYS.intersection(cli_env)
                 if not dangerous:
                     self.config.cli_env = dict(cli_env)
                 else:
                     logger.warning("rejected set_cli_settings cli_env: disallowed key(s) %r", sorted(dangerous))
+                    rejected.append("cli_env")
         await asyncio.to_thread(save_config, self.config_path, self.config)
-        await self._handle_get_cli_settings(ws)  # confirm back with the (possibly-unchanged) state
+        # confirm back with the (possibly-unchanged) state, naming anything that was refused
+        await self._handle_get_cli_settings(ws, tuple(rejected))
 
     async def _handle_get_account_settings(self, ws: "websockets.WebSocketClientProtocol") -> None:
         """R1/R2 (session-account-switch): which identity new SDK-owned
@@ -1431,17 +1370,18 @@ class CompanionDaemon:
         await self._handle_get_account_settings(ws)
 
     async def _store_personal_account_token(self, token: str) -> None:
-        """Shared persistence path for both the manual paste-in
-        (_handle_set_personal_account_token) and the automated pty-capture
-        (_handle_start_personal_account_setup) flows, so success is
-        recorded identically either way (U2's own test scenario)."""
+        """KTD5's manual paste-in persistence path (_handle_set_personal_
+        account_token's own caller)."""
         self.config.personal_oauth_token = token
         await asyncio.to_thread(save_config, self.config_path, self.config)
 
     async def _handle_set_personal_account_token(
         self, ws: "websockets.WebSocketClientProtocol", token: Optional[str]
     ) -> None:
-        """KTD5's manual-fallback entry point."""
+        """KTD5's manual entry point - the only way to configure a personal
+        token (the automated `claude setup-token` pty-capture flow this
+        used to try first was removed: paste-in-only, mirroring Codex's own
+        always-manual entry point below)."""
         if token is None or not token.strip():
             logger.warning("rejected set_personal_account_token: empty or missing token")
             await self._handle_get_account_settings(ws)
@@ -1449,28 +1389,20 @@ class CompanionDaemon:
         await self._store_personal_account_token(token.strip())
         await self._handle_get_account_settings(ws)
 
-    async def _handle_start_personal_account_setup(self, ws: "websockets.WebSocketClientProtocol") -> None:
-        """KTD5's automated-first attempt. On success, confirms back
-        through the same _handle_get_account_settings every other change
-        does - the phone infers success from personal_configured flipping
-        true, no separate "it worked" signal needed. On failure, emits an
-        explicit personal_account_setup_result(available=False) - unlike
-        success, there is nothing else that would tell the phone "an
-        attempt just failed, show the manual fallback" versus "nothing has
-        happened yet"."""
-        token = await _run_setup_token_under_pty(self.config.cli_path)
-        if token is not None:
-            await self._store_personal_account_token(token)
-            await self._handle_get_account_settings(ws)
-            return
-        event = {
-            "session_id": "_account_settings",
-            "event_id": 0,
-            "type": "personal_account_setup_result",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "data": {"available": False},
-        }
-        await ws.send(json.dumps({"token": self.config.device_token, "type": "event", "event": event}))
+    async def _handle_clear_personal_account_token(self, ws: "websockets.WebSocketClientProtocol") -> None:
+        """Design fix (user report): the mobile UI's own "Remove token"
+        affordance. Also resets active_account back to 'vscode' when the
+        token being cleared is the one currently in use - mirroring
+        _handle_set_active_account's own "personal requires a token"
+        backstop, since leaving active_account='personal' with no token on
+        file would just make the *next* new session silently fall back to
+        whatever the CLI's own ambient auth resolves to, with no signal
+        anywhere that this Mac's chosen identity quietly stopped applying."""
+        self.config.personal_oauth_token = None
+        if self.config.active_account == "personal":
+            self.config.active_account = "vscode"
+        await asyncio.to_thread(save_config, self.config_path, self.config)
+        await self._handle_get_account_settings(ws)
 
     async def _handle_set_active_codex_account(
         self, ws: "websockets.WebSocketClientProtocol", codex_active_account: Optional[str]
@@ -1508,11 +1440,9 @@ class CompanionDaemon:
         """Codex's own persistence path, mirroring
         _store_personal_account_token - only ever writes
         self.config.codex_personal_api_key, never Claude's own
-        personal_oauth_token (R10). Unlike Claude's pair of callers, there
-        is no automated pty-capture flow to share this with: Codex has no
-        `claude setup-token`-equivalent CLI command to shell out to (see
-        _handle_start_personal_account_setup's own docstring) - a manual
-        paste is the only entry point."""
+        personal_oauth_token (R10). Codex has no automated setup CLI to
+        shell out to (nothing OpenAI ships mints a token the way `claude
+        setup-token` does) - a manual paste is its only entry point."""
         self.config.codex_personal_api_key = token
         await asyncio.to_thread(save_config, self.config_path, self.config)
 
@@ -1526,6 +1456,16 @@ class CompanionDaemon:
             await self._handle_get_account_settings(ws)
             return
         await self._store_personal_codex_account_token(token.strip())
+        await self._handle_get_account_settings(ws)
+
+    async def _handle_clear_personal_codex_account_token(self, ws: "websockets.WebSocketClientProtocol") -> None:
+        """Codex's own twin of _handle_clear_personal_account_token - only
+        ever touches codex_personal_api_key/codex_active_account, never
+        Claude's own fields (R10)."""
+        self.config.codex_personal_api_key = None
+        if self.config.codex_active_account == "personal":
+            self.config.codex_active_account = "vscode"
+        await asyncio.to_thread(save_config, self.config_path, self.config)
         await self._handle_get_account_settings(ws)
 
     async def _handle_git_status(self, adapter, session_id: str) -> None:

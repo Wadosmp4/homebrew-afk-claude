@@ -52,9 +52,9 @@ ClientFactory = Callable[[ClaudeAgentOptions], Any]
 # control-request awaits had no bound - an unresponsive CLI subprocess would
 # hang the dispatching task forever, with no confirmation event and no
 # registry write, leaving the phone's own client-side optimistic-UI timeout
-# as the only thing that ever notices. Bounded the same way daemon.py's own
-# comparable awaits already are (e.g. _handle_session_start's setup-token
-# wait).
+# as the only thing that ever notices. Bounded the same way every other
+# await-on-an-external-process call in this codebase is, rather than left
+# open-ended.
 _LIVE_CONTROL_REQUEST_TIMEOUT_SECONDS = 10.0
 
 
