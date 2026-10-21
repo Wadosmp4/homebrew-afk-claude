@@ -1,5 +1,9 @@
 # Companion
 
+> **Installing it?** Start with the step-by-step guide: [INSTALL.md](INSTALL.md)
+> (Mac and Linux, pairing your phone, updating, troubleshooting). The rest of
+> this file is the technical reference.
+
 Background daemon that authenticates to the relay and holds a persistent,
 auto-reconnecting connection with heartbeats (U2). Adapters that discover
 and drive/observe Claude Code sessions (U3, U4) hang off this daemon in

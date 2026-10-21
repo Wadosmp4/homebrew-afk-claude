@@ -64,6 +64,7 @@ import urllib.request
 from typing import Optional, Sequence
 
 from . import hook_bridge
+from .invite import looks_like_invite, parse_invite
 from .config import (
     CompanionConfig,
     DEFAULT_RELAY_URL,
@@ -367,19 +368,43 @@ def _setup(args: argparse.Namespace) -> None:
         _print_phone_pairing_code(relay_url, config.device_token)
         return
 
-    relay_url = args.relay_url or DEFAULT_RELAY_URL
+    # An invitation (--invite) carries the address, so nothing has to be typed or looked up.
+    try:
+        invite = parse_invite(args.invite) if args.invite else None
+    except ValueError as exc:
+        print(f"Could not use that invitation: {exc}.")
+        return
+
+    relay_url = (invite.relay_url if invite else None) or args.relay_url or DEFAULT_RELAY_URL
+    code: Optional[str] = invite.code if invite else None
+
+    if invite is None:
+        has_code = input("Do you have an invitation code? [y/N]: ").strip().lower().startswith("y")
+        if has_code:
+            pasted = input("Paste your invitation code: ").strip()
+            if looks_like_invite(pasted):
+                try:
+                    invite = parse_invite(pasted)
+                except ValueError as exc:
+                    print(f"Could not use that invitation: {exc}.")
+                    return
+                relay_url, code = invite.relay_url, invite.code
+            else:
+                code = pasted  # a bare one-time code: the address has to come from elsewhere (--relay-url / env)
+        elif not relay_url:
+            print(
+                "To add this computer to an existing account, use the command shown in the app: "
+                "Home > Add a computer."
+            )
+            return
+
     if not relay_url:
-        print("No relay address known - set the AFK_RELAY_URL environment variable, or pass --relay-url.")
+        print("No address known for this code - ask for the full invitation code.")
         return
     relay_url = relay_url.rstrip("/")
 
-    has_bootstrap_code = (
-        input("Do you have a one-time bootstrap code from your relay? [y/N]: ").strip().lower().startswith("y")
-    )
-
-    if not has_bootstrap_code:
-        # Not the very first Mac - some phone is already paired and can
-        # vouch for this one, same as `pair`.
+    if code is None:
+        # No one-time code: an already-paired phone vouches for this computer, same as `pair`.
         label = args.label or socket.gethostname()
         approved = _request_and_await_companion_approval(
             relay_url, label, DEFAULT_PAIR_TIMEOUT_SECONDS, DEFAULT_PAIR_POLL_INTERVAL_SECONDS, args.config_path
@@ -390,19 +415,18 @@ def _setup(args: argparse.Namespace) -> None:
             print("Timed out waiting for approval - run `afk-claude-companion setup` again.")
         return
 
-    code = input("Enter the bootstrap code shown by your relay: ").strip()
     try:
         result = _claim_bootstrap_code(relay_url, code)
     except urllib.error.HTTPError as exc:
         print(f"Could not claim that code: {_error_detail(exc)}")
         return
     except urllib.error.URLError as exc:
-        print(f"Could not reach the relay at {relay_url}: {exc.reason}")
+        print(f"Could not reach the service: {exc.reason}")
         return
 
     ws_url = _derive_ws_url(relay_url)
     save_config(args.config_path, CompanionConfig(relay_url=ws_url, device_token=result["token"]))
-    print(f"This Mac is now paired with the relay. Config written to {args.config_path}")
+    print(f"This computer is now connected. Config written to {args.config_path}")
     _print_phone_pairing_code(relay_url, result["token"])
 
 
@@ -435,6 +459,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--relay-url",
         default=DEFAULT_RELAY_URL,
         help="The relay's https:// URL - only needed before this Mac has a config (default: AFK_RELAY_URL env var)",
+    )
+    setup_parser.add_argument(
+        "--invite",
+        default=None,
+        help="An invitation code (it carries the service address, so no --relay-url is needed)",
     )
     setup_parser.add_argument(
         "--label", default=None, help="Human-readable label for this Mac if it needs a phone's approval (default: hostname)"

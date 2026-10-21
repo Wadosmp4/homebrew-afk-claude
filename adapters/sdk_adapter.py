@@ -217,6 +217,8 @@ class SDKAdapter:
 
     async def send_message(self, session_id: str, text: str) -> None:
         session = self._get(session_id)
+        # A new turn starts: whatever "waiting for input" was being held back for the previous one is moot.
+        session.deferred_waiting = None
         session.emit("user_message", text=text)
         await session.outbound.put(text)
 
@@ -461,6 +463,13 @@ class _Session:
         self.reader_task: Optional[asyncio.Task] = None
         self.cwd: Optional[str] = None
         self._ended = False
+        # Subagents (the "Task" tool) that have started and not yet reported a terminal state. The CLI
+        # reports the dispatching turn as finished (ResultMessage) while such a subagent is still
+        # running; "waiting for input" must not be announced until both are done.
+        self.active_tasks: set[str] = set()
+        # The subtype of a finished turn whose "waiting_for_input" is being held back because
+        # `active_tasks` was not empty; emitted once the last task ends.
+        self.deferred_waiting: Optional[str] = None
 
     def emit(self, type_: str, **data: Any) -> Event:
         event = self.sequencer.emit(type_, **data)
@@ -473,6 +482,8 @@ class _Session:
         if self._ended:
             return
         self._ended = True
+        self.active_tasks.clear()
+        self.deferred_waiting = None
         self.emit("session_ended", reason=reason)
 
     async def prompt_stream(self):
@@ -597,6 +608,28 @@ class _Session:
             model=usage.get("model"),
         )
 
+    def _announce_turn_finished(self, subtype: str) -> None:
+        """A turn ended cleanly: "waiting for input" now, or - while a subagent it started is still
+        running - as soon as the last one finishes."""
+        if self.active_tasks:
+            self.deferred_waiting = subtype
+        else:
+            self.deferred_waiting = None
+            self.emit("waiting_for_input", subtype=subtype)
+
+    def _task_started(self, task_id: str) -> None:
+        self.active_tasks.add(task_id)
+
+    def _task_ended(self, task_id: str) -> None:
+        self.active_tasks.discard(task_id)
+        self.release_deferred_waiting()
+
+    def release_deferred_waiting(self) -> None:
+        """Emit a held-back "waiting_for_input" once nothing is left running."""
+        if self.deferred_waiting is not None and not self.active_tasks:
+            subtype, self.deferred_waiting = self.deferred_waiting, None
+            self.emit("waiting_for_input", subtype=subtype)
+
     def _handle_message(self, message: Any) -> None:
         if isinstance(message, AssistantMessage):
             for block in message.content:
@@ -611,7 +644,7 @@ class _Session:
             if message.is_error:
                 self.emit("error", message=message.result or f"turn ended with error: {message.subtype}")
             else:
-                self.emit("waiting_for_input", subtype=message.subtype)
+                self._announce_turn_finished(message.subtype)
             # Bug fix (user report): this turn's own token usage, recorded
             # regardless of is_error - a failed turn still spent tokens
             # getting there. See rate_limit_estimator.py's own docstring
@@ -635,6 +668,7 @@ class _Session:
         # still running" independently of this turn's own waiting_for_input,
         # and lets stop_task() below give it something real to cancel.
         elif isinstance(message, TaskStartedMessage):
+            self._task_started(message.task_id)
             self.emit(
                 "task_update",
                 phase="started",
@@ -663,6 +697,8 @@ class _Session:
                 task_id=message.task_id,
                 status=message.status,
             )
+            if message.status in TERMINAL_TASK_STATUSES:
+                self._task_ended(message.task_id)
         elif isinstance(message, TaskNotificationMessage):
             # The authoritative "this task is over" signal - stop_task()'s
             # own docstring says a stopped task always reports here with
@@ -679,6 +715,8 @@ class _Session:
                 summary=message.summary,
                 tool_use_id=message.tool_use_id,
             )
+            # The task_update above goes out first, so the held "waiting for input" lands after it.
+            self._task_ended(message.task_id)
             # Bug fix (user report): this task's final usage total - see
             # record_task_usage's own docstring for why only the delta
             # since the last progress tick (if any) actually gets added.

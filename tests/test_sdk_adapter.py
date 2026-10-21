@@ -1525,3 +1525,119 @@ async def test_connect_backs_out_cleanly_when_a_racing_disconnect_pops_the_sessi
     assert a.discover_sessions() == []
     assert a.is_active("s1") is None
     assert created_clients[0].disconnected is True
+
+
+# "Waiting for your input" is only announced once the turn AND every subagent it started are finished -
+# the CLI reports the dispatching turn as done while a subagent is still running.
+
+
+def _task_started(task_id: str) -> TaskStartedMessage:
+    return TaskStartedMessage(
+        subtype="task_started", data={}, task_id=task_id, description="Reviewing", uuid=f"u-{task_id}",
+        session_id="s1", tool_use_id=f"tool-{task_id}",
+    )
+
+
+def _task_done(task_id: str, status: str = "completed") -> TaskNotificationMessage:
+    return TaskNotificationMessage(
+        subtype="task_notification", data={}, task_id=task_id, status=status, output_file="/tmp/x.json",
+        summary="done", uuid=f"d-{task_id}", session_id="s1",
+        usage={"total_tokens": 0, "tool_uses": 0, "duration_ms": 1},
+    )
+
+
+async def _assert_nothing_more(adapter) -> None:
+    """Nothing further has been emitted (looks at the session's queue: timing out a read on the event
+    generator would end it)."""
+    await asyncio.sleep(0.2)
+    assert adapter._sessions["s1"].events.empty()
+
+
+async def _types_until_quiet(events, count: int) -> list[str]:
+    seen = []
+    for _ in range(count):
+        seen.append((await asyncio.wait_for(events.__anext__(), timeout=2)).type)
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_waiting_for_input_is_held_while_a_subagent_is_still_running(adapter):
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    client.push(_task_started("t1"))
+    client.push(_result_message({}))  # the dispatching turn is over, the subagent is not
+    assert await _types_until_quiet(events, 1) == ["task_update"]
+    await _assert_nothing_more(adapter)  # no "waiting for input" yet
+
+    client.push(_task_done("t1"))
+    # The subagent's own finish line first, then the held "waiting for input".
+    assert await _types_until_quiet(events, 2) == ["task_update", "waiting_for_input"]
+
+
+@pytest.mark.asyncio
+async def test_waiting_for_input_waits_for_every_subagent(adapter):
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    client.push(_task_started("t1"))
+    client.push(_task_started("t2"))
+    client.push(_result_message({}))
+    await _types_until_quiet(events, 2)  # both started
+
+    client.push(_task_done("t1"))
+    assert await _types_until_quiet(events, 1) == ["task_update"]
+    await _assert_nothing_more(adapter)  # one is still running
+
+    client.push(_task_done("t2"))
+    assert await _types_until_quiet(events, 2) == ["task_update", "waiting_for_input"]
+
+
+@pytest.mark.asyncio
+async def test_waiting_for_input_is_immediate_when_no_subagent_is_running(adapter):
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+
+    client.push(_result_message({}))
+
+    assert await _types_until_quiet(events, 1) == ["waiting_for_input"]
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_subagent_also_releases_the_held_waiting_for_input(adapter):
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+    client.push(_task_started("t1"))
+    client.push(_result_message({}))
+    await _types_until_quiet(events, 1)  # the subagent started
+
+    client.push(_task_done("t1", status="stopped"))
+
+    assert await _types_until_quiet(events, 2) == ["task_update", "waiting_for_input"]
+
+
+@pytest.mark.asyncio
+async def test_a_new_message_drops_a_held_waiting_for_input(adapter):
+    await adapter.connect("s1")
+    client = adapter._test_clients["latest"]
+    events = adapter.subscribe("s1")
+    await events.__anext__()  # session_started
+    client.push(_task_started("t1"))
+    client.push(_result_message({}))
+    await _types_until_quiet(events, 1)
+
+    await adapter.send_message("s1", "carry on")
+    assert await _types_until_quiet(events, 1) == ["user_message"]
+
+    # The subagent finishing later must not announce the OLD turn's "waiting for input".
+    client.push(_task_done("t1"))
+    assert await _types_until_quiet(events, 1) == ["task_update"]
+    await _assert_nothing_more(adapter)

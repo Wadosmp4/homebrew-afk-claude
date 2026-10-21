@@ -507,13 +507,74 @@ def test_setup_falls_back_to_the_afk_relay_url_env_var(monkeypatch, tmp_path, ca
     assert loaded.relay_url == "wss://relay.example.com/ws/companion"
 
 
-def test_setup_with_no_relay_url_anywhere_prints_guidance_instead_of_crashing(monkeypatch, tmp_path, capsys):
+def test_setup_with_no_address_and_no_invitation_points_to_the_app_instead_of_crashing(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(cli, "DEFAULT_RELAY_URL", None)
+    monkeypatch.setattr("builtins.input", _fake_input("n"))
 
     main(["setup", "--config-path", str(tmp_path / "does-not-exist.json")])
 
-    out = capsys.readouterr().out
-    assert "AFK_RELAY_URL" in out or "--relay-url" in out
+    assert "Add a computer" in capsys.readouterr().out
+
+
+# --- invitations: the address travels inside the code ----------------------------------
+
+
+def test_setup_with_an_invitation_carries_its_own_address_and_claims_its_code(monkeypatch, tmp_path, capsys):
+    from companion.invite import make_invite
+
+    monkeypatch.setattr(cli, "DEFAULT_RELAY_URL", None)
+    seen = {}
+
+    def claim(relay_url, code):
+        seen["claim"] = (relay_url, code)
+        return {"token": "device-token"}
+
+    monkeypatch.setattr(cli, "_claim_bootstrap_code", claim)
+    monkeypatch.setattr(cli, "_print_phone_pairing_code", lambda url, token: print("PHONE CODE"))
+    monkeypatch.setattr("builtins.input", _fake_input("y", make_invite("https://relay.example.com", "123456")))
+
+    main(["setup", "--config-path", str(tmp_path / "config.json")])
+
+    assert seen["claim"] == ("https://relay.example.com", "123456")
+    assert "PHONE CODE" in capsys.readouterr().out
+    assert cli.load_config(str(tmp_path / "config.json")).relay_url == "wss://relay.example.com/ws/companion"
+
+
+def test_setup_invite_option_without_a_code_goes_straight_to_the_phone_approval(monkeypatch, tmp_path):
+    from companion.invite import make_invite
+
+    monkeypatch.setattr(cli, "DEFAULT_RELAY_URL", None)
+    asked = {}
+
+    def approval(relay_url, label, timeout, poll_interval, config_path):
+        asked["relay_url"] = relay_url
+        return True
+
+    monkeypatch.setattr(cli, "_request_and_await_companion_approval", approval)
+    monkeypatch.setattr("builtins.input", lambda prompt: pytest.fail("no question should be asked"))
+
+    main(["setup", "--invite", make_invite("https://relay.example.com"), "--config-path", str(tmp_path / "config.json")])
+
+    assert asked["relay_url"] == "https://relay.example.com"
+
+
+def test_setup_rejects_a_garbled_invitation_without_asking_or_connecting(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, "_claim_bootstrap_code", lambda *a: pytest.fail("must not connect"))
+
+    main(["setup", "--invite", "AFK1.%%%not-base64", "--config-path", str(tmp_path / "config.json")])
+
+    assert "Could not use that invitation" in capsys.readouterr().out
+
+
+def test_setup_refuses_an_invitation_that_points_at_an_insecure_address(monkeypatch, tmp_path, capsys):
+    import base64
+
+    evil = "AFK1." + base64.urlsafe_b64encode(b"http://evil.example.com").decode().rstrip("=")
+    monkeypatch.setattr(cli, "_claim_bootstrap_code", lambda *a: pytest.fail("must not connect"))
+
+    main(["setup", "--invite", evil, "--config-path", str(tmp_path / "config.json")])
+
+    assert "secure" in capsys.readouterr().out
 
 
 def test_setup_stops_cleanly_on_an_invalid_bootstrap_code(monkeypatch, tmp_path, capsys):
@@ -748,3 +809,4 @@ def test_precheck_reports_unreachable_on_a_malformed_response(capsys):
 
     out = capsys.readouterr().out.lower()
     assert "unreachable" in out
+
