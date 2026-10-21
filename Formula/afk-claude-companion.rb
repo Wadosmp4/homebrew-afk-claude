@@ -9,8 +9,8 @@ class AfkClaudeCompanion < Formula
 
   desc "Mac companion daemon for the AFK Claude remote-control app"
   homepage "https://github.com/Wadosmp4/homebrew-afk-claude"
-  url "https://github.com/Wadosmp4/homebrew-afk-claude/archive/refs/tags/v0.2.0.tar.gz"
-  sha256 "be731f8933fc99a7a97cfb4cd0be8dcd7179ff44b3378a5b8507cc4ebb10c0e1"
+  url "https://github.com/Wadosmp4/homebrew-afk-claude/archive/refs/tags/v0.3.0.tar.gz"
+  sha256 "30a2bce11ca369b6e0fd4b88a2ac121cd309426975149762fd8b0917d5ebbf4b"
   license "MIT"
 
   depends_on "python@3.12"
