@@ -61,6 +61,16 @@ brew services start afk-claude-companion
 
 Your computer should now show **Online** in the app. Tap **View sessions**, pick a project and start a session.
 
+## Using Codex too (optional)
+
+Claude Code works out of the box. Codex sessions are optional and need an extra component that the Homebrew install does **not** include yet. To use Codex, install the companion with `pip` instead and ask for the Codex extra:
+
+```bash
+python3 -m venv ~/.afk-claude && ~/.afk-claude/bin/pip install "remote-claude-companion[codex] @ git+https://github.com/Wadosmp4/homebrew-afk-claude.git"
+```
+
+(See [Without Homebrew](#without-homebrew) for running it.) Then sign in to Codex on that computer, or add an OpenAI key under **Settings → Codex → My key** in the app. If you only use Claude, skip this: picking Codex in the app will say it couldn't start.
+
 ## Adding another computer
 
 On the new computer, install the companion (step 1), then run:
