@@ -14,11 +14,13 @@ Your code stays on your computer. Only the session messages (what Claude says, t
 ## What you need
 
 - A **Mac** or a **Linux** computer (Ubuntu, Debian, Fedora and similar). Windows works only through WSL2 - see [Windows](#windows).
-- **Claude Code installed and signed in on that computer.** Install it from the official Claude Code instructions, then run `claude` once in a terminal and log in. The companion drives that installed copy and uses its login. (The `pip` install below bundles its own copy; the Homebrew one does not.)
-- **Homebrew** (`brew.sh`). It is the easiest way to install and to keep the companion updated. No Homebrew? See [Without Homebrew](#without-homebrew).
+- **Claude Code installed and signed in on that computer.** Install it from the official Claude Code instructions, then run `claude` once in a terminal and log in. The companion uses that login (and, with the Homebrew install, that installed copy).
+- **Homebrew** (`brew.sh`) on a Mac. On Linux the [pip route](#linux-without-homebrew-recommended-on-linux) is simpler.
 - The **AFK Claude app** on your phone, and the **invitation code** you were sent (one long string starting with `AFK1.`).
 
 ## 1. Install the companion
+
+**On a Mac** (Homebrew). On Linux, skip to [Linux without Homebrew](#linux-without-homebrew-recommended-on-linux) and come back to step 2.
 
 ```bash
 brew tap Wadosmp4/afk-claude
@@ -51,6 +53,8 @@ It then prints a **6-digit code**. Keep that window open for the next step. The 
 
 ## 4. Keep the companion running
 
+(On Linux with the pip route, the user service in that section does this.)
+
 The companion has to be running for your phone to see the computer. Start it now and have it start by itself at every login:
 
 ```bash
@@ -69,7 +73,7 @@ Claude Code works out of the box. Codex sessions are optional and need an extra 
 python3 -m venv ~/.afk-claude && ~/.afk-claude/bin/pip install "remote-claude-companion[codex] @ git+https://github.com/Wadosmp4/homebrew-afk-claude.git"
 ```
 
-(See [Without Homebrew](#without-homebrew) for running it.) Then sign in to Codex on that computer, or add an OpenAI key under **Settings → Codex → My key** in the app. If you only use Claude, skip this: picking Codex in the app will say it couldn't start.
+(See [Linux without Homebrew](#linux-without-homebrew-recommended-on-linux) for running it.) Then sign in to Codex on that computer, or add an OpenAI key under **Settings → Codex → My key** in the app. If you only use Claude, skip this: picking Codex in the app will say it couldn't start.
 
 ## Adding another computer
 
@@ -115,17 +119,46 @@ Still stuck? Send whoever invited you the output of `brew services list` and `af
 
 The companion does not run natively on Windows. If you use **WSL2** (Windows Subsystem for Linux, with Ubuntu), install Homebrew inside it and follow the steps above - it behaves like a Linux computer. The projects you want to work on need to live inside WSL. This route has not been tested by the project, so expect some rough edges.
 
-## Without Homebrew
+## Linux without Homebrew (recommended on Linux)
 
-If you can't use Homebrew, you can install the same package with Python 3.10 or newer:
+On Linux this is usually simpler than Homebrew: it needs only Python 3.10 or newer and git (plus Claude Code signed in, as above). On Debian or Ubuntu, first run `sudo apt install python3-venv git` (other distributions have the same packages under similar names).
 
 ```bash
-python3 -m venv ~/.afk-claude && ~/.afk-claude/bin/pip install "git+https://github.com/Wadosmp4/homebrew-afk-claude.git"
+python3 -m venv ~/.afk-claude
+~/.afk-claude/bin/pip install "git+https://github.com/Wadosmp4/homebrew-afk-claude.git@v0.3.0"
 ~/.afk-claude/bin/afk-claude-companion setup
-~/.afk-claude/bin/afk-claude-companion run
 ```
 
-You then have to start it yourself after a restart (or add it to your own service manager).
+`setup` works exactly as in step 2 above. To keep the companion running and start it automatically, add it as a user service. Create `~/.config/systemd/user/afk-claude-companion.service`:
+
+```ini
+[Unit]
+Description=AFK Claude companion
+After=network-online.target
+
+[Service]
+ExecStart=%h/.afk-claude/bin/afk-claude-companion run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+then run:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now afk-claude-companion
+loginctl enable-linger "$USER"      # keeps it running when you are logged out
+systemctl --user status afk-claude-companion
+```
+
+To update later: `~/.afk-claude/bin/pip install --upgrade "git+https://github.com/Wadosmp4/homebrew-afk-claude.git@<new version>"`, then `systemctl --user restart afk-claude-companion`. To use Codex as well, add the extra: `pip install "remote-claude-companion[codex] @ git+https://github.com/Wadosmp4/homebrew-afk-claude.git@v0.3.0"`.
+
+## Other ways to run it
+
+Without Homebrew or systemd (for example on a Mac), use the same `pip` install above and start it yourself with `~/.afk-claude/bin/afk-claude-companion run` (it stops when the terminal closes).
 
 ## Your privacy and your control
 
